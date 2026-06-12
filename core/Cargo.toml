@@ -14,6 +14,7 @@ thiserror.workspace = true
 log.workspace = true
 tokio.workspace = true
 tokio-tungstenite = { version = "0.29", features = ["rustls-tls-webpki-roots"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 futures-util = { version = "0.3", default-features = false, features = ["std", "sink"] }
 
 [dev-dependencies]

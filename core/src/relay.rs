@@ -59,11 +59,23 @@ pub struct RelayPool {
     runtime: tokio::runtime::Handle,
 }
 
+/// rustls 0.23 needs a process-level crypto provider; the TLS stack pulled
+/// in by tokio-tungstenite deliberately enables none, so install ring
+/// before the first `wss://` handshake (idempotent, races are harmless —
+/// `install_default` simply fails if one is already set).
+pub fn ensure_crypto_provider() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
+}
+
 impl RelayPool {
     /// Create a pool that reports relay activity on `event_tx`. Must be
     /// called from within a tokio runtime (its handle is captured for
     /// spawning relay tasks later, possibly from non-runtime threads).
     pub fn new(event_tx: mpsc::UnboundedSender<PoolEvent>) -> Arc<Self> {
+        ensure_crypto_provider();
         Arc::new(Self {
             relays: Mutex::new(HashMap::new()),
             filter: Mutex::new(None),
@@ -429,6 +441,16 @@ fn handle_incoming(url: &str, text: &str, event_tx: &mpsc::UnboundedSender<PoolE
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn crypto_provider_is_installed_for_tls() {
+        ensure_crypto_provider();
+        ensure_crypto_provider(); // idempotent
+        assert!(
+            rustls::crypto::CryptoProvider::get_default().is_some(),
+            "wss:// handshakes would panic without a process-level provider"
+        );
+    }
 
     #[test]
     fn url_normalization() {

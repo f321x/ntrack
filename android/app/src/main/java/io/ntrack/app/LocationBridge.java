@@ -45,7 +45,11 @@ public final class LocationBridge {
     // ---- permissions -----------------------------------------------------
 
     public static boolean hasLocationPermission(Activity activity) {
+        // Android 12+ lets users grant approximate location only; coarse
+        // fixes are still useful for live sharing.
         return activity.checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION)
+                == PackageManager.PERMISSION_GRANTED
+                || activity.checkSelfPermission(Manifest.permission.ACCESS_COARSE_LOCATION)
                 == PackageManager.PERMISSION_GRANTED;
     }
 
@@ -66,9 +70,11 @@ public final class LocationBridge {
     public static void handlePermissionResult(int requestCode, String[] permissions, int[] results) {
         if (requestCode != REQ_LOCATION) return;
         boolean granted = false;
-        for (int i = 0; i < permissions.length; i++) {
-            if (Manifest.permission.ACCESS_FINE_LOCATION.equals(permissions[i])
-                    && results[i] == PackageManager.PERMISSION_GRANTED) {
+        for (int i = 0; i < permissions.length && i < results.length; i++) {
+            boolean isLocation =
+                    Manifest.permission.ACCESS_FINE_LOCATION.equals(permissions[i])
+                            || Manifest.permission.ACCESS_COARSE_LOCATION.equals(permissions[i]);
+            if (isLocation && results[i] == PackageManager.PERMISSION_GRANTED) {
                 granted = true;
             }
         }
@@ -201,7 +207,7 @@ public final class LocationBridge {
             if (Build.VERSION.SDK_INT >= 33) {
                 // Mark sensitive so launchers don't preview group secrets.
                 android.os.PersistableBundle extras = new android.os.PersistableBundle();
-                extras.putBoolean(ClipData.EXTRA_IS_SENSITIVE, true);
+                extras.putBoolean(android.content.ClipDescription.EXTRA_IS_SENSITIVE, true);
                 clip.getDescription().setExtras(extras);
             }
             cm.setPrimaryClip(clip);

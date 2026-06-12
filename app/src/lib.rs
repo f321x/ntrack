@@ -54,6 +54,11 @@ pub fn run_app(
     controller.shutdown();
 }
 
+#[cfg(all(target_os = "android", not(feature = "android")))]
+compile_error!(
+    "Android builds need the android-activity backend: pass `--no-default-features --features android` (scripts/build-apk.sh does this)"
+);
+
 /// Android entry point, invoked by the android-activity glue after
 /// `MainActivity` loads this library.
 #[cfg(target_os = "android")]

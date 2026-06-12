@@ -22,6 +22,17 @@ fi
 
 echo "==> Building Rust library for ABIs: $ABIS"
 rm -rf "$JNILIBS"
+
+# Slint's android backend compiles a small Java helper at build time and
+# embeds it as dex. cargo-ndk exports ANDROID_PLATFORM=<minSdk>, which would
+# make it look for platforms/android-26; compile against the installed
+# platform jar instead (same model as Gradle's compileSdk).
+ANDROID_JAR="$(ls -d "$ANDROID_HOME"/platforms/android-*/android.jar 2>/dev/null | sort -V | tail -1)"
+if [ -n "$ANDROID_JAR" ]; then
+    export ANDROID_JAR
+    echo "    using ANDROID_JAR=$ANDROID_JAR"
+fi
+
 TARGET_FLAGS=()
 for abi in $ABIS; do TARGET_FLAGS+=(-t "$abi"); done
 cargo ndk "${TARGET_FLAGS[@]}" --platform 26 -o "$JNILIBS" \

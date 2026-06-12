@@ -16,3 +16,4 @@
 .vscode/
 *.log
 local.properties
+docker/certs/*.crt

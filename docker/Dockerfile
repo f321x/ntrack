@@ -18,7 +18,21 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates curl unzip zip git \
         openjdk-17-jdk-headless \
         build-essential pkg-config \
+        libfontconfig1-dev \
     && rm -rf /var/lib/apt/lists/*
+
+# Optional extra CA certificates (e.g. corporate TLS-inspecting proxies):
+# drop PEM files named *.crt into docker/certs/ before building. No-op when
+# the directory is empty. Installed into both the system store (curl, rust)
+# and the JVM truststore (gradle, sdkmanager).
+COPY certs/ /usr/local/share/ca-certificates/ntrack-extra/
+RUN update-ca-certificates && \
+    for c in /usr/local/share/ca-certificates/ntrack-extra/*.crt; do \
+        if [ -f "$c" ]; then \
+            keytool -importcert -cacerts -storepass changeit -noprompt \
+                -alias "ntrack-$(basename "$c" .crt)" -file "$c" || exit 1; \
+        fi; \
+    done
 
 # ---- Android SDK + NDK ------------------------------------------------------
 ENV ANDROID_HOME=/opt/android-sdk

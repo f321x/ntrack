@@ -36,7 +36,7 @@ env_logger = { version = "0.11", default-features = false, features = ["auto-col
 [features]
 default = []
 # Desktop development build: `cargo run -p ntrack-app --features desktop`
-desktop = ["slint/backend-winit", "slint/renderer-femtovg", "slint/accessibility"]
+desktop = ["slint/backend-winit", "slint/renderer-femtovg", "slint/renderer-software", "slint/accessibility"]
 # Android build (via cargo-ndk): brings in the android-activity backend
 # (which renders with Skia).
 android = ["slint/backend-android-activity-06"]

@@ -56,6 +56,10 @@ Notes:
   `.docker-target/`, so subsequent builds are fast.
 * Default ABI is `arm64-v8a` (every modern phone). For an emulator or extra
   targets: `ABIS="arm64-v8a x86_64" ./build.sh`.
+* Behind a TLS-inspecting (corporate) proxy? Drop the proxy's CA certificate
+  as a `.crt` PEM into `docker/certs/` before building — it is installed
+  into the image's system and Java trust stores (see
+  `docker/certs/README.md`).
 * `./build.sh test` runs the test suite in the container; `SKIP_TESTS=1
   ./build.sh` skips the test gate during an APK build. `./build.sh clean`
   removes (possibly root-owned) build artifacts.

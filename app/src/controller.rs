@@ -321,6 +321,7 @@ impl Controller {
                 TrackItem {
                     sender: t.sender_hex.clone().into(),
                     title: title.into(),
+                    label: t.label.clone().into(),
                     group: t.group_name.clone().into(),
                     status: match t.status {
                         Status::Active => "LIVE",

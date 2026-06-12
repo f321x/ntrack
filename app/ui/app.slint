@@ -17,6 +17,7 @@ export struct GroupItem {
 export struct TrackItem {
     sender: string,      // sender pubkey hex (stable id)
     title: string,       // label or short npub
+    label: string,       // raw user label ("" when unset)
     group: string,
     status: string,      // "LIVE" | "TEST" | "ENDED"
     coords: string,
@@ -381,7 +382,7 @@ component TrackPage inherits ScrollView {
         for t[i] in root.tracks : TrackRow {
             item: t;
             open-map => { root.open-map(i); }
-            rename => { root.rename-request(t.sender, t.title); }
+            rename => { root.rename-request(t.sender, t.label); }
         }
     }
 }
@@ -617,7 +618,7 @@ export component MainWindow inherits Window {
     // rename dialog
     in-out property <bool> rename-dialog-visible;
     in-out property <string> rename-sender;
-    in property <string> rename-current;
+    in-out property <string> rename-current;
 
     // confirm dialog (rotate / delete group)
     in-out property <bool> confirm-dialog-visible;
@@ -709,6 +710,7 @@ export component MainWindow inherits Window {
                 open-map(i) => { root.open-map(i); }
                 rename-request(sender, current) => {
                     root.rename-sender = sender;
+                    root.rename-current = current;
                     root.rename-dialog-visible = true;
                 }
             }
@@ -838,7 +840,10 @@ export component MainWindow inherits Window {
                     font-size: 12px;
                     wrap: word-wrap;
                 }
-                rename-input := LineEdit { placeholder-text: "Label"; }
+                rename-input := LineEdit {
+                    placeholder-text: "Label";
+                    init => { self.text = root.rename-current; }
+                }
                 HorizontalLayout {
                     spacing: 8px;
                     AppButton { text: "Cancel"; clicked => { root.rename-dialog-visible = false; } }
