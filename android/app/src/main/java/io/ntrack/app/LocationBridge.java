@@ -30,6 +30,11 @@ import java.util.List;
  *
  *   nativeOnLocation(lat, lng, accuracy, timeMillis)  — each location fix
  *   nativeOnPermission(granted)                        — permission outcome
+ *
+ * The bridge deliberately takes no Context/Activity parameters: the
+ * android-activity glue only exposes the Application context to native
+ * code, and passing it where an Activity is expected trips CheckJNI. The
+ * live activity is always resolved via {@link MainActivity#current()}.
  */
 public final class LocationBridge {
     private static final String TAG = "ntrack";
@@ -44,7 +49,9 @@ public final class LocationBridge {
 
     // ---- permissions -----------------------------------------------------
 
-    public static boolean hasLocationPermission(Activity activity) {
+    public static boolean hasLocationPermission() {
+        Activity activity = MainActivity.current();
+        if (activity == null) return false;
         // Android 12+ lets users grant approximate location only; coarse
         // fixes are still useful for live sharing.
         return activity.checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION)
@@ -53,7 +60,13 @@ public final class LocationBridge {
                 == PackageManager.PERMISSION_GRANTED;
     }
 
-    public static void requestLocationPermission(final Activity activity) {
+    public static void requestLocationPermission() {
+        final Activity activity = MainActivity.current();
+        if (activity == null) {
+            Log.w(TAG, "requestLocationPermission: no live activity");
+            nativeOnPermission(false);
+            return;
+        }
         activity.runOnUiThread(() -> {
             List<String> perms = new ArrayList<>();
             perms.add(Manifest.permission.ACCESS_FINE_LOCATION);
@@ -91,9 +104,15 @@ public final class LocationBridge {
      * Start the foreground service (keeps the process and GPS alive while
      * the app is backgrounded) and subscribe to location updates.
      */
-    public static void startLocation(final Activity activity, final long intervalMs) {
+    public static void startLocation(final long intervalMs) {
+        final Activity activity = MainActivity.current();
+        if (activity == null) {
+            Log.w(TAG, "startLocation: no live activity");
+            nativeOnPermission(false);
+            return;
+        }
         activity.runOnUiThread(() -> {
-            if (!hasLocationPermission(activity)) {
+            if (!hasLocationPermission()) {
                 Log.w(TAG, "startLocation without permission");
                 nativeOnPermission(false);
                 return;
@@ -157,7 +176,9 @@ public final class LocationBridge {
         return out;
     }
 
-    public static void stopLocation(final Activity activity) {
+    public static void stopLocation() {
+        final Activity activity = MainActivity.current();
+        if (activity == null) return;
         activity.runOnUiThread(() -> {
             stopListening(activity);
             activity.stopService(new Intent(activity, LocationService.class));
@@ -179,8 +200,9 @@ public final class LocationBridge {
 
     // ---- misc platform actions --------------------------------------------
 
-    public static void openMap(final Activity activity, final double lat, final double lng,
-                               final String label) {
+    public static void openMap(final double lat, final double lng, final String label) {
+        final Activity activity = MainActivity.current();
+        if (activity == null) return;
         activity.runOnUiThread(() -> {
             String coords = lat + "," + lng;
             Uri geo = Uri.parse("geo:" + coords + "?q=" + coords
@@ -199,7 +221,9 @@ public final class LocationBridge {
         });
     }
 
-    public static void copyText(final Activity activity, final String text) {
+    public static void copyText(final String text) {
+        final Activity activity = MainActivity.current();
+        if (activity == null) return;
         activity.runOnUiThread(() -> {
             ClipboardManager cm =
                     (ClipboardManager) activity.getSystemService(Context.CLIPBOARD_SERVICE);
@@ -214,7 +238,9 @@ public final class LocationBridge {
         });
     }
 
-    public static void shareText(final Activity activity, final String text) {
+    public static void shareText(final String text) {
+        final Activity activity = MainActivity.current();
+        if (activity == null) return;
         activity.runOnUiThread(() -> {
             Intent send = new Intent(Intent.ACTION_SEND);
             send.setType("text/plain");

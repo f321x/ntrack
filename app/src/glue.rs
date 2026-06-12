@@ -5,9 +5,17 @@
 //! this module registers the native callbacks it invokes and forwards calls
 //! from the [`Platform`] trait into its static methods.
 //!
+//! Important: the context published by the android-activity glue
+//! (`ndk_context::android_context().context()`) is the **Application**, not
+//! the Activity — passing it where Java expects an `Activity` aborts under
+//! CheckJNI. We therefore never pass a context across JNI: the bridge
+//! methods take only primitives/strings and resolve the live activity on
+//! the Java side (`MainActivity.current()`). The Application context is
+//! used here once, at init, to reach the app class loader.
+//!
 //! The module compiles on every platform (so host `cargo check`/`clippy`
-//! cover it) but can only be *constructed* on Android, where
-//! `ndk-context` is initialized by the android-activity glue.
+//! cover it) but can only be *constructed* on Android, where `ndk-context`
+//! is initialized by the android-activity glue.
 
 use std::ffi::c_void;
 use std::sync::OnceLock;
@@ -27,7 +35,6 @@ static PLATFORM_TX: OnceLock<mpsc::UnboundedSender<PlatformEvent>> = OnceLock::n
 
 pub struct AndroidPlatform {
     vm: JavaVM,
-    activity: GlobalRef,
     bridge: GlobalRef,
 }
 
@@ -40,21 +47,18 @@ impl AndroidPlatform {
         let vm = unsafe { JavaVM::from_raw(ctx.vm().cast()) }
             .map_err(|e| format!("JavaVM::from_raw: {e}"))?;
 
-        let (activity, bridge) = {
+        let bridge = {
             let mut env = vm
                 .attach_current_thread()
                 .map_err(|e| format!("attach: {e}"))?;
 
-            let activity_obj = unsafe { JObject::from_raw(ctx.context() as jni::sys::jobject) };
-            let activity = env
-                .new_global_ref(&activity_obj)
-                .map_err(|e| format!("global ref activity: {e}"))?;
-
             // App classes are invisible to FindClass on native threads; go
-            // through the activity's class loader instead.
+            // through the app context's class loader instead. (`context()`
+            // is the Application object — fine for getClassLoader.)
+            let context_obj = unsafe { JObject::from_raw(ctx.context() as jni::sys::jobject) };
             let loader = env
                 .call_method(
-                    &activity_obj,
+                    &context_obj,
                     "getClassLoader",
                     "()Ljava/lang/ClassLoader;",
                     &[],
@@ -94,20 +98,20 @@ impl AndroidPlatform {
                 ],
             )
             .map_err(|e| format!("register natives: {e}"))?;
-            (activity, bridge)
+            bridge
         };
 
         let _ = PLATFORM_TX.set(tx);
-        Ok(Self { vm, activity, bridge })
+        Ok(Self { vm, bridge })
     }
 
-    /// Attach (if needed) and run `f` with the env, activity and bridge
-    /// class. JNI errors are logged and swallowed: platform calls are
+    /// Attach (if needed) and run `f` with the env and the bridge class.
+    /// JNI errors are logged and swallowed: platform calls are
     /// fire-and-forget from the app's perspective.
     fn with_env<R>(
         &self,
         what: &str,
-        f: impl FnOnce(&mut JNIEnv, &JObject, &JClass) -> jni::errors::Result<R>,
+        f: impl FnOnce(&mut JNIEnv, &JClass) -> jni::errors::Result<R>,
     ) -> Option<R> {
         let mut guard = match self.vm.attach_current_thread() {
             Ok(g) => g,
@@ -119,7 +123,7 @@ impl AndroidPlatform {
         let env: &mut JNIEnv = &mut guard;
         let bridge_obj = self.bridge.as_obj();
         let class: &JClass = bridge_obj.into();
-        match f(env, self.activity.as_obj(), class) {
+        match f(env, class) {
             Ok(r) => Some(r),
             Err(e) => {
                 log::error!("jni call {what} failed: {e}");
@@ -135,63 +139,47 @@ impl AndroidPlatform {
 
 impl Platform for AndroidPlatform {
     fn has_location_permission(&self) -> bool {
-        self.with_env("hasLocationPermission", |env, activity, class| {
-            env.call_static_method(
-                class,
-                "hasLocationPermission",
-                "(Landroid/app/Activity;)Z",
-                &[JValue::Object(activity)],
-            )
-            .and_then(|v| v.z())
+        self.with_env("hasLocationPermission", |env, class| {
+            env.call_static_method(class, "hasLocationPermission", "()Z", &[])
+                .and_then(|v| v.z())
         })
         .unwrap_or(false)
     }
 
     fn request_location_permission(&self) {
-        self.with_env("requestLocationPermission", |env, activity, class| {
-            env.call_static_method(
-                class,
-                "requestLocationPermission",
-                "(Landroid/app/Activity;)V",
-                &[JValue::Object(activity)],
-            )
-            .map(|_| ())
+        self.with_env("requestLocationPermission", |env, class| {
+            env.call_static_method(class, "requestLocationPermission", "()V", &[])
+                .map(|_| ())
         });
     }
 
     fn start_location(&self, interval_ms: u64) {
-        self.with_env("startLocation", |env, activity, class| {
+        self.with_env("startLocation", |env, class| {
             env.call_static_method(
                 class,
                 "startLocation",
-                "(Landroid/app/Activity;J)V",
-                &[JValue::Object(activity), JValue::Long(interval_ms as i64)],
+                "(J)V",
+                &[JValue::Long(interval_ms as i64)],
             )
             .map(|_| ())
         });
     }
 
     fn stop_location(&self) {
-        self.with_env("stopLocation", |env, activity, class| {
-            env.call_static_method(
-                class,
-                "stopLocation",
-                "(Landroid/app/Activity;)V",
-                &[JValue::Object(activity)],
-            )
-            .map(|_| ())
+        self.with_env("stopLocation", |env, class| {
+            env.call_static_method(class, "stopLocation", "()V", &[])
+                .map(|_| ())
         });
     }
 
     fn open_map(&self, lat: f64, lng: f64, label: &str) {
-        self.with_env("openMap", |env, activity, class| {
+        self.with_env("openMap", |env, class| {
             let jlabel = env.new_string(label)?;
             env.call_static_method(
                 class,
                 "openMap",
-                "(Landroid/app/Activity;DDLjava/lang/String;)V",
+                "(DDLjava/lang/String;)V",
                 &[
-                    JValue::Object(activity),
                     JValue::Double(lat),
                     JValue::Double(lng),
                     JValue::Object(&jlabel),
@@ -202,26 +190,26 @@ impl Platform for AndroidPlatform {
     }
 
     fn copy_text(&self, text: &str) {
-        self.with_env("copyText", |env, activity, class| {
+        self.with_env("copyText", |env, class| {
             let jtext = env.new_string(text)?;
             env.call_static_method(
                 class,
                 "copyText",
-                "(Landroid/app/Activity;Ljava/lang/String;)V",
-                &[JValue::Object(activity), JValue::Object(&jtext)],
+                "(Ljava/lang/String;)V",
+                &[JValue::Object(&jtext)],
             )
             .map(|_| ())
         });
     }
 
     fn share_text(&self, text: &str) {
-        self.with_env("shareText", |env, activity, class| {
+        self.with_env("shareText", |env, class| {
             let jtext = env.new_string(text)?;
             env.call_static_method(
                 class,
                 "shareText",
-                "(Landroid/app/Activity;Ljava/lang/String;)V",
-                &[JValue::Object(activity), JValue::Object(&jtext)],
+                "(Ljava/lang/String;)V",
+                &[JValue::Object(&jtext)],
             )
             .map(|_| ())
         });
