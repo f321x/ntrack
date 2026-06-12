@@ -1,0 +1,20 @@
+[package]
+name = "ntrack-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "NIP-GART (kind:694) live location sharing protocol core: events, crypto, relays, engines"
+
+[dependencies]
+nostr.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+log.workspace = true
+tokio.workspace = true
+tokio-tungstenite = { version = "0.29", features = ["rustls-tls-webpki-roots"] }
+futures-util = { version = "0.3", default-features = false, features = ["std", "sink"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }

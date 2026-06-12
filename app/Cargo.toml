@@ -1,0 +1,45 @@
+[package]
+name = "ntrack-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "ntrack: live location sharing over Nostr (NIP-GART), Slint UI"
+
+[lib]
+name = "ntrack_app"
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "ntrack-desktop"
+path = "src/main.rs"
+required-features = ["desktop"]
+
+[dependencies]
+ntrack-core = { path = "../core" }
+log.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+slint = { version = "1.16", default-features = false, features = ["std", "compat-1-2"] }
+qrcode = { version = "0.14", default-features = false }
+# JNI glue is compiled (but unused) on desktop too, so `cargo check` on the
+# host validates it without an NDK.
+jni = "0.22"
+ndk-context = "0.1"
+
+[target.'cfg(target_os = "android")'.dependencies]
+android_logger = "0.15"
+
+[target.'cfg(not(target_os = "android"))'.dependencies]
+env_logger = { version = "0.11", default-features = false, features = ["auto-color", "humantime"] }
+
+[features]
+default = []
+# Desktop development build: `cargo run -p ntrack-app --features desktop`
+desktop = ["slint/backend-winit", "slint/renderer-femtovg", "slint/accessibility"]
+# Android build (via cargo-ndk): brings in the android-activity backend
+# (which renders with Skia).
+android = ["slint/backend-android-activity-06"]
+
+[build-dependencies]
+slint-build = "1.16"

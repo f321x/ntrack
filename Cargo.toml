@@ -1,0 +1,28 @@
+[workspace]
+resolver = "2"
+members = ["core", "app"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/f321x/ntrack"
+
+[workspace.dependencies]
+nostr = { version = "0.44", default-features = false, features = ["std", "nip44"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+log = "0.4"
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "time", "net", "macros"] }
+
+# Native libraries shipped in the APK are built with the release profile.
+# Thin LTO + debuginfo stripping keeps libntrack_app.so reasonably small.
+[profile.release]
+lto = "thin"
+strip = "debuginfo"
+panic = "abort"
+
+[profile.release.package.ntrack-core]
+# keep overflow checks in the protocol layer even in release builds
+overflow-checks = true
