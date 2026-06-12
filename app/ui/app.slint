@@ -161,6 +161,7 @@ component SharePage inherits ScrollView {
     VerticalLayout {
         padding: Theme.pad;
         spacing: 12px;
+        alignment: start;
 
         Card {
             VerticalLayout {
@@ -353,6 +354,7 @@ component TrackPage inherits ScrollView {
     VerticalLayout {
         padding: Theme.pad;
         spacing: 12px;
+        alignment: start;
         if !root.can-receive-any : Card {
             VerticalLayout {
                 padding: Theme.pad;
@@ -443,6 +445,7 @@ component GroupsPage inherits ScrollView {
     VerticalLayout {
         padding: Theme.pad;
         spacing: 12px;
+        alignment: start;
 
         SectionTitle { text: "YOUR GROUPS"; }
         if root.groups.length == 0 : Text {
@@ -506,6 +509,7 @@ component SettingsPage inherits ScrollView {
     VerticalLayout {
         padding: Theme.pad;
         spacing: 12px;
+        alignment: start;
 
         SectionTitle { text: "RELAYS"; }
         Card {
@@ -763,7 +767,8 @@ export component MainWindow inherits Window {
             x: (parent.width - self.width) / 2;
             y: (parent.height - self.height) / 2;
             width: min(parent.width - 32px, 380px);
-            VerticalLayout {
+            height: key-dialog-layout.preferred-height;
+            key-dialog-layout := VerticalLayout {
                 padding: Theme.pad;
                 spacing: 10px;
                 Text {
@@ -830,7 +835,8 @@ export component MainWindow inherits Window {
             x: (parent.width - self.width) / 2;
             y: (parent.height - self.height) / 2;
             width: min(parent.width - 32px, 380px);
-            VerticalLayout {
+            height: rename-dialog-layout.preferred-height;
+            rename-dialog-layout := VerticalLayout {
                 padding: Theme.pad;
                 spacing: 10px;
                 Text { text: "Name this sender"; color: Theme.text; font-size: 16px; font-weight: 700; }
@@ -867,7 +873,8 @@ export component MainWindow inherits Window {
             x: (parent.width - self.width) / 2;
             y: (parent.height - self.height) / 2;
             width: min(parent.width - 32px, 380px);
-            VerticalLayout {
+            height: confirm-dialog-layout.preferred-height;
+            confirm-dialog-layout := VerticalLayout {
                 padding: Theme.pad;
                 spacing: 10px;
                 Text { text: root.confirm-title; color: Theme.text; font-size: 16px; font-weight: 700; wrap: word-wrap; }
