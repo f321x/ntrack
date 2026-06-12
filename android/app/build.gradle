@@ -1,0 +1,47 @@
+plugins {
+    id 'com.android.application'
+}
+
+android {
+    namespace 'io.ntrack.app'
+    compileSdk 34
+
+    defaultConfig {
+        applicationId "io.ntrack.app"
+        minSdk 26
+        targetSdk 34
+        versionCode 1
+        versionName "0.1.0"
+
+        // ABIs are controlled by which jniLibs cargo-ndk produced; this
+        // filter just guards against stray folders.
+        ndk {
+            //noinspection ChromeOsAbiSupport
+            abiFilters = (project.findProperty('ntrackAbis') ?: 'arm64-v8a,armeabi-v7a,x86_64').split(',')
+        }
+    }
+
+    buildTypes {
+        debug {
+            // Rust code is compiled by cargo-ndk before Gradle runs; the
+            // "debug" APK intentionally packages release-profile .so files
+            // (a debug-profile Slint+Skia build is huge and slow).
+            debuggable true
+        }
+        release {
+            minifyEnabled false
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    // libntrack_app.so (+ libc++_shared.so) are placed in
+    // src/main/jniLibs/<abi>/ by scripts/build-apk.sh via cargo-ndk.
+}
+
+dependencies {
+    // none — plain Android framework APIs only
+}
