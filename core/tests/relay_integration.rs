@@ -173,7 +173,7 @@ async fn subscription_is_sent_and_incoming_event_is_decryptable() {
             PoolEvent::Incoming { event: got, .. } => {
                 assert_eq!(got.id, event.id);
                 let mut seen = SeenIds::new(8);
-                let inc = protocol::process_incoming(&got, &[group.clone()], &mut seen).unwrap();
+                let inc = protocol::process_incoming(&got, std::slice::from_ref(&group), &mut seen).unwrap();
                 assert_eq!(inc.payload.lat, Some(48.2));
                 break;
             }

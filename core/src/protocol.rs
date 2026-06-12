@@ -330,7 +330,7 @@ mod tests {
         assert_eq!(ptags, vec![&group.public_key()]);
 
         let mut s = seen();
-        let inc = process_incoming(&event, &[group.clone()], &mut s).unwrap();
+        let inc = process_incoming(&event, std::slice::from_ref(&group), &mut s).unwrap();
         assert_eq!(inc.sender, sender.public_key());
         assert_eq!(inc.group, group.public_key());
         assert_eq!(inc.payload, payload);

@@ -3308,7 +3308,7 @@ version = "0.1.0"
 dependencies = [
  "android_logger",
  "env_logger",
- "jni 0.22.4",
+ "jni 0.21.1",
  "log",
  "ndk-context",
  "ntrack-core",

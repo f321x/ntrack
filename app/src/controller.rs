@@ -1,0 +1,781 @@
+//! Controller: bridges the Slint UI, the core engine and the platform.
+//!
+//! Threading model:
+//! * Slint callbacks run on the UI thread and call [`Controller`] methods.
+//! * The engine runs inside a private tokio runtime; its [`UiEvent`]s are
+//!   folded into [`ViewState`] and re-rendered onto the UI thread via
+//!   `Weak::upgrade_in_event_loop`.
+//! * A 1 s UI timer re-renders relative timestamps and expires toasts.
+
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use ntrack_core::config::{ConfigStore, Group};
+use ntrack_core::engine::{
+    now_secs, ConfigSnapshot, Engine, EngineCmd, LocationSample, ShareSnapshot, TrackSnapshot,
+    UiEvent,
+};
+use ntrack_core::keys::{parse_group_key, ParsedGroupKey};
+use ntrack_core::protocol::Status;
+use ntrack_core::relay::{normalize_relay_url, RelayPool};
+use slint::Weak;
+use tokio::sync::mpsc;
+
+use crate::platform::{Platform, PlatformEvent};
+use crate::{GroupItem, MainWindow, RelayItem, TrackItem};
+
+/// Publish interval choices shown in the UI, in seconds.
+pub const INTERVALS: [u64; 4] = [15, 30, 60, 300];
+const TOAST_DURATION: Duration = Duration::from_secs(3);
+
+#[derive(Clone)]
+enum Confirm {
+    RotateGroup(String),
+    DeleteGroup(String),
+}
+
+#[derive(Clone)]
+enum AfterPermission {
+    StartShare { msg: String },
+    SendTest,
+}
+
+#[derive(Default)]
+struct ViewState {
+    config: Option<ConfigSnapshot>,
+    share: Option<ShareSnapshot>,
+    tracks: Vec<TrackSnapshot>,
+    relays: Vec<(String, bool)>,
+    toast: Option<(String, Instant)>,
+    confirm: Option<Confirm>,
+    after_permission: Option<AfterPermission>,
+    location_active: bool,
+}
+
+pub struct Controller {
+    rt: tokio::runtime::Runtime,
+    cmd_tx: mpsc::UnboundedSender<EngineCmd>,
+    platform: Arc<dyn Platform>,
+    ui: Weak<MainWindow>,
+    view: Arc<Mutex<ViewState>>,
+}
+
+impl Controller {
+    pub fn new(
+        data_dir: PathBuf,
+        platform: Arc<dyn Platform>,
+        ui: Weak<MainWindow>,
+    ) -> Arc<Self> {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+
+        let (pool_tx, mut pool_rx) = mpsc::unbounded_channel();
+        let (ui_tx, ui_rx) = mpsc::unbounded_channel();
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+
+        let store = ConfigStore::new(&data_dir);
+        rt.block_on(async {
+            let pool = RelayPool::new(pool_tx);
+            let engine = Engine::new(store, pool, ui_tx);
+            tokio::spawn(engine.run(cmd_rx));
+        });
+
+        // pool events → engine commands
+        let cmd_tx2 = cmd_tx.clone();
+        rt.spawn(async move {
+            while let Some(ev) = pool_rx.recv().await {
+                if cmd_tx2.send(EngineCmd::Pool(ev)).is_err() {
+                    break;
+                }
+            }
+        });
+
+        let ctrl = Arc::new(Self {
+            rt,
+            cmd_tx,
+            platform,
+            ui,
+            view: Arc::new(Mutex::new(ViewState::default())),
+        });
+        ctrl.clone().spawn_ui_event_loop(ui_rx);
+        ctrl
+    }
+
+    /// Feed platform events (location fixes, permission results) in.
+    pub fn spawn_platform_forwarder(
+        self: &Arc<Self>,
+        mut rx: mpsc::UnboundedReceiver<PlatformEvent>,
+    ) {
+        let ctrl = self.clone();
+        self.rt.spawn(async move {
+            while let Some(ev) = rx.recv().await {
+                ctrl.on_platform_event(ev);
+            }
+        });
+    }
+
+    fn on_platform_event(self: &Arc<Self>, ev: PlatformEvent) {
+        match ev {
+            PlatformEvent::Location(sample) => {
+                let _ = self.cmd_tx.send(EngineCmd::Location(sample));
+            }
+            PlatformEvent::PermissionResult(granted) => {
+                let pending = self.view.lock().unwrap().after_permission.take();
+                if granted {
+                    match pending {
+                        Some(AfterPermission::StartShare { msg }) => {
+                            let _ = self.cmd_tx.send(EngineCmd::StartShare {
+                                msg: Some(msg).filter(|m| !m.trim().is_empty()),
+                            });
+                        }
+                        Some(AfterPermission::SendTest) => {
+                            let _ = self.cmd_tx.send(EngineCmd::SendTest);
+                        }
+                        None => {}
+                    }
+                } else {
+                    self.toast("Location permission denied");
+                    let sharing = self
+                        .view
+                        .lock()
+                        .unwrap()
+                        .share
+                        .as_ref()
+                        .map(|s| s.sharing)
+                        .unwrap_or(false);
+                    if sharing {
+                        let _ = self
+                            .cmd_tx
+                            .send(EngineCmd::LocationUnavailable("permission denied".into()));
+                    }
+                }
+            }
+        }
+    }
+
+    fn spawn_ui_event_loop(self: Arc<Self>, mut ui_rx: mpsc::UnboundedReceiver<UiEvent>) {
+        let ctrl = self.clone();
+        self.rt.spawn(async move {
+            while let Some(ev) = ui_rx.recv().await {
+                ctrl.on_ui_event(ev);
+            }
+        });
+    }
+
+    fn on_ui_event(self: &Arc<Self>, ev: UiEvent) {
+        match ev {
+            UiEvent::Config(c) => {
+                self.view.lock().unwrap().config = Some(c);
+            }
+            UiEvent::Share(s) => {
+                self.view.lock().unwrap().share = Some(s);
+            }
+            UiEvent::Tracks(t) => {
+                self.view.lock().unwrap().tracks = t;
+            }
+            UiEvent::Relays(r) => {
+                self.view.lock().unwrap().relays = r;
+            }
+            UiEvent::Toast(msg) => {
+                self.view.lock().unwrap().toast = Some((msg, Instant::now() + TOAST_DURATION));
+            }
+            UiEvent::NeedLocation(on) => {
+                let interval_ms = {
+                    let mut view = self.view.lock().unwrap();
+                    view.location_active = on;
+                    view.config
+                        .as_ref()
+                        .map(|c| c.interval_secs * 1000)
+                        .unwrap_or(30_000)
+                };
+                if on {
+                    self.platform.start_location(interval_ms);
+                } else {
+                    self.platform.stop_location();
+                }
+            }
+            UiEvent::GroupShare(share) => {
+                // Build the QR off the UI thread; create the image on it.
+                let payload = share
+                    .nsec
+                    .as_ref()
+                    .map(|s| s.expose().to_string())
+                    .unwrap_or_else(|| share.npub.clone());
+                let qr = qr_pixel_buffer(&payload);
+                let name = share.name.clone();
+                let npub = share.npub.clone();
+                let nsec = share
+                    .nsec
+                    .as_ref()
+                    .map(|s| s.expose().to_string())
+                    .unwrap_or_default();
+                let _ = self.ui.upgrade_in_event_loop(move |ui| {
+                    ui.set_key_dialog_name(name.into());
+                    ui.set_key_dialog_npub(npub.into());
+                    ui.set_key_dialog_nsec(nsec.into());
+                    if let Some(buf) = qr {
+                        ui.set_key_dialog_qr(slint::Image::from_rgba8(buf));
+                    }
+                    ui.set_key_dialog_visible(true);
+                });
+                return; // dialog props set directly; no full render needed
+            }
+        }
+        self.schedule_render();
+    }
+
+    fn toast(self: &Arc<Self>, msg: &str) {
+        self.view.lock().unwrap().toast = Some((msg.to_string(), Instant::now() + TOAST_DURATION));
+        self.schedule_render();
+    }
+
+    fn schedule_render(self: &Arc<Self>) {
+        let ctrl = self.clone();
+        let _ = self.ui.upgrade_in_event_loop(move |ui| ctrl.render(&ui));
+    }
+
+    /// Render the entire view state onto the UI. Idempotent; called from the
+    /// UI thread only.
+    pub fn render(&self, ui: &MainWindow) {
+        let mut view = self.view.lock().unwrap();
+
+        // toast expiry
+        if let Some((_, deadline)) = &view.toast {
+            if Instant::now() >= *deadline {
+                view.toast = None;
+            }
+        }
+        ui.set_toast(
+            view.toast
+                .as_ref()
+                .map(|(m, _)| m.as_str())
+                .unwrap_or("")
+                .into(),
+        );
+
+        if let Some(cfg) = &view.config {
+            let groups: Vec<GroupItem> = cfg
+                .groups
+                .iter()
+                .map(|g| GroupItem {
+                    id: g.id.clone().into(),
+                    name: g.name.clone().into(),
+                    npub: shorten(&g.npub).into(),
+                    can_receive: g.can_receive,
+                    selected: g.selected,
+                })
+                .collect();
+            ui.set_groups(slint::ModelRc::new(slint::VecModel::from(groups)));
+            ui.set_can_receive_any(cfg.groups.iter().any(|g| g.can_receive));
+            ui.set_sender_npub(cfg.sender_npub.clone().into());
+            ui.set_interval_index(
+                INTERVALS
+                    .iter()
+                    .position(|s| *s == cfg.interval_secs)
+                    .unwrap_or(1) as i32,
+            );
+        }
+
+        let relays: Vec<RelayItem> = view
+            .relays
+            .iter()
+            .map(|(url, connected)| RelayItem {
+                url: url.clone().into(),
+                connected: *connected,
+            })
+            .collect();
+        ui.set_relays(slint::ModelRc::new(slint::VecModel::from(relays)));
+
+        let connected = view.relays.iter().filter(|(_, c)| *c).count();
+        let total = view.relays.len();
+
+        let share = view.share.clone().unwrap_or(ShareSnapshot {
+            sharing: false,
+            test_pending: false,
+            last_publish: None,
+            publish_count: 0,
+            last_acked: false,
+            waiting_for_fix: false,
+        });
+        ui.set_sharing(share.sharing);
+        ui.set_test_pending(share.test_pending);
+        ui.set_waiting_fix(share.sharing && share.waiting_for_fix);
+        let (headline, detail) = share_status_strings(&share, connected, total);
+        ui.set_status_headline(headline.into());
+        ui.set_status_detail(detail.into());
+
+        let tracks: Vec<TrackItem> = view
+            .tracks
+            .iter()
+            .map(|t| {
+                let title = if t.label.is_empty() {
+                    t.sender_short.clone()
+                } else {
+                    t.label.clone()
+                };
+                let has_coords = !(t.lat == 0.0 && t.lng == 0.0 && t.ts == 0);
+                TrackItem {
+                    sender: t.sender_hex.clone().into(),
+                    title: title.into(),
+                    group: t.group_name.clone().into(),
+                    status: match t.status {
+                        Status::Active => "LIVE",
+                        Status::Test => "TEST",
+                        Status::Stop => "ENDED",
+                    }
+                    .into(),
+                    coords: if has_coords {
+                        format!("{:.5}, {:.5}", t.lat, t.lng).into()
+                    } else {
+                        "".into()
+                    },
+                    ago: ago_string(t.ts, t.created_at),
+                    msg: t.msg.clone().into(),
+                    live: t.live,
+                    is_test: t.is_test,
+                    has_coords,
+                }
+            })
+            .collect();
+        ui.set_tracks(slint::ModelRc::new(slint::VecModel::from(tracks)));
+    }
+
+    // ---- UI callback wiring ---------------------------------------------
+
+    pub fn attach(self: &Arc<Self>, ui: &MainWindow) {
+        macro_rules! hook {
+            ($setter:ident, |$ctrl:ident $(, $arg:ident : $ty:ty)*| $body:block) => {{
+                let $ctrl = self.clone();
+                ui.$setter(move |$($arg: $ty),*| $body);
+            }};
+        }
+
+        hook!(on_toggle_group, |ctrl, id: slint::SharedString, on: bool| {
+            let id = id.to_string();
+            ctrl.mutate(move |c| {
+                if let Some(g) = c.groups.iter_mut().find(|g| g.public == id) {
+                    g.selected = on;
+                }
+            });
+        });
+
+        hook!(on_start_share, |ctrl, msg: slint::SharedString| {
+            ctrl.start_share(msg.to_string());
+        });
+
+        hook!(on_stop_share, |ctrl| {
+            let _ = ctrl.cmd_tx.send(EngineCmd::StopShare);
+        });
+
+        hook!(on_send_test, |ctrl| {
+            ctrl.send_test();
+        });
+
+        hook!(on_set_interval, |ctrl, idx: i32| {
+            let secs = INTERVALS
+                .get(idx.max(0) as usize)
+                .copied()
+                .unwrap_or(30);
+            ctrl.mutate(move |c| c.interval_secs = secs);
+            // apply immediately if location updates are running
+            let active = ctrl.view.lock().unwrap().location_active;
+            if active {
+                ctrl.platform.stop_location();
+                ctrl.platform.start_location(secs * 1000);
+            }
+        });
+
+        hook!(on_message_edited, |ctrl, msg: slint::SharedString| {
+            let m = msg.trim().to_string();
+            let _ = ctrl
+                .cmd_tx
+                .send(EngineCmd::SetMessage(if m.is_empty() { None } else { Some(m) }));
+        });
+
+        hook!(on_open_map, |ctrl, idx: i32| {
+            let item = ctrl
+                .view
+                .lock()
+                .unwrap()
+                .tracks
+                .get(idx.max(0) as usize)
+                .cloned();
+            if let Some(t) = item {
+                let label = if t.label.is_empty() { &t.sender_short } else { &t.label };
+                ctrl.platform.open_map(t.lat, t.lng, label);
+            }
+        });
+
+        hook!(on_rename_sender_confirmed, |ctrl,
+                                           sender: slint::SharedString,
+                                           label: slint::SharedString| {
+            let (s, l) = (sender.to_string(), label.to_string());
+            ctrl.mutate(move |c| c.set_label(&s, &l));
+        });
+
+        hook!(on_create_group, |ctrl, name: slint::SharedString| {
+            let name = name.trim().to_string();
+            if name.is_empty() {
+                ctrl.toast("Give the group a name");
+                return;
+            }
+            match Group::new_member(name) {
+                Ok(group) => {
+                    let id = group.public.clone();
+                    ctrl.mutate(move |c| c.groups.push(group));
+                    // immediately offer the key for distribution
+                    let _ = ctrl.cmd_tx.send(EngineCmd::RequestGroupShare { group_hex: id });
+                }
+                Err(e) => ctrl.toast(&format!("Could not create group: {e}")),
+            }
+        });
+
+        hook!(on_import_group, |ctrl,
+                                name: slint::SharedString,
+                                key: slint::SharedString| {
+            ctrl.import_group(name.to_string(), key.to_string());
+        });
+
+        hook!(on_share_group, |ctrl, id: slint::SharedString| {
+            let _ = ctrl
+                .cmd_tx
+                .send(EngineCmd::RequestGroupShare { group_hex: id.to_string() });
+        });
+
+        hook!(on_rotate_group, |ctrl, id: slint::SharedString| {
+            ctrl.view.lock().unwrap().confirm = Some(Confirm::RotateGroup(id.to_string()));
+            let _ = ctrl.ui.upgrade_in_event_loop(move |ui| {
+                ui.set_confirm_title("Rotate group key?".into());
+                ui.set_confirm_body(
+                    "A new secret key is generated for this group. Every member must import the new key — the old one stops working for new broadcasts. Do this whenever someone leaves the group."
+                        .into(),
+                );
+                ui.set_confirm_action("Rotate".into());
+                ui.set_confirm_dialog_visible(true);
+            });
+        });
+
+        hook!(on_delete_group, |ctrl, id: slint::SharedString| {
+            ctrl.view.lock().unwrap().confirm = Some(Confirm::DeleteGroup(id.to_string()));
+            let _ = ctrl.ui.upgrade_in_event_loop(move |ui| {
+                ui.set_confirm_title("Delete group?".into());
+                ui.set_confirm_body(
+                    "The key is removed from this device. You will stop receiving locations for this group; other members are unaffected."
+                        .into(),
+                );
+                ui.set_confirm_action("Delete".into());
+                ui.set_confirm_dialog_visible(true);
+            });
+        });
+
+        hook!(on_confirm_accepted, |ctrl| {
+            let confirm = ctrl.view.lock().unwrap().confirm.take();
+            match confirm {
+                Some(Confirm::RotateGroup(id)) => {
+                    let _ = ctrl.cmd_tx.send(EngineCmd::RotateGroup { group_hex: id });
+                }
+                Some(Confirm::DeleteGroup(id)) => {
+                    ctrl.mutate(move |c| c.groups.retain(|g| g.public != id));
+                }
+                None => {}
+            }
+        });
+
+        hook!(on_add_relay, |ctrl, url: slint::SharedString| {
+            match normalize_relay_url(url.as_str()) {
+                Ok(u) => ctrl.mutate(move |c| {
+                    if !c.relays.contains(&u) {
+                        c.relays.push(u);
+                    }
+                }),
+                Err(_) => ctrl.toast("Invalid relay URL"),
+            }
+        });
+
+        hook!(on_remove_relay, |ctrl, url: slint::SharedString| {
+            let u = url.to_string();
+            ctrl.mutate(move |c| c.relays.retain(|r| r != &u));
+        });
+
+        hook!(on_rotate_sender, |ctrl| {
+            ctrl.mutate(|c| {
+                let _ = c.rotate_sender();
+            });
+            ctrl.toast("Sender key rotated — receivers will see you as a new sender");
+        });
+
+        hook!(on_copy_text, |ctrl, text: slint::SharedString| {
+            ctrl.platform.copy_text(text.as_str());
+            ctrl.toast("Copied to clipboard");
+        });
+
+        hook!(on_system_share, |ctrl, text: slint::SharedString| {
+            ctrl.platform.share_text(text.as_str());
+        });
+    }
+
+    fn mutate(
+        self: &Arc<Self>,
+        f: impl FnOnce(&mut ntrack_core::config::Config) + Send + 'static,
+    ) {
+        let _ = self.cmd_tx.send(EngineCmd::Mutate(Box::new(f)));
+    }
+
+    fn start_share(self: &Arc<Self>, msg: String) {
+        // Refuse early when no group is selected so we don't pointlessly
+        // prompt for permissions (engine re-checks anyway).
+        let any_selected = self
+            .view
+            .lock()
+            .unwrap()
+            .config
+            .as_ref()
+            .map(|c| c.groups.iter().any(|g| g.selected))
+            .unwrap_or(false);
+        if !any_selected {
+            self.toast("Select at least one group to share with");
+            return;
+        }
+        if self.platform.has_location_permission() {
+            let _ = self.cmd_tx.send(EngineCmd::StartShare {
+                msg: Some(msg).filter(|m| !m.trim().is_empty()),
+            });
+        } else {
+            self.view.lock().unwrap().after_permission =
+                Some(AfterPermission::StartShare { msg });
+            self.platform.request_location_permission();
+        }
+    }
+
+    fn send_test(self: &Arc<Self>) {
+        if self.platform.has_location_permission() {
+            let _ = self.cmd_tx.send(EngineCmd::SendTest);
+        } else {
+            self.view.lock().unwrap().after_permission = Some(AfterPermission::SendTest);
+            self.platform.request_location_permission();
+        }
+    }
+
+    fn import_group(self: &Arc<Self>, name: String, key: String) {
+        let key = key.trim().to_string();
+        if key.is_empty() {
+            self.toast("Paste a group key (nsec1… or npub1…)");
+            return;
+        }
+        let parsed = match parse_group_key(&key) {
+            Ok(p) => p,
+            Err(e) => {
+                self.toast(&format!("{e}"));
+                return;
+            }
+        };
+        let (public, secret) = match parsed {
+            ParsedGroupKey::Member(keys) => (
+                keys.public_key().to_hex(),
+                Some(ntrack_core::keys::nsec(&keys)),
+            ),
+            ParsedGroupKey::SendOnly(pk) => (pk.to_hex(), None),
+        };
+        let exists = self
+            .view
+            .lock()
+            .unwrap()
+            .config
+            .as_ref()
+            .map(|c| c.groups.iter().any(|g| g.id == public))
+            .unwrap_or(false);
+        if exists {
+            self.toast("This group key is already imported");
+            return;
+        }
+        let name = if name.trim().is_empty() {
+            format!("Group {}", &public[..8])
+        } else {
+            name.trim().to_string()
+        };
+        let receive = secret.is_some();
+        self.mutate(move |c| {
+            c.groups.push(Group {
+                name,
+                public,
+                secret,
+                selected: true,
+            });
+        });
+        self.toast(if receive {
+            "Group imported — you can send and receive"
+        } else {
+            "Group imported (send-only)"
+        });
+    }
+
+    /// Drive location samples from the platform forwarder in tests/sim.
+    pub fn inject_location(&self, sample: LocationSample) {
+        let _ = self.cmd_tx.send(EngineCmd::Location(sample));
+    }
+
+    pub fn shutdown(&self) {
+        let _ = self.cmd_tx.send(EngineCmd::Shutdown);
+        // Give the engine a moment to flush state and emit the final STOP.
+        std::thread::sleep(Duration::from_millis(300));
+    }
+}
+
+/// "now", "12 s ago", "5 min ago", "3 h ago" — based on the location fix
+/// time when present, otherwise the event timestamp.
+fn ago_string(ts: u64, created_at: u64) -> slint::SharedString {
+    let t = if ts > 0 { ts } else { created_at };
+    if t == 0 {
+        return "".into();
+    }
+    let now = now_secs();
+    let d = now.saturating_sub(t);
+    let s = match d {
+        0..=4 => "just now".to_string(),
+        5..=59 => format!("{d} s ago"),
+        60..=3599 => format!("{} min ago", d / 60),
+        3600..=86399 => format!("{} h ago", d / 3600),
+        _ => format!("{} d ago", d / 86400),
+    };
+    s.into()
+}
+
+fn shorten(npub: &str) -> String {
+    if npub.len() > 21 {
+        format!("{}…{}", &npub[..14], &npub[npub.len() - 6..])
+    } else {
+        npub.to_string()
+    }
+}
+
+fn share_status_strings(s: &ShareSnapshot, connected: usize, total: usize) -> (String, String) {
+    if !s.sharing {
+        let headline = "Not sharing".to_string();
+        let detail = if total == 0 {
+            "Add a relay in Settings to get started.".to_string()
+        } else {
+            format!(
+                "{connected}/{total} relays connected. Your location is only sent while sharing is on."
+            )
+        };
+        return (headline, detail);
+    }
+    if s.waiting_for_fix {
+        return (
+            "Waiting for GPS fix…".to_string(),
+            format!("{connected}/{total} relays connected. Sharing starts at the first fix."),
+        );
+    }
+    let ack = if s.last_acked { "✓ relay confirmed" } else { "sending…" };
+    let last = s
+        .last_publish
+        .map(|t| {
+            let d = now_secs().saturating_sub(t);
+            if d < 5 {
+                "just now".to_string()
+            } else {
+                format!("{d} s ago")
+            }
+        })
+        .unwrap_or_else(|| "—".to_string());
+    (
+        "Sharing live location".to_string(),
+        format!(
+            "{connected}/{total} relays · {} updates sent · last {last} · {ack}",
+            s.publish_count
+        ),
+    )
+}
+
+/// Render a QR code into a pixel buffer (dark modules on white, 4-module
+/// quiet zone). Returns `None` if the payload doesn't fit a QR code.
+fn qr_pixel_buffer(data: &str) -> Option<slint::SharedPixelBuffer<slint::Rgba8Pixel>> {
+    let code = qrcode::QrCode::new(data.as_bytes()).ok()?;
+    let width = code.width();
+    let quiet = 4usize;
+    let size = (width + quiet * 2) as u32;
+    let mut buf = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::new(size, size);
+    let stride = size as usize;
+    let pixels = buf.make_mut_slice();
+    for p in pixels.iter_mut() {
+        *p = slint::Rgba8Pixel { r: 255, g: 255, b: 255, a: 255 };
+    }
+    let colors = code.to_colors();
+    for y in 0..width {
+        for x in 0..width {
+            if colors[y * width + x] == qrcode::Color::Dark {
+                pixels[(y + quiet) * stride + (x + quiet)] =
+                    slint::Rgba8Pixel { r: 16, g: 18, b: 24, a: 255 };
+            }
+        }
+    }
+    Some(buf)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ago_strings() {
+        let now = now_secs();
+        assert_eq!(ago_string(now, 0).as_str(), "just now");
+        assert_eq!(ago_string(now - 30, 0).as_str(), "30 s ago");
+        assert_eq!(ago_string(now - 120, 0).as_str(), "2 min ago");
+        assert_eq!(ago_string(now - 7200, 0).as_str(), "2 h ago");
+        assert_eq!(ago_string(0, now - 90).as_str(), "1 min ago");
+        assert_eq!(ago_string(0, 0).as_str(), "");
+    }
+
+    #[test]
+    fn qr_buffer_is_rendered() {
+        let buf = qr_pixel_buffer("nsec1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq").unwrap();
+        assert!(buf.width() > 20);
+        assert_eq!(buf.width(), buf.height());
+        // corners of the quiet zone are white
+        let px = buf.as_slice()[0];
+        assert_eq!((px.r, px.g, px.b), (255, 255, 255));
+    }
+
+    #[test]
+    fn status_strings() {
+        let s = ShareSnapshot {
+            sharing: false,
+            test_pending: false,
+            last_publish: None,
+            publish_count: 0,
+            last_acked: false,
+            waiting_for_fix: false,
+        };
+        let (h, d) = share_status_strings(&s, 2, 3);
+        assert_eq!(h, "Not sharing");
+        assert!(d.contains("2/3"));
+
+        let s = ShareSnapshot {
+            sharing: true,
+            test_pending: false,
+            last_publish: Some(now_secs()),
+            publish_count: 7,
+            last_acked: true,
+            waiting_for_fix: false,
+        };
+        let (h, d) = share_status_strings(&s, 3, 3);
+        assert_eq!(h, "Sharing live location");
+        assert!(d.contains("7 updates"));
+        assert!(d.contains("confirmed"));
+    }
+
+    #[test]
+    fn shorten_npub() {
+        let long = "npub1abcdefghijklmnopqrstuvwxyz0123456789";
+        let s = shorten(long);
+        assert!(s.len() < long.len());
+        assert!(s.starts_with("npub1"));
+        assert!(s.contains('…'));
+        assert_eq!(shorten("npub1short"), "npub1short");
+    }
+}

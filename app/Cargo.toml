@@ -24,7 +24,7 @@ slint = { version = "1.16", default-features = false, features = ["std", "compat
 qrcode = { version = "0.14", default-features = false }
 # JNI glue is compiled (but unused) on desktop too, so `cargo check` on the
 # host validates it without an NDK.
-jni = "0.22"
+jni = "0.21"
 ndk-context = "0.1"
 
 [target.'cfg(target_os = "android")'.dependencies]

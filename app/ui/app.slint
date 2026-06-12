@@ -1,0 +1,903 @@
+// ntrack — live location sharing over Nostr (NIP-GART, kind:694)
+//
+// Single-window phone UI with four pages and a bottom tab bar.
+// All data shown here is pushed from Rust as ready-to-render strings/models;
+// all interaction flows back through callbacks.
+
+import { LineEdit, ComboBox, ScrollView, Palette } from "std-widgets.slint";
+
+export struct GroupItem {
+    id: string,          // recipient pseudonym pubkey, hex
+    name: string,
+    npub: string,        // shortened npub for display
+    can-receive: bool,
+    selected: bool,
+}
+
+export struct TrackItem {
+    sender: string,      // sender pubkey hex (stable id)
+    title: string,       // label or short npub
+    group: string,
+    status: string,      // "LIVE" | "TEST" | "ENDED"
+    coords: string,
+    ago: string,
+    msg: string,
+    live: bool,
+    is-test: bool,
+    has-coords: bool,
+}
+
+export struct RelayItem {
+    url: string,
+    connected: bool,
+}
+
+global Theme {
+    out property <color> bg: #0f1117;
+    out property <color> card: #1a1d27;
+    out property <color> card-alt: #232736;
+    out property <color> accent: #8b5cf6;
+    out property <color> accent-dim: #6d45cc;
+    out property <color> text: #e8eaf2;
+    out property <color> muted: #9aa0b4;
+    out property <color> ok: #3ddc84;
+    out property <color> warn: #ffb347;
+    out property <color> danger: #ff5566;
+    out property <color> line: #2a2e3f;
+    out property <length> pad: 16px;
+    out property <length> radius: 14px;
+}
+
+component Card inherits Rectangle {
+    background: Theme.card;
+    border-radius: Theme.radius;
+    clip: true;
+}
+
+component AppButton inherits Rectangle {
+    in property <string> text;
+    in property <bool> primary: false;
+    in property <bool> danger: false;
+    in property <bool> enabled: true;
+    callback clicked;
+
+    height: 46px;
+    border-radius: 12px;
+    background: !self.enabled ? Theme.card-alt
+        : self.danger ? Theme.danger.darker(20%)
+        : self.primary ? (touch.pressed ? Theme.accent-dim : Theme.accent)
+        : (touch.pressed ? Theme.card-alt.brighter(15%) : Theme.card-alt);
+
+    Text {
+        text: root.text;
+        color: root.enabled ? (root.primary || root.danger ? #ffffff : Theme.text) : Theme.muted;
+        font-size: 15px;
+        font-weight: 600;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+    touch := TouchArea {
+        enabled: root.enabled;
+        clicked => { root.clicked(); }
+    }
+}
+
+component SmallButton inherits Rectangle {
+    in property <string> text;
+    in property <bool> danger: false;
+    callback clicked;
+    height: 30px;
+    width: label.preferred-width + 20px;
+    border-radius: 8px;
+    background: t.pressed ? Theme.card-alt.brighter(20%) : Theme.card-alt;
+    border-width: 1px;
+    border-color: root.danger ? Theme.danger.darker(10%) : Theme.line;
+    label := Text {
+        text: root.text;
+        color: root.danger ? Theme.danger : Theme.text;
+        font-size: 12px;
+        vertical-alignment: center;
+        horizontal-alignment: center;
+    }
+    t := TouchArea { clicked => { root.clicked(); } }
+}
+
+component StatusDot inherits Rectangle {
+    in property <bool> on;
+    in property <color> on-color: Theme.ok;
+    width: 10px;
+    height: 10px;
+    border-radius: 5px;
+    background: root.on ? root.on-color : #555b70;
+}
+
+component SectionTitle inherits Text {
+    color: Theme.muted;
+    font-size: 12px;
+    font-weight: 700;
+    letter-spacing: 1px;
+}
+
+component Toggle inherits Rectangle {
+    in property <bool> checked;
+    callback toggled(bool);
+    width: 44px;
+    height: 26px;
+    border-radius: 13px;
+    background: root.checked ? Theme.accent : Theme.card-alt;
+    animate background { duration: 120ms; }
+    Rectangle {
+        x: root.checked ? parent.width - self.width - 3px : 3px;
+        y: 3px;
+        width: 20px;
+        height: 20px;
+        border-radius: 10px;
+        background: #ffffff;
+        animate x { duration: 120ms; }
+    }
+    TouchArea { clicked => { root.toggled(!root.checked); } }
+}
+
+// ---------------------------------------------------------------- pages --
+
+component SharePage inherits ScrollView {
+    in property <[GroupItem]> groups;
+    in property <bool> sharing;
+    in property <bool> test-pending;
+    in property <bool> waiting-fix;
+    in property <string> status-headline;
+    in property <string> status-detail;
+    in property <int> interval-index;
+    in property <bool> location-permission;
+
+    callback toggle-group(string, bool);
+    callback start-share(string);
+    callback stop-share();
+    callback send-test();
+    callback set-interval(int);
+    callback message-edited(string);
+
+    VerticalLayout {
+        padding: Theme.pad;
+        spacing: 12px;
+
+        Card {
+            VerticalLayout {
+                padding: Theme.pad;
+                spacing: 6px;
+                HorizontalLayout {
+                    spacing: 8px;
+                    VerticalLayout {
+                        alignment: center;
+                        StatusDot {
+                            on: root.sharing;
+                            on-color: root.waiting-fix ? Theme.warn : Theme.ok;
+                        }
+                    }
+                    Text {
+                        text: root.status-headline;
+                        color: Theme.text;
+                        font-size: 18px;
+                        font-weight: 700;
+                        wrap: word-wrap;
+                    }
+                }
+                Text {
+                    text: root.status-detail;
+                    color: Theme.muted;
+                    font-size: 13px;
+                    wrap: word-wrap;
+                }
+            }
+        }
+
+        SectionTitle { text: "SHARE WITH"; }
+        Card {
+            VerticalLayout {
+                padding: 8px;
+                if root.groups.length == 0 : VerticalLayout {
+                    padding: 8px;
+                    Text {
+                        text: "No groups yet — create one in the Groups tab.";
+                        color: Theme.muted;
+                        font-size: 13px;
+                        wrap: word-wrap;
+                    }
+                }
+                for g[i] in root.groups : HorizontalLayout {
+                    padding: 8px;
+                    spacing: 10px;
+                    VerticalLayout {
+                        alignment: center;
+                        Toggle {
+                            checked: g.selected;
+                            toggled(v) => { root.toggle-group(g.id, v); }
+                        }
+                    }
+                    VerticalLayout {
+                        Text { text: g.name; color: Theme.text; font-size: 15px; }
+                        Text { text: g.npub; color: Theme.muted; font-size: 11px; }
+                    }
+                }
+            }
+        }
+
+        SectionTitle { text: "OPTIONS"; }
+        Card {
+            VerticalLayout {
+                padding: Theme.pad;
+                spacing: 10px;
+                msg-input := LineEdit {
+                    placeholder-text: "Optional message (e.g. \"on my way\")";
+                    enabled: true;
+                    edited(text) => { root.message-edited(text); }
+                }
+                HorizontalLayout {
+                    spacing: 10px;
+                    Text {
+                        text: "Update every";
+                        color: Theme.text;
+                        font-size: 14px;
+                        vertical-alignment: center;
+                    }
+                    interval-box := ComboBox {
+                        model: ["15 s", "30 s", "1 min", "5 min"];
+                        current-index: root.interval-index;
+                        selected => { root.set-interval(self.current-index); }
+                    }
+                }
+            }
+        }
+
+        AppButton {
+            text: root.sharing ? "Stop sharing" : "Start sharing";
+            primary: !root.sharing;
+            danger: root.sharing;
+            clicked => {
+                if (root.sharing) {
+                    root.stop-share();
+                } else {
+                    root.start-share(msg-input.text);
+                }
+            }
+        }
+        AppButton {
+            text: root.test-pending ? "Sending test…" : "Send test broadcast";
+            enabled: !root.test-pending;
+            clicked => { root.send-test(); }
+        }
+        Text {
+            text: "A test broadcast verifies the whole pipeline — relays, encryption and your group members' apps — without starting a live share.";
+            color: Theme.muted;
+            font-size: 12px;
+            wrap: word-wrap;
+        }
+    }
+}
+
+component TrackRow inherits Card {
+    in property <TrackItem> item;
+    callback open-map();
+    callback rename();
+
+    VerticalLayout {
+        padding: Theme.pad;
+        spacing: 6px;
+        HorizontalLayout {
+            spacing: 8px;
+            VerticalLayout {
+                alignment: center;
+                StatusDot {
+                    on: item.live || item.is-test;
+                    on-color: item.is-test ? Theme.warn : Theme.ok;
+                }
+            }
+            Text {
+                text: item.title;
+                color: Theme.text;
+                font-size: 16px;
+                font-weight: 700;
+                overflow: elide;
+                horizontal-stretch: 1;
+            }
+            Rectangle {
+                width: badge.preferred-width + 16px;
+                height: 22px;
+                border-radius: 11px;
+                background: item.is-test ? Theme.warn.darker(60%)
+                    : item.live ? Theme.ok.darker(60%) : Theme.card-alt;
+                badge := Text {
+                    text: item.status;
+                    color: item.is-test ? Theme.warn : item.live ? Theme.ok : Theme.muted;
+                    font-size: 11px;
+                    font-weight: 700;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+            }
+        }
+        Text { text: "Group: " + item.group; color: Theme.muted; font-size: 12px; }
+        if item.has-coords : Text {
+            text: item.coords;
+            color: Theme.text;
+            font-size: 13px;
+        }
+        if item.msg != "" : Text {
+            text: "“" + item.msg + "”";
+            color: Theme.warn;
+            font-size: 13px;
+            wrap: word-wrap;
+        }
+        HorizontalLayout {
+            spacing: 8px;
+            Text {
+                text: item.ago;
+                color: Theme.muted;
+                font-size: 12px;
+                vertical-alignment: center;
+                horizontal-stretch: 1;
+            }
+            SmallButton { text: "Rename"; clicked => { root.rename(); } }
+            if item.has-coords : SmallButton { text: "Open map"; clicked => { root.open-map(); } }
+        }
+    }
+}
+
+component TrackPage inherits ScrollView {
+    in property <[TrackItem]> tracks;
+    in property <bool> can-receive-any;
+    callback open-map(int);
+    callback rename-request(string, string); // sender hex, current title
+
+    VerticalLayout {
+        padding: Theme.pad;
+        spacing: 12px;
+        if !root.can-receive-any : Card {
+            VerticalLayout {
+                padding: Theme.pad;
+                spacing: 6px;
+                Text { text: "Not receiving"; color: Theme.text; font-size: 16px; font-weight: 700; }
+                Text {
+                    text: "To receive locations you need a group whose secret key you hold: create a group or import an nsec in the Groups tab.";
+                    color: Theme.muted;
+                    font-size: 13px;
+                    wrap: word-wrap;
+                }
+            }
+        }
+        if root.can-receive-any && root.tracks.length == 0 : Card {
+            VerticalLayout {
+                padding: Theme.pad;
+                spacing: 6px;
+                Text { text: "Listening…"; color: Theme.text; font-size: 16px; font-weight: 700; }
+                Text {
+                    text: "Live locations shared with your groups will appear here.";
+                    color: Theme.muted;
+                    font-size: 13px;
+                    wrap: word-wrap;
+                }
+            }
+        }
+        for t[i] in root.tracks : TrackRow {
+            item: t;
+            open-map => { root.open-map(i); }
+            rename => { root.rename-request(t.sender, t.title); }
+        }
+    }
+}
+
+component GroupRow inherits Card {
+    in property <GroupItem> item;
+    callback share-key();
+    callback rotate-key();
+    callback delete-group();
+
+    VerticalLayout {
+        padding: Theme.pad;
+        spacing: 8px;
+        HorizontalLayout {
+            spacing: 8px;
+            Text {
+                text: item.name;
+                color: Theme.text;
+                font-size: 16px;
+                font-weight: 700;
+                overflow: elide;
+                horizontal-stretch: 1;
+            }
+            Rectangle {
+                width: kind.preferred-width + 16px;
+                height: 22px;
+                border-radius: 11px;
+                background: item.can-receive ? Theme.accent.darker(60%) : Theme.card-alt;
+                kind := Text {
+                    text: item.can-receive ? "member" : "send-only";
+                    color: item.can-receive ? Theme.accent.brighter(40%) : Theme.muted;
+                    font-size: 11px;
+                    font-weight: 700;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+            }
+        }
+        Text { text: item.npub; color: Theme.muted; font-size: 12px; }
+        HorizontalLayout {
+            spacing: 8px;
+            alignment: start;
+            SmallButton { text: "Share key"; clicked => { root.share-key(); } }
+            if item.can-receive : SmallButton { text: "Rotate"; clicked => { root.rotate-key(); } }
+            SmallButton { text: "Delete"; danger: true; clicked => { root.delete-group(); } }
+        }
+    }
+}
+
+component GroupsPage inherits ScrollView {
+    in property <[GroupItem]> groups;
+    callback create-group(string);
+    callback import-group(string, string);
+    callback share-group(string);
+    callback rotate-group(string);
+    callback delete-group(string);
+
+    VerticalLayout {
+        padding: Theme.pad;
+        spacing: 12px;
+
+        SectionTitle { text: "YOUR GROUPS"; }
+        if root.groups.length == 0 : Text {
+            text: "A group is a shared key: everyone holding the secret can see locations sent to it.";
+            color: Theme.muted;
+            font-size: 13px;
+            wrap: word-wrap;
+        }
+        for g[i] in root.groups : GroupRow {
+            item: g;
+            share-key => { root.share-group(g.id); }
+            rotate-key => { root.rotate-group(g.id); }
+            delete-group => { root.delete-group(g.id); }
+        }
+
+        SectionTitle { text: "CREATE NEW GROUP"; }
+        Card {
+            VerticalLayout {
+                padding: Theme.pad;
+                spacing: 10px;
+                new-name := LineEdit { placeholder-text: "Group name (e.g. Family)"; }
+                AppButton {
+                    text: "Create group";
+                    primary: true;
+                    clicked => {
+                        root.create-group(new-name.text);
+                        new-name.text = "";
+                    }
+                }
+            }
+        }
+
+        SectionTitle { text: "JOIN EXISTING GROUP"; }
+        Card {
+            VerticalLayout {
+                padding: Theme.pad;
+                spacing: 10px;
+                import-name := LineEdit { placeholder-text: "Group name"; }
+                import-key := LineEdit { placeholder-text: "Paste nsec1… (member) or npub1… (send-only)"; }
+                AppButton {
+                    text: "Import key";
+                    primary: true;
+                    clicked => {
+                        root.import-group(import-name.text, import-key.text);
+                        import-name.text = "";
+                        import-key.text = "";
+                    }
+                }
+            }
+        }
+    }
+}
+
+component SettingsPage inherits ScrollView {
+    in property <[RelayItem]> relays;
+    in property <string> sender-npub;
+    callback add-relay(string);
+    callback remove-relay(string);
+    callback rotate-sender();
+
+    VerticalLayout {
+        padding: Theme.pad;
+        spacing: 12px;
+
+        SectionTitle { text: "RELAYS"; }
+        Card {
+            VerticalLayout {
+                padding: 8px;
+                for r[i] in root.relays : HorizontalLayout {
+                    padding: 8px;
+                    spacing: 10px;
+                    VerticalLayout {
+                        alignment: center;
+                        StatusDot { on: r.connected; }
+                    }
+                    Text {
+                        text: r.url;
+                        color: Theme.text;
+                        font-size: 13px;
+                        overflow: elide;
+                        vertical-alignment: center;
+                        horizontal-stretch: 1;
+                    }
+                    SmallButton { text: "Remove"; danger: true; clicked => { root.remove-relay(r.url); } }
+                }
+            }
+        }
+        Card {
+            VerticalLayout {
+                padding: Theme.pad;
+                spacing: 10px;
+                relay-input := LineEdit { placeholder-text: "wss://relay.example.com"; }
+                AppButton {
+                    text: "Add relay";
+                    clicked => {
+                        root.add-relay(relay-input.text);
+                        relay-input.text = "";
+                    }
+                }
+            }
+        }
+
+        SectionTitle { text: "SENDER KEY"; }
+        Card {
+            VerticalLayout {
+                padding: Theme.pad;
+                spacing: 8px;
+                Text {
+                    text: root.sender-npub == "" ? "Generated on first share" : root.sender-npub;
+                    color: Theme.text;
+                    font-size: 13px;
+                    wrap: word-wrap;
+                }
+                Text {
+                    text: "Your broadcasts are signed by a dedicated key, never a personal Nostr identity. Rotating it unlinks future shares from past ones; receivers will see you as a new sender.";
+                    color: Theme.muted;
+                    font-size: 12px;
+                    wrap: word-wrap;
+                }
+                AppButton { text: "Rotate sender key"; clicked => { root.rotate-sender(); } }
+            }
+        }
+
+        SectionTitle { text: "ABOUT"; }
+        Text {
+            text: "ntrack shares your location end-to-end encrypted over Nostr using the NIP-GART protocol (kind 694), compatible with the Gart app. Locations are encrypted with NIP-44 to your groups' keys; relays only see ciphertext from a pseudonymous sender.";
+            color: Theme.muted;
+            font-size: 12px;
+            wrap: word-wrap;
+        }
+    }
+}
+
+// ------------------------------------------------------------- dialogs --
+
+component ModalScrim inherits Rectangle {
+    callback dismiss();
+    background: #000000cc;
+    TouchArea { clicked => { root.dismiss(); } }
+}
+
+// ---------------------------------------------------------- main window --
+
+export component MainWindow inherits Window {
+    title: "ntrack";
+    background: Theme.bg;
+    preferred-width: 412px;
+    preferred-height: 915px;
+    default-font-size: 14px;
+
+    in property <[GroupItem]> groups;
+    in property <[TrackItem]> tracks;
+    in property <[RelayItem]> relays;
+    in property <bool> sharing;
+    in property <bool> test-pending;
+    in property <bool> waiting-fix;
+    in property <string> status-headline: "Not sharing";
+    in property <string> status-detail: "";
+    in property <int> interval-index: 1;
+    in property <string> sender-npub;
+    in property <bool> can-receive-any;
+    in property <string> toast;
+    // top inset to keep content out of the status bar area on Android
+    in property <length> safe-top: 12px;
+
+    // share-key dialog payload (filled by Rust before showing)
+    in-out property <bool> key-dialog-visible;
+    in property <string> key-dialog-name;
+    in property <string> key-dialog-npub;
+    in property <string> key-dialog-nsec;
+    in property <image> key-dialog-qr;
+
+    // rename dialog
+    in-out property <bool> rename-dialog-visible;
+    in-out property <string> rename-sender;
+    in property <string> rename-current;
+
+    // confirm dialog (rotate / delete group)
+    in-out property <bool> confirm-dialog-visible;
+    in property <string> confirm-title;
+    in property <string> confirm-body;
+    in property <string> confirm-action;
+
+    in-out property <int> current-page: 0;
+
+    callback toggle-group(string, bool);
+    callback start-share(string);
+    callback stop-share();
+    callback send-test();
+    callback set-interval(int);
+    callback message-edited(string);
+    callback open-map(int);
+    callback rename-sender-confirmed(string, string);
+    callback create-group(string);
+    callback import-group(string, string);
+    callback share-group(string);
+    callback rotate-group(string);
+    callback delete-group(string);
+    callback confirm-accepted();
+    callback add-relay(string);
+    callback remove-relay(string);
+    callback rotate-sender();
+    callback copy-text(string);
+    callback system-share(string);
+
+    init => {
+        Palette.color-scheme = ColorScheme.dark;
+    }
+
+    VerticalLayout {
+        Rectangle { height: root.safe-top; background: Theme.bg; }
+
+        // header
+        HorizontalLayout {
+            padding-left: Theme.pad;
+            padding-right: Theme.pad;
+            padding-top: 6px;
+            padding-bottom: 6px;
+            spacing: 8px;
+            Text {
+                text: "ntrack";
+                color: Theme.text;
+                font-size: 20px;
+                font-weight: 800;
+                horizontal-stretch: 1;
+            }
+            if root.sharing : Rectangle {
+                width: live.preferred-width + 18px;
+                height: 26px;
+                border-radius: 13px;
+                background: Theme.ok.darker(60%);
+                live := Text {
+                    text: "SHARING";
+                    color: Theme.ok;
+                    font-size: 11px;
+                    font-weight: 800;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+            }
+        }
+
+        // page area
+        Rectangle {
+            vertical-stretch: 1;
+            clip: true;
+            if root.current-page == 0 : SharePage {
+                groups: root.groups;
+                sharing: root.sharing;
+                test-pending: root.test-pending;
+                waiting-fix: root.waiting-fix;
+                status-headline: root.status-headline;
+                status-detail: root.status-detail;
+                interval-index: root.interval-index;
+                toggle-group(id, v) => { root.toggle-group(id, v); }
+                start-share(msg) => { root.start-share(msg); }
+                stop-share => { root.stop-share(); }
+                send-test => { root.send-test(); }
+                set-interval(i) => { root.set-interval(i); }
+                message-edited(m) => { root.message-edited(m); }
+            }
+            if root.current-page == 1 : TrackPage {
+                tracks: root.tracks;
+                can-receive-any: root.can-receive-any;
+                open-map(i) => { root.open-map(i); }
+                rename-request(sender, current) => {
+                    root.rename-sender = sender;
+                    root.rename-dialog-visible = true;
+                }
+            }
+            if root.current-page == 2 : GroupsPage {
+                groups: root.groups;
+                create-group(n) => { root.create-group(n); }
+                import-group(n, k) => { root.import-group(n, k); }
+                share-group(id) => { root.share-group(id); }
+                rotate-group(id) => { root.rotate-group(id); }
+                delete-group(id) => { root.delete-group(id); }
+            }
+            if root.current-page == 3 : SettingsPage {
+                relays: root.relays;
+                sender-npub: root.sender-npub;
+                add-relay(u) => { root.add-relay(u); }
+                remove-relay(u) => { root.remove-relay(u); }
+                rotate-sender => { root.rotate-sender(); }
+            }
+        }
+
+        // tab bar
+        Rectangle {
+            height: 64px;
+            background: Theme.card;
+            HorizontalLayout {
+                padding: 6px;
+                spacing: 4px;
+                for tab[idx] in ["Share", "Track", "Groups", "Settings"] : Rectangle {
+                    border-radius: 10px;
+                    background: root.current-page == idx ? Theme.card-alt : transparent;
+                    Text {
+                        text: tab;
+                        color: root.current-page == idx ? Theme.accent.brighter(40%) : Theme.muted;
+                        font-size: 14px;
+                        font-weight: root.current-page == idx ? 700 : 500;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                    TouchArea { clicked => { root.current-page = idx; } }
+                }
+            }
+        }
+    }
+
+    // ---- overlays ----
+
+    if root.key-dialog-visible : ModalScrim {
+        dismiss => { root.key-dialog-visible = false; }
+        Card {
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            width: min(parent.width - 32px, 380px);
+            VerticalLayout {
+                padding: Theme.pad;
+                spacing: 10px;
+                Text {
+                    text: "Group key — " + root.key-dialog-name;
+                    color: Theme.text;
+                    font-size: 16px;
+                    font-weight: 700;
+                    wrap: word-wrap;
+                }
+                if root.key-dialog-nsec != "" : Rectangle {
+                    height: self.width * 0.62;
+                    background: #ffffff;
+                    border-radius: 8px;
+                    Image {
+                        source: root.key-dialog-qr;
+                        width: parent.height - 16px;
+                        height: parent.height - 16px;
+                        x: (parent.width - self.width) / 2;
+                        y: 8px;
+                        image-rendering: pixelated;
+                    }
+                }
+                if root.key-dialog-nsec != "" : Text {
+                    text: root.key-dialog-nsec;
+                    color: Theme.warn;
+                    font-size: 11px;
+                    wrap: char-wrap;
+                }
+                if root.key-dialog-nsec != "" : Text {
+                    text: "Anyone with this secret can read all locations shared with the group. Hand it over in person or via an end-to-end encrypted channel only. If membership changes, rotate the key.";
+                    color: Theme.muted;
+                    font-size: 12px;
+                    wrap: word-wrap;
+                }
+                if root.key-dialog-nsec == "" : Text {
+                    text: "Send-only group — you don't hold its secret. Share the public key below so others can also send to it:\n" + root.key-dialog-npub;
+                    color: Theme.muted;
+                    font-size: 12px;
+                    wrap: word-wrap;
+                }
+                HorizontalLayout {
+                    spacing: 8px;
+                    AppButton {
+                        text: "Copy";
+                        clicked => {
+                            root.copy-text(root.key-dialog-nsec != "" ? root.key-dialog-nsec : root.key-dialog-npub);
+                        }
+                    }
+                    AppButton {
+                        text: "Share…";
+                        clicked => {
+                            root.system-share(root.key-dialog-nsec != "" ? root.key-dialog-nsec : root.key-dialog-npub);
+                        }
+                    }
+                }
+                AppButton { text: "Close"; primary: true; clicked => { root.key-dialog-visible = false; } }
+            }
+        }
+    }
+
+    if root.rename-dialog-visible : ModalScrim {
+        dismiss => { root.rename-dialog-visible = false; }
+        Card {
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            width: min(parent.width - 32px, 380px);
+            VerticalLayout {
+                padding: Theme.pad;
+                spacing: 10px;
+                Text { text: "Name this sender"; color: Theme.text; font-size: 16px; font-weight: 700; }
+                Text {
+                    text: "Senders are pseudonymous keys. Give this one a name you recognize (e.g. \"Anna's phone\").";
+                    color: Theme.muted;
+                    font-size: 12px;
+                    wrap: word-wrap;
+                }
+                rename-input := LineEdit { placeholder-text: "Label"; }
+                HorizontalLayout {
+                    spacing: 8px;
+                    AppButton { text: "Cancel"; clicked => { root.rename-dialog-visible = false; } }
+                    AppButton {
+                        text: "Save";
+                        primary: true;
+                        clicked => {
+                            root.rename-sender-confirmed(root.rename-sender, rename-input.text);
+                            rename-input.text = "";
+                            root.rename-dialog-visible = false;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if root.confirm-dialog-visible : ModalScrim {
+        dismiss => { root.confirm-dialog-visible = false; }
+        Card {
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            width: min(parent.width - 32px, 380px);
+            VerticalLayout {
+                padding: Theme.pad;
+                spacing: 10px;
+                Text { text: root.confirm-title; color: Theme.text; font-size: 16px; font-weight: 700; wrap: word-wrap; }
+                Text { text: root.confirm-body; color: Theme.muted; font-size: 13px; wrap: word-wrap; }
+                HorizontalLayout {
+                    spacing: 8px;
+                    AppButton { text: "Cancel"; clicked => { root.confirm-dialog-visible = false; } }
+                    AppButton {
+                        text: root.confirm-action;
+                        danger: true;
+                        clicked => {
+                            root.confirm-dialog-visible = false;
+                            root.confirm-accepted();
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if root.toast != "" : Rectangle {
+        x: (parent.width - self.width) / 2;
+        y: parent.height - 140px;
+        width: min(toast-label.preferred-width + 32px, parent.width - 32px);
+        height: toast-label.preferred-height + 20px;
+        border-radius: 12px;
+        background: #2c3040ee;
+        toast-label := Text {
+            text: root.toast;
+            color: Theme.text;
+            font-size: 13px;
+            wrap: word-wrap;
+            width: parent.width - 32px;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+    }
+}

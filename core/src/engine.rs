@@ -60,6 +60,10 @@ pub enum EngineCmd {
     LocationUnavailable(String),
     /// Ask the engine to emit the share dialog data for a group.
     RequestGroupShare { group_hex: String },
+    /// Rotate a group's recipient pseudonym key (NIP-GART MUST-provide).
+    /// Emits the refreshed config plus a [`UiEvent::GroupShare`] carrying the
+    /// new secret for redistribution to members.
+    RotateGroup { group_hex: String },
     Pool(PoolEvent),
     /// Periodic flush + share tick (driven internally; exposed for tests).
     Tick,
@@ -269,6 +273,25 @@ impl<P: EnginePool> Engine<P> {
                     };
                     let _ = self.ui_tx.send(UiEvent::GroupShare(share));
                 }
+            }
+            EngineCmd::RotateGroup { group_hex } => {
+                let new_hex = {
+                    let Some(g) = self
+                        .config
+                        .groups
+                        .iter_mut()
+                        .find(|g| g.public == group_hex)
+                    else {
+                        return;
+                    };
+                    g.rotate();
+                    g.public.clone()
+                };
+                self.persist();
+                self.sync_pool();
+                self.emit_config();
+                self.toast("Key rotated — distribute the new key to all members".into());
+                self.handle(EngineCmd::RequestGroupShare { group_hex: new_hex });
             }
             EngineCmd::Pool(ev) => self.on_pool_event(ev),
             EngineCmd::Tick => self.on_tick(),
@@ -537,11 +560,9 @@ impl<P: EnginePool> Engine<P> {
         }
         let last_coords = match inc.payload.status {
             Status::Stop => prev.and_then(|p| {
-                p.last_coords.or_else(|| {
-                    match (p.payload.lat, p.payload.lng, p.payload.ts) {
-                        (Some(lat), Some(lng), Some(ts)) => Some((lat, lng, ts)),
-                        _ => None,
-                    }
+                p.last_coords.or(match (p.payload.lat, p.payload.lng, p.payload.ts) {
+                    (Some(lat), Some(lng), Some(ts)) => Some((lat, lng, ts)),
+                    _ => None,
                 })
             }),
             _ => None,
@@ -994,6 +1015,48 @@ mod tests {
         )
         .unwrap();
         assert_eq!(inc.payload.status, Status::Stop);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn rotate_group_changes_subscription_and_offers_new_key() {
+        let mut f = fixture();
+        let g = add_member_group(&mut f, "Crew");
+        drain(&mut f);
+
+        f.engine.handle(EngineCmd::RotateGroup { group_hex: g.public.clone() });
+        let evs = drain(&mut f);
+
+        // new key offered for redistribution
+        let share = evs
+            .iter()
+            .find_map(|e| match e {
+                UiEvent::GroupShare(s) => Some(s),
+                _ => None,
+            })
+            .expect("share dialog data emitted");
+        assert_ne!(share.npub, keys::npub(&g.public_key().unwrap()));
+        assert!(share.nsec.is_some());
+
+        // config snapshot reflects the new key, same name
+        let cfg = evs
+            .iter()
+            .find_map(|e| match e {
+                UiEvent::Config(c) => Some(c),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(cfg.groups.len(), 1);
+        assert_eq!(cfg.groups[0].name, "Crew");
+        assert_ne!(cfg.groups[0].id, g.public);
+
+        // subscription now points at the new key only
+        let filter = f.pool.subscription.lock().unwrap().clone().unwrap();
+        let json = serde_json::to_value(&filter).unwrap();
+        assert_eq!(json["#p"][0], cfg.groups[0].id);
+
+        // rotating an unknown group is a no-op
+        f.engine.handle(EngineCmd::RotateGroup { group_hex: "deadbeef".into() });
+        assert!(drain(&mut f).is_empty());
     }
 
     #[tokio::test(start_paused = true)]
