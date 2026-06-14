@@ -436,11 +436,16 @@ component GroupRow inherits Card {
 
 component GroupsPage inherits ScrollView {
     in property <[GroupItem]> groups;
+    // Two-way bound to the import form so an incoming invite (scan / deep
+    // link) can pre-fill these from Rust.
+    in-out property <string> import-name-text;
+    in-out property <string> import-key-text;
     callback create-group(string);
     callback import-group(string, string);
     callback share-group(string);
     callback rotate-group(string);
     callback delete-group(string);
+    callback scan-qr();
 
     VerticalLayout {
         padding: Theme.pad;
@@ -483,8 +488,18 @@ component GroupsPage inherits ScrollView {
             VerticalLayout {
                 padding: Theme.pad;
                 spacing: 10px;
-                import-name := LineEdit { placeholder-text: "Group name"; }
-                import-key := LineEdit { placeholder-text: "Paste nsec1… (member) or npub1… (send-only)"; }
+                AppButton {
+                    text: "Scan QR code";
+                    clicked => { root.scan-qr(); }
+                }
+                import-name := LineEdit {
+                    placeholder-text: "Group name";
+                    text <=> root.import-name-text;
+                }
+                import-key := LineEdit {
+                    placeholder-text: "Paste an invite, nsec1… or npub1…";
+                    text <=> root.import-key-text;
+                }
                 AppButton {
                     text: "Import key";
                     primary: true;
@@ -610,11 +625,16 @@ export component MainWindow inherits Window {
     in property <bool> can-receive-any;
     in property <string> toast;
 
+    // import form, two-way bound so an incoming invite can pre-fill it
+    in-out property <string> import-name-text;
+    in-out property <string> import-key-text;
+
     // share-key dialog payload (filled by Rust before showing)
     in-out property <bool> key-dialog-visible;
     in property <string> key-dialog-name;
     in property <string> key-dialog-npub;
     in property <string> key-dialog-nsec;
+    in property <string> key-dialog-invite; // ntrack://join URI: QR + copy/share
     in property <image> key-dialog-qr;
 
     // rename dialog
@@ -643,6 +663,7 @@ export component MainWindow inherits Window {
     callback share-group(string);
     callback rotate-group(string);
     callback delete-group(string);
+    callback scan-qr();
     callback confirm-accepted();
     callback add-relay(string);
     callback remove-relay(string);
@@ -726,11 +747,14 @@ export component MainWindow inherits Window {
             }
             if root.current-page == 2 : GroupsPage {
                 groups: root.groups;
+                import-name-text <=> root.import-name-text;
+                import-key-text <=> root.import-key-text;
                 create-group(n) => { root.create-group(n); }
                 import-group(n, k) => { root.import-group(n, k); }
                 share-group(id) => { root.share-group(id); }
                 rotate-group(id) => { root.rotate-group(id); }
                 delete-group(id) => { root.delete-group(id); }
+                scan-qr => { root.scan-qr(); }
             }
             if root.current-page == 3 : SettingsPage {
                 relays: root.relays;
@@ -788,7 +812,7 @@ export component MainWindow inherits Window {
                     font-weight: 700;
                     wrap: word-wrap;
                 }
-                if root.key-dialog-nsec != "" : Rectangle {
+                if root.key-dialog-invite != "" : Rectangle {
                     height: self.width * 0.62;
                     background: #ffffff;
                     border-radius: 8px;
@@ -801,20 +825,26 @@ export component MainWindow inherits Window {
                         image-rendering: pixelated;
                     }
                 }
-                if root.key-dialog-nsec != "" : Text {
-                    text: root.key-dialog-nsec;
-                    color: Theme.warn;
+                Text {
+                    text: "Scanning this in ntrack pre-fills the group name and key automatically.";
+                    color: Theme.muted;
+                    font-size: 12px;
+                    wrap: word-wrap;
+                }
+                Text {
+                    text: root.key-dialog-invite;
+                    color: root.key-dialog-nsec != "" ? Theme.warn : Theme.text;
                     font-size: 11px;
                     wrap: char-wrap;
                 }
                 if root.key-dialog-nsec != "" : Text {
-                    text: "Anyone with this secret can read all locations shared with the group. Hand it over in person or via an end-to-end encrypted channel only. If membership changes, rotate the key.";
+                    text: "This link contains the group secret — anyone with it can read all locations shared with the group. Hand it over in person or via an end-to-end encrypted channel only. If membership changes, rotate the key.";
                     color: Theme.muted;
                     font-size: 12px;
                     wrap: word-wrap;
                 }
                 if root.key-dialog-nsec == "" : Text {
-                    text: "Send-only group — you don't hold its secret. Share the public key below so others can also send to it:\n" + root.key-dialog-npub;
+                    text: "Send-only group — this link carries only the public key, so others can send to the group but cannot read it.";
                     color: Theme.muted;
                     font-size: 12px;
                     wrap: word-wrap;
@@ -823,15 +853,11 @@ export component MainWindow inherits Window {
                     spacing: 8px;
                     AppButton {
                         text: "Copy";
-                        clicked => {
-                            root.copy-text(root.key-dialog-nsec != "" ? root.key-dialog-nsec : root.key-dialog-npub);
-                        }
+                        clicked => { root.copy-text(root.key-dialog-invite); }
                     }
                     AppButton {
                         text: "Share…";
-                        clicked => {
-                            root.system-share(root.key-dialog-nsec != "" ? root.key-dialog-nsec : root.key-dialog-npub);
-                        }
+                        clicked => { root.system-share(root.key-dialog-invite); }
                     }
                 }
                 AppButton { text: "Close"; primary: true; clicked => { root.key-dialog-visible = false; } }

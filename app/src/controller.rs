@@ -27,6 +27,9 @@ use crate::{GroupItem, MainWindow, RelayItem, TrackItem};
 
 /// Publish interval choices shown in the UI, in seconds.
 pub const INTERVALS: [u64; 4] = [15, 30, 60, 300];
+/// Index of the Groups page in the bottom tab bar (Share, Track, Groups,
+/// Settings). An incoming invite switches here to pre-fill the import form.
+const GROUPS_PAGE: i32 = 2;
 /// How long a live share may go without an update before we stop showing it
 /// as live: the longest publish interval a sender can pick plus a grace
 /// buffer for relay/GPS jitter. A killed or offline app never gets to send
@@ -160,7 +163,26 @@ impl Controller {
                     }
                 }
             }
+            PlatformEvent::IncomingInvite(raw) => self.on_incoming_invite(raw),
         }
+    }
+
+    /// A scanned QR code or tapped `ntrack://join` link arrived. Pre-fill the
+    /// Groups-tab import form and switch to it so the user can review the group
+    /// before importing (we never import silently).
+    fn on_incoming_invite(self: &Arc<Self>, raw: String) {
+        let Some(invite) = ntrack_core::invite::parse_shared(&raw) else {
+            self.toast("Not an ntrack invite");
+            return;
+        };
+        let name = invite.name.unwrap_or_default();
+        let key = invite.key;
+        let _ = self.ui.upgrade_in_event_loop(move |ui| {
+            ui.set_import_name_text(name.into());
+            ui.set_import_key_text(key.into());
+            ui.set_current_page(GROUPS_PAGE);
+        });
+        self.toast("Invite scanned — review and tap Import");
     }
 
     fn spawn_ui_event_loop(self: Arc<Self>, mut ui_rx: mpsc::UnboundedReceiver<UiEvent>) {
@@ -205,13 +227,17 @@ impl Controller {
                 }
             }
             UiEvent::GroupShare(share) => {
-                // Build the QR off the UI thread; create the image on it.
-                let payload = share
+                // The shared artifact is a self-describing invite URI carrying
+                // the group name alongside the key, so the recipient never has
+                // to type the name. The QR, Copy and Share all use it.
+                let key = share
                     .nsec
                     .as_ref()
                     .map(|s| s.expose().to_string())
                     .unwrap_or_else(|| share.npub.clone());
-                let qr = qr_pixel_buffer(&payload);
+                let invite = ntrack_core::invite::build_invite(&share.name, &key);
+                // Build the QR off the UI thread; create the image on it.
+                let qr = qr_pixel_buffer(&invite);
                 let name = share.name.clone();
                 let npub = share.npub.clone();
                 let nsec = share
@@ -223,6 +249,7 @@ impl Controller {
                     ui.set_key_dialog_name(name.into());
                     ui.set_key_dialog_npub(npub.into());
                     ui.set_key_dialog_nsec(nsec.into());
+                    ui.set_key_dialog_invite(invite.into());
                     if let Some(buf) = qr {
                         ui.set_key_dialog_qr(slint::Image::from_rgba8(buf));
                     }
@@ -443,6 +470,10 @@ impl Controller {
             ctrl.import_group(name.to_string(), key.to_string());
         });
 
+        hook!(on_scan_qr, |ctrl| {
+            ctrl.platform.scan_qr();
+        });
+
         hook!(on_share_group, |ctrl, id: slint::SharedString| {
             let _ = ctrl
                 .cmd_tx
@@ -564,11 +595,18 @@ impl Controller {
     }
 
     fn import_group(self: &Arc<Self>, name: String, key: String) {
-        let key = key.trim().to_string();
-        if key.is_empty() {
-            self.toast("Paste a group key (nsec1… or npub1…)");
+        let raw = key.trim();
+        if raw.is_empty() {
+            self.toast("Paste an invite, nsec1… or npub1…");
             return;
         }
+        // Accept a full `ntrack://join` invite pasted into the key field too,
+        // not just a bare key; an embedded name fills in when the name field
+        // was left blank.
+        let (embedded_name, key) = match ntrack_core::invite::parse_shared(raw) {
+            Some(invite) => (invite.name, invite.key),
+            None => (None, raw.to_string()),
+        };
         let parsed = match parse_group_key(&key) {
             Ok(p) => p,
             Err(e) => {
@@ -595,10 +633,16 @@ impl Controller {
             self.toast("This group key is already imported");
             return;
         }
-        let name = if name.trim().is_empty() {
-            format!("Group {}", &public[..8])
+        // Name precedence: what the user typed, else the invite's embedded
+        // name, else a derived placeholder.
+        let name = name.trim().to_string();
+        let name = if !name.is_empty() {
+            name
         } else {
-            name.trim().to_string()
+            embedded_name
+                .map(|n| n.trim().to_string())
+                .filter(|n| !n.is_empty())
+                .unwrap_or_else(|| format!("Group {}", &public[..8]))
         };
         let receive = secret.is_some();
         self.mutate(move |c| {

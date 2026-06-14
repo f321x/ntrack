@@ -15,6 +15,13 @@ A **group** is a shared keypair. Hand its secret key (`nsec…`) to the people w
 holding it lets them decrypt, the public key (`npub…`) is enough to send. Distribute keys over a
 secure channel: the key *is* the membership, so rotate it whenever membership changes.
 
+**Inviting someone** — a group's *Share key* dialog shows a QR code and a tappable
+`ntrack://join?n=<name>&k=<key>` link that bundles the group **name** with its key, so the
+recipient never retypes anything. They can **scan** it (Groups → *Scan QR code*), **tap** the link
+(ntrack opens with the import form pre-filled), or copy/paste the string. A bare `nsec…`/`npub…`
+still works too. For a member invite the link carries the secret, so share it over a secure
+channel — exactly as you would the bare `nsec`.
+
 - **Share** — publishes your encrypted location at a set interval from a sender key that's never
   linked to a personal Nostr identity.
 - **Track** — subscribes to your groups, verifies + dedups + decrypts incoming events, and shows

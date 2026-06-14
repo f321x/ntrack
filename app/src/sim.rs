@@ -84,4 +84,14 @@ impl Platform for SimPlatform {
     fn share_text(&self, text: &str) {
         log::info!("sim: share sheet ({} chars)", text.len());
     }
+
+    fn scan_qr(&self) {
+        // Desktop has no camera; synthesize a scanned invite so the import
+        // pre-fill flow can be exercised on the workstation.
+        let k = ntrack_core::keys::generate();
+        let nsec = ntrack_core::keys::nsec(&k);
+        let invite = ntrack_core::invite::build_invite("Scanned Demo", nsec.expose());
+        log::info!("sim: scan_qr -> synthetic invite");
+        let _ = self.tx.send(PlatformEvent::IncomingInvite(invite));
+    }
 }

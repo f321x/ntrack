@@ -11,6 +11,11 @@ pub enum PlatformEvent {
     /// Result of a permission request triggered by
     /// [`Platform::request_location_permission`].
     PermissionResult(bool),
+    /// A group invite arrived from outside the UI: a scanned QR code
+    /// ([`Platform::scan_qr`]) or a tapped `ntrack://join` deep link. The
+    /// payload is the raw string; the controller parses it with
+    /// [`ntrack_core::invite::parse_shared`] and pre-fills the import form.
+    IncomingInvite(String),
 }
 
 pub trait Platform: Send + Sync + 'static {
@@ -25,4 +30,7 @@ pub trait Platform: Send + Sync + 'static {
     fn open_map(&self, lat: f64, lng: f64, label: &str);
     fn copy_text(&self, text: &str);
     fn share_text(&self, text: &str);
+    /// Open the camera QR scanner. The decoded string arrives asynchronously
+    /// as [`PlatformEvent::IncomingInvite`].
+    fn scan_qr(&self);
 }

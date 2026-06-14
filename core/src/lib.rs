@@ -19,8 +19,10 @@ pub mod config;
 pub mod dedup;
 pub mod engine;
 pub mod error;
+pub mod invite;
 pub mod keys;
 pub mod protocol;
+pub mod qr;
 pub mod relay;
 
 pub use error::Error;

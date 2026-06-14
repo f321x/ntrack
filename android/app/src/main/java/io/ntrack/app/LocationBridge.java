@@ -44,8 +44,20 @@ public final class LocationBridge {
 
     static native void nativeOnLocation(double lat, double lng, float accuracy, long timeMillis);
     static native void nativeOnPermission(boolean granted);
+    /** Decode one camera frame's luminance plane; returns the payload or null. */
+    static native String nativeDecodeQr(byte[] luma, int width, int height, int rowStride);
+    /** A QR code was scanned. */
+    static native void nativeOnQrResult(String text);
+    /** An {@code ntrack://join} deep link launched or resumed the app. */
+    static native void nativeOnDeepLink(String uri);
 
     private static LocationListener listener;
+
+    // Deep links can arrive (in MainActivity.onCreate) before the Rust side has
+    // registered its native callbacks, so buffer the latest one until Rust is
+    // ready and flushes it.
+    private static String pendingDeepLink;
+    private static boolean nativeReady;
 
     // ---- permissions -----------------------------------------------------
 
@@ -257,5 +269,70 @@ public final class LocationBridge {
                 Log.e(TAG, "no app can share text");
             }
         });
+    }
+
+    // ---- QR scanner -------------------------------------------------------
+
+    /** Open the camera scanner (a separate {@link ScanActivity}). */
+    public static void scanQr() {
+        final Activity activity = MainActivity.current();
+        if (activity == null) {
+            Log.w(TAG, "scanQr: no live activity");
+            return;
+        }
+        activity.runOnUiThread(() -> {
+            try {
+                activity.startActivity(new Intent(activity, ScanActivity.class));
+            } catch (Exception e) {
+                Log.e(TAG, "failed to open scanner", e);
+            }
+        });
+    }
+
+    /** Called by {@link ScanActivity} per frame; returns the payload or null. */
+    static String decodeQr(byte[] luma, int width, int height, int rowStride) {
+        try {
+            return nativeDecodeQr(luma, width, height, rowStride);
+        } catch (UnsatisfiedLinkError e) {
+            return null;
+        }
+    }
+
+    /** Called by {@link ScanActivity} once a QR code has been decoded. */
+    static void deliverScan(String text) {
+        try {
+            nativeOnQrResult(text);
+        } catch (UnsatisfiedLinkError e) {
+            Log.e(TAG, "native not ready for scan result", e);
+        }
+    }
+
+    // ---- deep links -------------------------------------------------------
+
+    /** Called by {@link MainActivity} for an {@code ntrack://join} VIEW intent. */
+    public static synchronized void onDeepLinkIntent(String uri) {
+        if (uri == null || uri.isEmpty()) return;
+        pendingDeepLink = uri;
+        if (nativeReady) {
+            flushPendingDeepLink();
+        }
+    }
+
+    /**
+     * Deliver any buffered deep link. Called by Rust once the native callbacks
+     * are registered (marking the bridge ready), and re-entrantly from
+     * {@link #onDeepLinkIntent} for links that arrive afterwards.
+     */
+    public static synchronized void flushPendingDeepLink() {
+        nativeReady = true;
+        if (pendingDeepLink == null) return;
+        String uri = pendingDeepLink;
+        pendingDeepLink = null;
+        try {
+            nativeOnDeepLink(uri);
+        } catch (UnsatisfiedLinkError e) {
+            Log.e(TAG, "native not ready for deep link", e);
+            pendingDeepLink = uri; // try again on a later flush
+        }
     }
 }

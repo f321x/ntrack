@@ -8,6 +8,10 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_LOCATION" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.CAMERA" />
+
+    <!-- Scanning is optional; don't exclude camera-less devices from install. -->
+    <uses-feature android:name="android.hardware.camera" android:required="false" />
 
     <application
         android:label="@string/app_name"
@@ -30,7 +34,19 @@
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
+            <!-- Tappable group invites: ntrack://join?n=<name>&k=<key> -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="ntrack" android:host="join" />
+            </intent-filter>
         </activity>
+
+        <activity
+            android:name=".ScanActivity"
+            android:exported="false"
+            android:screenOrientation="portrait" />
 
         <service
             android:name=".LocationService"

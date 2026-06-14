@@ -20,8 +20,8 @@
 use std::ffi::c_void;
 use std::sync::OnceLock;
 
-use jni::objects::{GlobalRef, JClass, JObject, JValue};
-use jni::sys::{jboolean, jdouble, jfloat, jlong};
+use jni::objects::{GlobalRef, JByteArray, JClass, JObject, JString, JValue};
+use jni::sys::{jboolean, jdouble, jfloat, jint, jlong, jstring};
 use jni::{JNIEnv, JavaVM, NativeMethod};
 use ntrack_core::engine::LocationSample;
 use tokio::sync::mpsc;
@@ -95,6 +95,21 @@ impl AndroidPlatform {
                         sig: "(Z)V".into(),
                         fn_ptr: native_on_permission as *mut c_void,
                     },
+                    NativeMethod {
+                        name: "nativeDecodeQr".into(),
+                        sig: "([BIII)Ljava/lang/String;".into(),
+                        fn_ptr: native_decode_qr as *mut c_void,
+                    },
+                    NativeMethod {
+                        name: "nativeOnQrResult".into(),
+                        sig: "(Ljava/lang/String;)V".into(),
+                        fn_ptr: native_on_qr_result as *mut c_void,
+                    },
+                    NativeMethod {
+                        name: "nativeOnDeepLink".into(),
+                        sig: "(Ljava/lang/String;)V".into(),
+                        fn_ptr: native_on_deep_link as *mut c_void,
+                    },
                 ],
             )
             .map_err(|e| format!("register natives: {e}"))?;
@@ -102,7 +117,15 @@ impl AndroidPlatform {
         };
 
         let _ = PLATFORM_TX.set(tx);
-        Ok(Self { vm, bridge })
+        let me = Self { vm, bridge };
+        // Native callbacks are now registered, so any deep link that launched
+        // us (delivered to Java before this Rust side was ready) can be
+        // flushed through.
+        me.with_env("flushPendingDeepLink", |env, class| {
+            env.call_static_method(class, "flushPendingDeepLink", "()V", &[])
+                .map(|_| ())
+        });
+        Ok(me)
     }
 
     /// Attach (if needed) and run `f` with the env and the bridge class.
@@ -214,6 +237,27 @@ impl Platform for AndroidPlatform {
             .map(|_| ())
         });
     }
+
+    fn scan_qr(&self) {
+        self.with_env("scanQr", |env, class| {
+            env.call_static_method(class, "scanQr", "()V", &[]).map(|_| ())
+        });
+    }
+}
+
+/// Forward a Java string (deep-link URI or decoded QR payload) to the
+/// controller as an [`PlatformEvent::IncomingInvite`].
+fn deliver_invite(env: &mut JNIEnv, s: &JString) {
+    let Ok(java_str) = env.get_string(s) else {
+        return;
+    };
+    let raw: String = java_str.into();
+    if raw.is_empty() {
+        return;
+    }
+    if let Some(tx) = PLATFORM_TX.get() {
+        let _ = tx.send(PlatformEvent::IncomingInvite(raw));
+    }
 }
 
 /// `static native void nativeOnLocation(double, double, float, long)` —
@@ -242,4 +286,53 @@ extern "system" fn native_on_permission(_env: JNIEnv, _class: JClass, granted: j
     if let Some(tx) = PLATFORM_TX.get() {
         let _ = tx.send(PlatformEvent::PermissionResult(granted != 0));
     }
+}
+
+/// `static native String nativeDecodeQr(byte[] y, int width, int height, int rowStride)`
+/// — decode one camera frame's luminance plane. Returns the decoded payload or
+/// `null` when no QR code is present, so the Java scanner keeps trying.
+extern "system" fn native_decode_qr(
+    env: JNIEnv,
+    _class: JClass,
+    data: JByteArray,
+    width: jint,
+    height: jint,
+    row_stride: jint,
+) -> jstring {
+    let null = std::ptr::null_mut();
+    let len = match env.get_array_length(&data) {
+        Ok(l) if l >= 0 => l as usize,
+        _ => return null,
+    };
+    let mut signed = vec![0i8; len];
+    if env.get_byte_array_region(&data, 0, &mut signed).is_err() {
+        return null;
+    }
+    // Reinterpret the JNI-signed bytes as the unsigned luminance samples they
+    // really are (same bit pattern, no copy).
+    let luma: &[u8] = unsafe { std::slice::from_raw_parts(signed.as_ptr() as *const u8, len) };
+    match ntrack_core::qr::decode_luma(
+        width.max(0) as usize,
+        height.max(0) as usize,
+        row_stride.max(0) as usize,
+        luma,
+    ) {
+        Some(text) => env
+            .new_string(text)
+            .map(|s| s.into_raw())
+            .unwrap_or(null),
+        None => null,
+    }
+}
+
+/// `static native void nativeOnQrResult(String)` — the scanner activity
+/// delivered a decoded payload.
+extern "system" fn native_on_qr_result(mut env: JNIEnv, _class: JClass, text: JString) {
+    deliver_invite(&mut env, &text);
+}
+
+/// `static native void nativeOnDeepLink(String)` — an `ntrack://join` URI that
+/// launched or resumed the activity.
+extern "system" fn native_on_deep_link(mut env: JNIEnv, _class: JClass, uri: JString) {
+    deliver_invite(&mut env, &uri);
 }

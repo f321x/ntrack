@@ -1,6 +1,8 @@
 package io.ntrack.app;
 
 import android.app.NativeActivity;
+import android.content.Intent;
+import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
 import android.view.View;
@@ -33,6 +35,31 @@ public class MainActivity extends NativeActivity {
         // sharing sessions are typically glanced at, not interacted with.
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         setupEdgeToEdge();
+        // A cold-start invite link arrives here before the Rust side has
+        // registered its callbacks; LocationBridge buffers it until ready.
+        handleDeepLink(getIntent());
+    }
+
+    @Override
+    protected void onNewIntent(Intent intent) {
+        super.onNewIntent(intent);
+        setIntent(intent);
+        handleDeepLink(intent);
+    }
+
+    /** Forward an {@code ntrack://join} VIEW intent to the bridge. */
+    private void handleDeepLink(Intent intent) {
+        if (intent == null || !Intent.ACTION_VIEW.equals(intent.getAction())) return;
+        Uri data = intent.getData();
+        if (data != null) {
+            LocationBridge.onDeepLinkIntent(data.toString());
+        }
+        // Mark the launch intent consumed: an unhandled config change (locale,
+        // font scale, …) recreates the activity, and onCreate would otherwise
+        // re-read this same VIEW intent and re-deliver the invite.
+        intent.setAction(null);
+        intent.setData(null);
+        setIntent(intent);
     }
 
     /**
