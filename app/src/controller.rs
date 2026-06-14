@@ -27,6 +27,12 @@ use crate::{GroupItem, MainWindow, RelayItem, TrackItem};
 
 /// Publish interval choices shown in the UI, in seconds.
 pub const INTERVALS: [u64; 4] = [15, 30, 60, 300];
+/// How long a live share may go without an update before we stop showing it
+/// as live: the longest publish interval a sender can pick plus a grace
+/// buffer for relay/GPS jitter. A killed or offline app never gets to send
+/// its best-effort STOP, so the "live" state must time out rather than be
+/// trusted forever. Recomputed every second by the render timer.
+const SHARE_TIMEOUT_SECS: u64 = INTERVALS[INTERVALS.len() - 1] + 60;
 const TOAST_DURATION: Duration = Duration::from_secs(3);
 
 #[derive(Clone)]
@@ -318,17 +324,13 @@ impl Controller {
                     t.label.clone()
                 };
                 let has_coords = !(t.lat == 0.0 && t.lng == 0.0 && t.ts == 0);
+                let (status, live) = track_liveness(t);
                 TrackItem {
                     sender: t.sender_hex.clone().into(),
                     title: title.into(),
                     label: t.label.clone().into(),
                     group: t.group_name.clone().into(),
-                    status: match t.status {
-                        Status::Active => "LIVE",
-                        Status::Test => "TEST",
-                        Status::Stop => "ENDED",
-                    }
-                    .into(),
+                    status: status.into(),
                     coords: if has_coords {
                         format!("{:.5}, {:.5}", t.lat, t.lng).into()
                     } else {
@@ -336,7 +338,7 @@ impl Controller {
                     },
                     ago: ago_string(t.ts, t.created_at),
                     msg: t.msg.clone().into(),
-                    live: t.live,
+                    live,
                     is_test: t.is_test,
                     has_coords,
                 }
@@ -645,6 +647,25 @@ fn ago_string(ts: u64, created_at: u64) -> slint::SharedString {
     s.into()
 }
 
+/// Whether an ACTIVE share whose last event arrived at `created_at` (unix
+/// seconds) has been silent long enough to no longer count as live.
+fn share_timed_out(created_at: u64) -> bool {
+    now_secs().saturating_sub(created_at) > SHARE_TIMEOUT_SECS
+}
+
+/// Badge label and "live" flag for a track. A live (ACTIVE) sender that has
+/// gone quiet past [`SHARE_TIMEOUT_SECS`] — app killed, GPS lost or offline,
+/// so its STOP never arrived — is shown as ended rather than pinned live.
+/// The last-known coordinates are kept (set by the caller) so the card still
+/// shows where the sender was last seen, exactly like a real STOP.
+fn track_liveness(t: &TrackSnapshot) -> (&'static str, bool) {
+    match t.status {
+        Status::Test => ("TEST", false),
+        Status::Active if !share_timed_out(t.created_at) => ("LIVE", true),
+        _ => ("ENDED", false),
+    }
+}
+
 fn shorten(npub: &str) -> String {
     if npub.len() > 21 {
         format!("{}…{}", &npub[..14], &npub[npub.len() - 6..])
@@ -730,6 +751,50 @@ mod tests {
         assert_eq!(ago_string(now - 7200, 0).as_str(), "2 h ago");
         assert_eq!(ago_string(0, now - 90).as_str(), "1 min ago");
         assert_eq!(ago_string(0, 0).as_str(), "");
+    }
+
+    fn track(status: Status, created_at: u64) -> TrackSnapshot {
+        TrackSnapshot {
+            sender_hex: "ab".into(),
+            sender_short: "npub1abc".into(),
+            label: String::new(),
+            group_name: "G".into(),
+            status,
+            live: status == Status::Active,
+            is_test: status == Status::Test,
+            lat: 1.0,
+            lng: 2.0,
+            ts: created_at,
+            created_at,
+            msg: String::new(),
+        }
+    }
+
+    #[test]
+    fn share_timeout_boundary() {
+        let now = now_secs();
+        assert!(!share_timed_out(now), "a fresh update is not timed out");
+        assert!(!share_timed_out(now - SHARE_TIMEOUT_SECS + 1), "still inside the window");
+        assert!(share_timed_out(now - SHARE_TIMEOUT_SECS - 1), "past the window");
+    }
+
+    #[test]
+    fn live_share_times_out_into_ended() {
+        let now = now_secs();
+        // A recent ACTIVE share is live.
+        assert_eq!(track_liveness(&track(Status::Active, now)), ("LIVE", true));
+        // An ACTIVE share we haven't heard from past the timeout is no longer
+        // shown as live — the sender's app was killed before sending a STOP.
+        assert_eq!(
+            track_liveness(&track(Status::Active, now - SHARE_TIMEOUT_SECS - 1)),
+            ("ENDED", false)
+        );
+        // A real STOP is always ended, and an old TEST keeps its TEST badge.
+        assert_eq!(track_liveness(&track(Status::Stop, now)), ("ENDED", false));
+        assert_eq!(
+            track_liveness(&track(Status::Test, now - SHARE_TIMEOUT_SECS - 1)),
+            ("TEST", false)
+        );
     }
 
     #[test]

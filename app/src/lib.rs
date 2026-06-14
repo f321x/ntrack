@@ -33,8 +33,9 @@ pub fn run_app(
     controller.attach(&ui);
     controller.spawn_platform_forwarder(platform_rx);
 
-    // Re-render once per second: relative timestamps, toast expiry, relay
-    // status. Cheap (small models) and keeps render logic in one place.
+    // Re-render once per second: relative timestamps, live-share timeouts,
+    // toast expiry, relay status. Cheap (small models) and keeps render logic
+    // in one place.
     let render_timer = slint::Timer::default();
     {
         let ctrl = controller.clone();
