@@ -110,6 +110,11 @@ impl AndroidPlatform {
                         sig: "(Ljava/lang/String;)V".into(),
                         fn_ptr: native_on_deep_link as *mut c_void,
                     },
+                    NativeMethod {
+                        name: "nativeOnResume".into(),
+                        sig: "()V".into(),
+                        fn_ptr: native_on_resume as *mut c_void,
+                    },
                 ],
             )
             .map_err(|e| format!("register natives: {e}"))?;
@@ -118,11 +123,15 @@ impl AndroidPlatform {
 
         let _ = PLATFORM_TX.set(tx);
         let me = Self { vm, bridge };
-        // Native callbacks are now registered, so any deep link that launched
-        // us (delivered to Java before this Rust side was ready) can be
-        // flushed through.
+        // Native callbacks are now registered, so any deep link or resume
+        // request that arrived before this Rust side was ready (e.g. a boot
+        // notification tap during cold start) can be flushed through.
         me.with_env("flushPendingDeepLink", |env, class| {
             env.call_static_method(class, "flushPendingDeepLink", "()V", &[])
+                .map(|_| ())
+        });
+        me.with_env("flushPendingResume", |env, class| {
+            env.call_static_method(class, "flushPendingResume", "()V", &[])
                 .map(|_| ())
         });
         Ok(me)
@@ -335,4 +344,12 @@ extern "system" fn native_on_qr_result(mut env: JNIEnv, _class: JClass, text: JS
 /// launched or resumed the activity.
 extern "system" fn native_on_deep_link(mut env: JNIEnv, _class: JClass, uri: JString) {
     deliver_invite(&mut env, &uri);
+}
+
+/// `static native void nativeOnResume()` — the user tapped the post-reboot
+/// "resume sharing" notification (delivered via `MainActivity`).
+extern "system" fn native_on_resume(_env: JNIEnv, _class: JClass) {
+    if let Some(tx) = PLATFORM_TX.get() {
+        let _ = tx.send(PlatformEvent::ResumeShareRequest);
+    }
 }

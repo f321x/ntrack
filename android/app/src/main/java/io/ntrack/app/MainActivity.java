@@ -35,9 +35,11 @@ public class MainActivity extends NativeActivity {
         // sharing sessions are typically glanced at, not interacted with.
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         setupEdgeToEdge();
-        // A cold-start invite link arrives here before the Rust side has
-        // registered its callbacks; LocationBridge buffers it until ready.
+        // A cold-start invite link or resume-notification tap arrives here
+        // before the Rust side has registered its callbacks; LocationBridge
+        // buffers either until ready.
         handleDeepLink(getIntent());
+        handleResumeIntent(getIntent());
     }
 
     @Override
@@ -45,6 +47,17 @@ public class MainActivity extends NativeActivity {
         super.onNewIntent(intent);
         setIntent(intent);
         handleDeepLink(intent);
+        handleResumeIntent(intent);
+    }
+
+    /** Forward a post-reboot resume-notification tap to the bridge. */
+    private void handleResumeIntent(Intent intent) {
+        if (intent == null || !intent.getBooleanExtra("resume_sharing", false)) return;
+        LocationBridge.onResumeIntent();
+        // Consume the extra so an unhandled config-change recreate doesn't
+        // re-read this intent and resume again.
+        intent.removeExtra("resume_sharing");
+        setIntent(intent);
     }
 
     /** Forward an {@code ntrack://join} VIEW intent to the bridge. */

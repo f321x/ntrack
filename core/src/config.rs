@@ -92,6 +92,16 @@ pub struct Config {
     /// Persisted replay-protection tail (processed event ids, hex).
     #[serde(default)]
     pub processed_ids: Vec<String>,
+    /// True while a share is active and the user has not explicitly stopped
+    /// it. Persisted so a reboot/crash can offer to resume. Set on
+    /// `start_share`; cleared only on an explicit stop — never by the
+    /// best-effort STOP emitted at process shutdown (that *is* the
+    /// reboot-while-sharing case we want to resume from).
+    #[serde(default)]
+    pub resume_share: bool,
+    /// Message attached to the share, restored on resume.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub resume_msg: Option<String>,
 }
 
 pub fn default_relays() -> Vec<String> {
@@ -116,6 +126,8 @@ impl Default for Config {
             use_expiration: true,
             sender_labels: Vec::new(),
             processed_ids: Vec::new(),
+            resume_share: false,
+            resume_msg: None,
         }
     }
 }
@@ -170,6 +182,29 @@ impl ConfigStore {
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Path of the non-secret "was sharing" sentinel, a sibling of
+    /// `config.json`. The Android boot receiver checks its mere existence to
+    /// decide whether to offer resuming, so it never has to parse (or even
+    /// open) the secret-bearing config file.
+    pub fn resume_flag_path(&self) -> PathBuf {
+        self.path.with_file_name("resume.flag")
+    }
+
+    /// Create (on = true) or remove (on = false) the resume sentinel so it
+    /// mirrors [`Config::resume_share`]. Best-effort: errors are ignored,
+    /// since the flag is only an optimisation for the boot receiver.
+    pub fn set_resume_flag(&self, on: bool) {
+        let path = self.resume_flag_path();
+        if on {
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let _ = std::fs::write(&path, []);
+        } else {
+            let _ = std::fs::remove_file(&path);
+        }
     }
 
     /// Load the config, falling back to defaults when the file is missing.
@@ -269,5 +304,38 @@ mod tests {
         assert_eq!(cfg.label_for("ab"), Some("Alice"));
         cfg.set_label("ab", "  ");
         assert_eq!(cfg.label_for("ab"), None);
+    }
+
+    #[test]
+    fn resume_fields_default_off_for_old_config() {
+        // An older config.json predating the resume fields must still load,
+        // defaulting to "not resuming".
+        let dir = tmpdir();
+        let store = ConfigStore::new(&dir);
+        std::fs::write(store.path(), br#"{"relays":[],"groups":[]}"#).unwrap();
+        let cfg = store.load().unwrap();
+        assert!(!cfg.resume_share);
+        assert_eq!(cfg.resume_msg, None);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn resume_flag_path_is_sibling_of_config() {
+        let dir = tmpdir();
+        let store = ConfigStore::new(&dir);
+        assert_eq!(store.resume_flag_path(), dir.join("resume.flag"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn set_resume_flag_creates_and_removes_sentinel() {
+        let dir = tmpdir();
+        let store = ConfigStore::new(&dir);
+        assert!(!store.resume_flag_path().exists());
+        store.set_resume_flag(true);
+        assert!(store.resume_flag_path().exists());
+        store.set_resume_flag(false);
+        assert!(!store.resume_flag_path().exists());
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

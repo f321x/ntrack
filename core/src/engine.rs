@@ -51,6 +51,10 @@ pub enum EngineCmd {
     /// relays/subscriptions afterwards.
     Mutate(Box<dyn FnOnce(&mut Config) + Send>),
     StartShare { msg: Option<String> },
+    /// Resume a share that was active before the process died, but only if the
+    /// persisted resume flag is still armed (i.e. the user never explicitly
+    /// stopped). Driven by the Android boot "resume" notification tap.
+    ResumeShareIfArmed,
     /// Update the message attached to subsequent location publishes.
     SetMessage(Option<String>),
     StopShare,
@@ -249,12 +253,24 @@ impl<P: EnginePool> Engine<P> {
                 self.emit_tracks();
             }
             EngineCmd::StartShare { msg } => self.start_share(msg),
+            EngineCmd::ResumeShareIfArmed => {
+                if self.config.resume_share && self.share.is_none() {
+                    let msg = self.config.resume_msg.clone();
+                    self.start_share(msg);
+                }
+            }
             EngineCmd::SetMessage(msg) => {
                 if let Some(s) = &mut self.share {
                     s.msg = msg.filter(|m| !m.trim().is_empty());
                 }
             }
-            EngineCmd::StopShare => self.stop_share(),
+            EngineCmd::StopShare => {
+                // An explicit user stop disarms boot-resume; a process-death
+                // STOP (run()'s shutdown tail) goes through stop_share()
+                // directly and deliberately leaves the flag armed.
+                self.disarm_resume();
+                self.stop_share();
+            }
             EngineCmd::SendTest => self.send_test(),
             EngineCmd::Location(sample) => self.on_location(sample),
             EngineCmd::LocationUnavailable(reason) => {
@@ -263,6 +279,9 @@ impl<P: EnginePool> Engine<P> {
                 }
                 self.test_pending = None;
                 if self.share.is_some() {
+                    // Permission revoked / GPS off is a real interruption the
+                    // user caused; don't try to resume into a denied state.
+                    self.disarm_resume();
                     self.stop_share();
                 } else {
                     self.emit_share();
@@ -337,11 +356,16 @@ impl<P: EnginePool> Engine<P> {
                 return;
             }
         };
+        let msg = msg.filter(|m| !m.trim().is_empty());
+        // Arm boot-resume: persisted so a reboot/crash while sharing can offer
+        // to continue. Cleared only on an explicit stop (see disarm_resume).
+        self.config.resume_share = true;
+        self.config.resume_msg = msg.clone();
         self.persist();
         self.share = Some(ShareState {
             sender,
             recipients,
-            msg: msg.filter(|m| !m.trim().is_empty()),
+            msg,
             last_publish_at: None,
             last_sample: None,
             last_sample_published: false,
@@ -352,6 +376,17 @@ impl<P: EnginePool> Engine<P> {
         });
         let _ = self.ui_tx.send(UiEvent::NeedLocation(true));
         self.emit_share();
+    }
+
+    /// Clear the persisted boot-resume flag (and its sentinel). Called on an
+    /// explicit user stop or a permission/GPS loss — never on the best-effort
+    /// shutdown STOP, which must leave resume armed.
+    fn disarm_resume(&mut self) {
+        if self.config.resume_share || self.config.resume_msg.is_some() {
+            self.config.resume_share = false;
+            self.config.resume_msg = None;
+            self.persist();
+        }
     }
 
     fn stop_share(&mut self) {
@@ -624,6 +659,9 @@ impl<P: EnginePool> Engine<P> {
             log::error!("config save failed: {e}");
             self.toast("Failed to save settings".into());
         }
+        // Keep the boot-resume sentinel in lockstep with the persisted flag,
+        // wherever config is saved.
+        self.store.set_resume_flag(self.config.resume_share);
     }
 
     fn flush_seen(&mut self) {
@@ -1098,6 +1136,125 @@ mod tests {
         )
         .unwrap();
         assert_eq!(inc.payload.status, Status::Stop);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn start_arms_resume_flag_and_persists_it() {
+        let mut f = fixture();
+        add_member_group(&mut f, "G");
+        drain(&mut f);
+
+        f.engine.handle(EngineCmd::StartShare { msg: Some("on my way".into()) });
+        // In-memory flag is armed with the share message (stored verbatim,
+        // exactly as it is attached to broadcasts).
+        assert!(f.engine.config.resume_share);
+        assert_eq!(f.engine.config.resume_msg.as_deref(), Some("on my way"));
+        // Persisted: a fresh load sees the same, and the sentinel exists.
+        assert!(f.engine.store.resume_flag_path().exists());
+        let reloaded = ConfigStore::new(&f.dir).load().unwrap();
+        assert!(reloaded.resume_share);
+        assert_eq!(reloaded.resume_msg.as_deref(), Some("on my way"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn explicit_stop_disarms_resume_flag() {
+        let mut f = fixture();
+        add_member_group(&mut f, "G");
+        drain(&mut f);
+        f.engine.handle(EngineCmd::StartShare { msg: Some("x".into()) });
+        f.engine.handle(EngineCmd::StopShare);
+        assert!(!f.engine.config.resume_share);
+        assert_eq!(f.engine.config.resume_msg, None);
+        assert!(!f.engine.store.resume_flag_path().exists());
+        let reloaded = ConfigStore::new(&f.dir).load().unwrap();
+        assert!(!reloaded.resume_share);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn location_unavailable_disarms_resume_flag() {
+        let mut f = fixture();
+        add_member_group(&mut f, "G");
+        drain(&mut f);
+        f.engine.handle(EngineCmd::StartShare { msg: None });
+        f.engine
+            .handle(EngineCmd::LocationUnavailable("permission denied".into()));
+        assert!(!f.engine.config.resume_share);
+        assert!(!f.engine.store.resume_flag_path().exists());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn resume_flag_survives_process_shutdown() {
+        // Simulate a reboot/kill while sharing: start a share, then drop the
+        // command channel so run() takes its shutdown path (best-effort STOP).
+        // That STOP must NOT disarm the persisted resume flag — otherwise we
+        // could never resume after a crash/reboot.
+        let dir = std::env::temp_dir().join(format!(
+            "ntrack-engine-shutdown-{}-{}",
+            std::process::id(),
+            SHUTDOWN_N.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = ConfigStore::new(&dir);
+        {
+            let mut cfg = store.load().unwrap();
+            cfg.groups.push(Group::new_member("G".into()).unwrap());
+            store.save(&cfg).unwrap();
+        }
+        let pool = Arc::new(MockPool::default());
+        let (ui_tx, _ui_rx) = mpsc::unbounded_channel();
+        let engine = Engine::new(store, pool.clone(), ui_tx);
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let handle = tokio::spawn(engine.run(cmd_rx));
+        cmd_tx
+            .send(EngineCmd::StartShare { msg: Some("hi".into()) })
+            .unwrap();
+        // Close the channel → run() processes StartShare, then breaks and runs
+        // its shutdown STOP.
+        drop(cmd_tx);
+        handle.await.unwrap();
+
+        let reloaded = ConfigStore::new(&dir).load().unwrap();
+        assert!(
+            reloaded.resume_share,
+            "shutdown STOP must keep the resume flag armed"
+        );
+        assert_eq!(reloaded.resume_msg.as_deref(), Some("hi"));
+        assert!(ConfigStore::new(&dir).resume_flag_path().exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    static SHUTDOWN_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    #[tokio::test(start_paused = true)]
+    async fn resume_if_armed_starts_when_armed() {
+        let mut f = fixture();
+        add_member_group(&mut f, "G");
+        f.engine
+            .handle(EngineCmd::Mutate(Box::new(|c| c.resume_share = true)));
+        drain(&mut f);
+
+        f.engine.handle(EngineCmd::ResumeShareIfArmed);
+        let evs = drain(&mut f);
+        assert!(
+            evs.iter().any(|e| matches!(e, UiEvent::NeedLocation(true))),
+            "an armed resume must start sharing"
+        );
+        // A fix now publishes, confirming the share is genuinely active.
+        f.engine.handle(EngineCmd::Location(sample(now_secs() * 1000)));
+        assert_eq!(f.pool.published.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn resume_if_armed_noops_when_disarmed() {
+        let mut f = fixture();
+        add_member_group(&mut f, "G");
+        drain(&mut f);
+
+        // resume_share defaults to false → no resume.
+        f.engine.handle(EngineCmd::ResumeShareIfArmed);
+        let evs = drain(&mut f);
+        assert!(!evs.iter().any(|e| matches!(e, UiEvent::NeedLocation(true))));
+        assert!(f.pool.published.lock().unwrap().is_empty());
     }
 
     #[tokio::test(start_paused = true)]

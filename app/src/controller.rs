@@ -48,6 +48,7 @@ enum Confirm {
 enum AfterPermission {
     StartShare { msg: String },
     SendTest,
+    ResumeShare,
 }
 
 #[derive(Default)]
@@ -144,6 +145,9 @@ impl Controller {
                         Some(AfterPermission::SendTest) => {
                             let _ = self.cmd_tx.send(EngineCmd::SendTest);
                         }
+                        Some(AfterPermission::ResumeShare) => {
+                            let _ = self.cmd_tx.send(EngineCmd::ResumeShareIfArmed);
+                        }
                         None => {}
                     }
                 } else {
@@ -164,6 +168,20 @@ impl Controller {
                 }
             }
             PlatformEvent::IncomingInvite(raw) => self.on_incoming_invite(raw),
+            PlatformEvent::ResumeShareRequest => self.resume_share_requested(),
+        }
+    }
+
+    /// The user tapped the post-reboot resume notification. Ensure location
+    /// permission, then ask the engine to resume if its persisted flag is
+    /// still armed (the engine no-ops otherwise, e.g. a stale notification
+    /// tapped after the share was already stopped).
+    fn resume_share_requested(self: &Arc<Self>) {
+        if self.platform.has_location_permission() {
+            let _ = self.cmd_tx.send(EngineCmd::ResumeShareIfArmed);
+        } else {
+            self.view.lock().unwrap().after_permission = Some(AfterPermission::ResumeShare);
+            self.platform.request_location_permission();
         }
     }
 

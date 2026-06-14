@@ -50,6 +50,8 @@ public final class LocationBridge {
     static native void nativeOnQrResult(String text);
     /** An {@code ntrack://join} deep link launched or resumed the app. */
     static native void nativeOnDeepLink(String uri);
+    /** The user tapped the post-reboot "resume sharing" notification. */
+    static native void nativeOnResume();
 
     private static LocationListener listener;
 
@@ -57,6 +59,8 @@ public final class LocationBridge {
     // registered its native callbacks, so buffer the latest one until Rust is
     // ready and flushes it.
     private static String pendingDeepLink;
+    // Same race for the post-reboot resume notification tap.
+    private static boolean pendingResume;
     private static boolean nativeReady;
 
     // ---- permissions -----------------------------------------------------
@@ -333,6 +337,33 @@ public final class LocationBridge {
         } catch (UnsatisfiedLinkError e) {
             Log.e(TAG, "native not ready for deep link", e);
             pendingDeepLink = uri; // try again on a later flush
+        }
+    }
+
+    // ---- resume-after-reboot ---------------------------------------------
+
+    /**
+     * Called by {@link MainActivity} when launched from the post-reboot resume
+     * notification (its {@code resume_sharing} intent extra). Like deep links,
+     * the tap can land before Rust is ready, so buffer until a flush.
+     */
+    public static synchronized void onResumeIntent() {
+        pendingResume = true;
+        if (nativeReady) {
+            flushPendingResume();
+        }
+    }
+
+    /** Deliver a buffered resume request; called by Rust once ready. */
+    public static synchronized void flushPendingResume() {
+        nativeReady = true;
+        if (!pendingResume) return;
+        pendingResume = false;
+        try {
+            nativeOnResume();
+        } catch (UnsatisfiedLinkError e) {
+            Log.e(TAG, "native not ready for resume", e);
+            pendingResume = true; // try again on a later flush
         }
     }
 }
