@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 108 108">
+  <defs><clipPath id="c"><circle cx="54" cy="54" r="54"/></clipPath></defs>
+  <g clip-path="url(#c)">
+    <rect x="0" y="0" width="108" height="108" fill="#0f1117"/>
+    <!-- location pin -->
+    <path fill="#8b5cf6" d="M54,28c-9.4,0 -17,7.6 -17,17 0,12.8 17,33 17,33s17,-20.2 17,-33c0,-9.4 -7.6,-17 -17,-17zM54,51a6,6 0 1,1 0,-12 6,6 0 0,1 0,12z"/>
+    <!-- broadcast arcs -->
+    <path stroke="#3ddc84" stroke-width="3" fill="none" stroke-linecap="round" d="M37,32a24,24 0 0,1 34,0"/>
+    <path stroke="#3ddc84" stroke-width="3" fill="none" stroke-linecap="round" d="M42,38a16,16 0 0,1 24,0"/>
+  </g>
+</svg>
