@@ -609,8 +609,13 @@ export component MainWindow inherits Window {
     in property <string> sender-npub;
     in property <bool> can-receive-any;
     in property <string> toast;
-    // top inset to keep content out of the status bar area on Android
+    // Safe-area insets pushed from the OS (status bar, navigation bar, display
+    // cutout) so content is not drawn under the system bars on edge-to-edge
+    // Android. All zero on the desktop (no system bars).
     in property <length> safe-top: 12px;
+    in property <length> safe-bottom: 0px;
+    in property <length> safe-left: 0px;
+    in property <length> safe-right: 0px;
 
     // share-key dialog payload (filled by Rust before showing)
     in-out property <bool> key-dialog-visible;
@@ -657,6 +662,11 @@ export component MainWindow inherits Window {
     }
 
     VerticalLayout {
+        // Keep interactive content clear of side insets (cutout / nav bar in
+        // landscape); zero in portrait.
+        padding-left: root.safe-left;
+        padding-right: root.safe-right;
+
         Rectangle { height: root.safe-top; background: Theme.bg; }
 
         // header
@@ -757,6 +767,10 @@ export component MainWindow inherits Window {
                 }
             }
         }
+
+        // bottom safe-area inset (gesture / navigation bar) — same colour as
+        // the tab bar so it reads as one surface.
+        Rectangle { height: root.safe-bottom; background: Theme.card; }
     }
 
     // ---- overlays ----
