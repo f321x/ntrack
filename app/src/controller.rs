@@ -671,7 +671,7 @@ fn share_status_strings(s: &ShareSnapshot, connected: usize, total: usize) -> (S
             format!("{connected}/{total} relays connected. Sharing starts at the first fix."),
         );
     }
-    let ack = if s.last_acked { "✓ relay confirmed" } else { "sending…" };
+    let ack = if s.last_acked { "relay confirmed" } else { "sending…" };
     let last = s
         .last_publish
         .map(|t| {

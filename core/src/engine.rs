@@ -243,6 +243,10 @@ impl<P: EnginePool> Engine<P> {
                 self.persist();
                 self.sync_pool();
                 self.emit_config();
+                // Track cards derive their title (and group name) from config,
+                // so a rename/relabel must refresh them immediately rather than
+                // waiting for the next incoming event to re-emit tracks.
+                self.emit_tracks();
             }
             EngineCmd::StartShare { msg } => self.start_share(msg),
             EngineCmd::SetMessage(msg) => {
@@ -1022,6 +1026,39 @@ mod tests {
             UiEvent::Tracks(t) => Some(t),
             _ => None,
         })
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn renaming_a_sender_refreshes_tracks_immediately() {
+        let mut f = fixture();
+        let group = add_member_group(&mut f, "Friends");
+        drain(&mut f);
+
+        // A sender shows up with no label yet → titled by its short npub.
+        let sender = keys::generate();
+        let sender_hex = sender.public_key().to_hex();
+        let ev = protocol::build_event(
+            &sender,
+            &[group.public_key().unwrap()],
+            &GartPayload::active(10.0, 20.0, 1000, None),
+            None,
+        )
+        .unwrap();
+        f.engine.handle(EngineCmd::Pool(PoolEvent::Incoming {
+            url: "wss://r".into(),
+            event: Box::new(ev),
+        }));
+        let tracks = last_tracks(drain(&mut f)).expect("tracks emitted");
+        assert_eq!(tracks[0].label, "", "no label before renaming");
+
+        // Renaming is a plain config mutation; it must re-emit tracks so the
+        // card title updates immediately instead of waiting for the next event.
+        let hex = sender_hex.clone();
+        f.engine
+            .handle(EngineCmd::Mutate(Box::new(move |c| c.set_label(&hex, "Anna"))));
+        let tracks = last_tracks(drain(&mut f)).expect("mutate re-emits tracks");
+        assert_eq!(tracks[0].sender_hex, sender_hex);
+        assert_eq!(tracks[0].label, "Anna");
     }
 
     #[tokio::test(start_paused = true)]
