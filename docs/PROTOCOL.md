@@ -127,7 +127,10 @@ harmless. (Test: `subscription_filter_shape`.)
 
 * Live sharing publishes `ACTIVE` events at the configured interval
   (15 s – 5 min) with the latest GPS fix; `ts` is the fix time, `created_at`
-  the publish time.
+  the publish time. The GPS is sampled at that same cadence — never faster,
+  since powering the radio is the dominant battery cost — and each fix is
+  broadcast at most once: if the GPS stalls and yields no new position,
+  ntrack stays quiet rather than re-sending a stale point.
 * Stopping a share (including when location becomes unavailable, and on
   app shutdown, best effort) publishes a `STOP` so receivers don't show a
   stale live state.
