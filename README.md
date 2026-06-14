@@ -42,10 +42,11 @@ adb install -r dist/ntrack-debug.apk
 
 ### Releases
 
-Tagged releases (`v*`) publish a signed APK to the repository's **Releases** page on
-GitHub — download `ntrack-<version>.apk` and `adb install` it. Maintainers: see
-[docs/RELEASING.md](docs/RELEASING.md) for the one-time signing-key setup and how to
-cut a release.
+Tagged releases (`v*`) publish a signed APK two ways: to the repository's **Releases**
+page on GitHub (download `ntrack-<version>.apk` and `adb install` it) and to the
+[Zapstore](https://zapstore.dev) app store (install and auto-update over Nostr).
+Maintainers: see [docs/RELEASING.md](docs/RELEASING.md) for the one-time signing-key
+setup and how to cut a release.
 
 ## Develop
 

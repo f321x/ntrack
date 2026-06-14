@@ -6,7 +6,7 @@ CI (`.github/workflows/ci.yml`) does three things:
 | --- | --- | --- |
 | Push to `master` | `test` | Compile + `cargo test --workspace` + clippy |
 | Pull request | `test`, `debug-apk` | The above, plus an installable **debug** APK (uploaded as a build artifact) signed with an ephemeral debug key |
-| Push a tag `v*` | `test`, `release-apk` | The above, plus a **signed release** APK published on the tag's GitHub Release |
+| Push a tag `v*` | `test`, `release-apk` | The above, plus a **signed release** APK published on the tag's GitHub Release **and** on the [Zapstore](https://zapstore.dev) app store |
 
 The debug APK on PRs is signed with Android's auto-generated debug keystore,
 which AGP regenerates inside each CI run — nothing to configure. The **release**
@@ -64,6 +64,44 @@ it. The secrets are never written into the repo and are masked in logs. The
 **keystore file itself is never committed** — `release-signing/`, `*.jks`, and
 `*.keystore` are git-ignored.
 
+## Publishing to Zapstore
+
+The tag build also publishes the **same signed APK** to the
+[Zapstore](https://zapstore.dev) app store, over Nostr, using the
+[`zsp`](https://github.com/zapstore/zsp) CLI. The store listing (name, summary,
+description, icon, screenshots, …) lives in [`zapstore.yaml`](../zapstore.yaml)
+at the repo root — edit that file to change how ntrack appears in the store.
+
+CI publishes in *yaml-mode with a local APK*: `zapstore.yaml` is the source of
+truth (`--skip-metadata` disables external enrichment) and its `release_source`
+points `zsp` at the just-built `dist/ntrack-release.apk`. The exact command is:
+
+```sh
+SIGN_WITH=$ZAPSTORE_NOSTR_NSEC zsp publish zapstore.yaml --quiet --skip-metadata
+```
+
+### The one secret you must set
+
+| Secret | Value |
+| --- | --- |
+| `ZAPSTORE_NOSTR_NSEC` | the `nsec…` of the Nostr key apps are published under |
+
+`zapstore.yaml` pins the matching **`pubkey`** (npub); `zsp` refuses to publish
+if `ZAPSTORE_NOSTR_NSEC` resolves to a different key, so a wrong or missing
+secret fails the job loudly rather than shipping under the wrong identity. Keep
+this key — Zapstore associates the app with whoever first published it. (Same
+caveat as the signing keystore: back it up.)
+
+Two things are intentionally *not* required here:
+
+- **No icon in the APK is needed** — ntrack's launcher icon is an adaptive XML
+  resource with no raster mipmap, so `zapstore.yaml` points `icon:` at the
+  committed `docs/branding/` PNG instead of relying on extraction.
+- **No certificate linking is required** to publish. Optionally you can later
+  cryptographically link the APK's signing certificate to the Nostr identity
+  with `zsp identity --link-key …` so clients can verify provenance; see the
+  zsp docs.
+
 ## Cutting a release
 
 Versioning is derived from the tag, so just tag and push:
@@ -78,7 +116,8 @@ git push origin v0.2.0
 
 The `release-apk` job builds `dist/ntrack-release.apk`, renames it to
 `ntrack-v0.2.0.apk`, and attaches it to the tag's GitHub Release (created with
-auto-generated notes). Re-running the job re-uploads the asset.
+auto-generated notes). Re-running the job re-uploads the asset. It then
+publishes the same APK to Zapstore (see above).
 
 ## Building a signed release locally
 

@@ -32,9 +32,11 @@ SKIP_IMAGE_BUILD=1 ./build.sh               # reuse an existing builder image (C
 ```
 
 **CI** (`.github/workflows/ci.yml`): host tests + clippy on every push to `master`
-and every PR; a debug APK (ephemeral key) on PRs; a *signed* release APK attached
-to the GitHub Release on every `v*` tag. Release signing secrets and the
-tag→version mapping are in `docs/RELEASING.md`.
+and every PR; a debug APK (ephemeral key) on PRs; a *signed* release APK on every
+`v*` tag, attached to the GitHub Release and published to the
+[Zapstore](https://zapstore.dev) app store (via `zsp`, signed with the
+`ZAPSTORE_NOSTR_NSEC` secret; listing in `zapstore.yaml`). Release signing
+secrets and the tag→version mapping are in `docs/RELEASING.md`.
 
 **Host build dependency:** Slint's text layer links fontconfig on Linux, so even a host
 `cargo test`/`clippy` of the GUI crate needs the dev package: `libfontconfig1-dev` (Debian/Ubuntu)

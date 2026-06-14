@@ -119,3 +119,23 @@ jobs:
             --generate-notes \
             "$asset" \
           || gh release upload "$GITHUB_REF_NAME" "$asset" --clobber
+      - name: Publish APK to Zapstore
+        # Publish the same signed APK to the Zapstore app store over Nostr,
+        # signed with our publishing key. "yaml-mode with a local APK":
+        # zapstore.yaml is the source of truth and its release_source points at
+        # the APK built above (dist/ntrack-release.apk). See docs/RELEASING.md.
+        env:
+          SIGN_WITH: ${{ secrets.ZAPSTORE_NOSTR_NSEC }}
+        run: |
+          if [ -z "$SIGN_WITH" ]; then
+            echo "::error::Missing secret ZAPSTORE_NOSTR_NSEC (see docs/RELEASING.md)"
+            exit 1
+          fi
+          # Pinned zsp release (https://github.com/zapstore/zsp); bump to upgrade.
+          ZSP_VERSION=0.4.10
+          curl -fsSL -o "$RUNNER_TEMP/zsp" \
+            "https://github.com/zapstore/zsp/releases/download/v${ZSP_VERSION}/zsp-${ZSP_VERSION}-linux-amd64"
+          chmod +x "$RUNNER_TEMP/zsp"
+          # --quiet: no prompts, auto-confirm (CI). --skip-metadata: keep
+          # zapstore.yaml authoritative instead of enriching from external sources.
+          "$RUNNER_TEMP/zsp" publish zapstore.yaml --quiet --skip-metadata

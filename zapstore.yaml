@@ -1,0 +1,58 @@
+# Zapstore listing for ntrack (io.ntrack.app).
+#
+# Published automatically on every `v*` tag by .github/workflows/ci.yml: the
+# release job builds the signed APK, then runs
+#
+#     SIGN_WITH=$ZAPSTORE_NOSTR_NSEC zsp publish zapstore.yaml --quiet --skip-metadata
+#
+# This is "yaml-mode with a local APK": every field below is the source of
+# truth (--skip-metadata disables external metadata enrichment), and
+# `release_source` points zsp at the freshly-built APK on disk instead of a
+# remote source. See docs/RELEASING.md and https://zapstore.dev/docs/publish.
+
+# Source repository — shown on the listing; the APK itself comes from
+# release_source below, not from here.
+repository: https://github.com/f321x/ntrack
+
+# npub of the Zapstore publishing identity (the ZAPSTORE_NOSTR_NSEC secret).
+# zsp refuses to publish if SIGN_WITH resolves to a different key — a guard
+# against accidentally shipping under the wrong identity.
+pubkey: npub1mxscnuhl2swlmul9a0mldyckuj02zunu9eetm8g3xx2huzargcyqg2uwh7
+
+# The signed release APK from `./build.sh release`, resolved relative to this
+# file. A local path makes zsp use the APK directly instead of fetching a
+# release from a remote source.
+release_source: ./dist/ntrack-release.apk
+
+name: ntrack
+summary: Encrypted, serverless live location sharing over Nostr
+license: MIT
+website: https://github.com/f321x/ntrack
+
+# Launcher icon is an adaptive (XML) resource with no raster mipmap, so it
+# can't be extracted from the APK; point at the committed branding asset.
+icon: https://raw.githubusercontent.com/f321x/ntrack/master/docs/branding/ntrack-square-1024.png
+
+tags:
+  - Security
+  - Connectivity
+
+description: |
+  ntrack shares your live location with a group of people you choose — over the
+  Nostr network, with no accounts and no central server. Locations are
+  end-to-end encrypted (NIP-44 v2), so relays only ever see ciphertext from a
+  throwaway sender key that is never linked to a personal Nostr identity. Any
+  Nostr relay works.
+
+  A group is simply a shared keypair. Hand its secret key to the people who
+  should see you — holding it lets them decrypt, the public key is enough to
+  send. The key is the membership, so rotate it whenever membership changes.
+
+  - Share — publish your encrypted location at a set interval.
+  - Track — follow your groups on a live map; incoming locations are verified,
+    deduplicated and decrypted on-device, each with an "open in maps" shortcut.
+  - Test — send a TEST event to exercise the whole pipeline (relays, encryption,
+    members' devices) without starting a real share.
+
+  ntrack interoperates with the Gart app through the NIP-GART protocol
+  (Nostr kind:694).
