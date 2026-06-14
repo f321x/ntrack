@@ -188,8 +188,14 @@ public final class LocationBridge {
                     @Override public void onProviderDisabled(String provider) {}
                 };
                 boolean any = false;
+                // Sample at the broadcast cadence, not faster: ntrack only
+                // ever sends the latest fix once per interval, so asking the
+                // GPS for fixes more often than that would spin the radio for
+                // positions we'd immediately discard. A 1 s floor guards a
+                // pathologically small interval.
+                long minTimeMs = Math.max(intervalMs, 1000L);
                 for (String provider : pickProviders(lm)) {
-                    lm.requestLocationUpdates(provider, Math.max(intervalMs / 2, 1000L), 0f,
+                    lm.requestLocationUpdates(provider, minTimeMs, 0f,
                             listener, Looper.getMainLooper());
                     any = true;
                     Log.i(TAG, "location updates from " + provider);

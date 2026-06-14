@@ -145,6 +145,10 @@ struct ShareState {
     msg: Option<String>,
     last_publish_at: Option<tokio::time::Instant>,
     last_sample: Option<LocationSample>,
+    /// Whether `last_sample` has already been broadcast. Guards the tick
+    /// against re-sending a position we've already published (which would
+    /// spin the radio for nothing); only genuinely new fixes are broadcast.
+    last_sample_published: bool,
     last_event_id: Option<EventId>,
     last_publish_ts: Option<u64>,
     publish_count: u64,
@@ -336,6 +340,7 @@ impl<P: EnginePool> Engine<P> {
             msg: msg.filter(|m| !m.trim().is_empty()),
             last_publish_at: None,
             last_sample: None,
+            last_sample_published: false,
             last_event_id: None,
             last_publish_ts: None,
             publish_count: 0,
@@ -414,6 +419,7 @@ impl<P: EnginePool> Engine<P> {
         };
         if let Some(s) = &mut self.share {
             s.last_sample = Some(sample);
+            s.last_sample_published = false;
         }
         if due {
             self.publish_active(sample);
@@ -434,12 +440,21 @@ impl<P: EnginePool> Engine<P> {
             }
         }
         let interval = Duration::from_secs(self.config.interval_secs.max(5));
+        // The tick only catches up a fix that arrived off-cycle (before its
+        // interval elapsed); fresh fixes are published on arrival in
+        // `on_location`. An already-published position is never re-sent —
+        // when the GPS stalls we go quiet rather than re-broadcasting a stale
+        // point, saving the radio and bandwidth.
         let due_sample = self.share.as_ref().and_then(|s| {
             let due = match s.last_publish_at {
                 None => true,
                 Some(at) => at.elapsed() >= interval,
             };
-            if due { s.last_sample } else { None }
+            if due && !s.last_sample_published {
+                s.last_sample
+            } else {
+                None
+            }
         });
         if let Some(sample) = due_sample {
             self.publish_active(sample);
@@ -489,6 +504,7 @@ impl<P: EnginePool> Engine<P> {
                         s.publish_count += 1;
                         s.last_event_id = Some(id);
                         s.last_acked = false;
+                        s.last_sample_published = true;
                     }
                 }
                 self.emit_share();
@@ -854,7 +870,8 @@ mod tests {
         f.engine.handle(EngineCmd::Location(sample(now_secs() * 1000 + 1000)));
         assert_eq!(f.pool.published.lock().unwrap().len(), 1);
 
-        // After the interval elapses, the tick republishes the latest fix.
+        // After the interval elapses, the tick publishes the latest fix that
+        // arrived off-cycle (the second one), without re-sending the first.
         tokio::time::advance(Duration::from_secs(31)).await;
         f.engine.handle(EngineCmd::Tick);
         assert_eq!(f.pool.published.lock().unwrap().len(), 2);
@@ -876,6 +893,35 @@ mod tests {
             published.iter().map(|e| e.pubkey).collect();
         assert_eq!(senders.len(), 1);
         assert_ne!(published[0].pubkey, group.public_key().unwrap());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn tick_does_not_rebroadcast_an_already_sent_fix() {
+        let mut f = fixture();
+        add_member_group(&mut f, "G");
+        drain(&mut f);
+        f.engine.handle(EngineCmd::StartShare { msg: None });
+
+        // First fix publishes immediately.
+        f.engine.handle(EngineCmd::Location(sample(now_secs() * 1000)));
+        assert_eq!(f.pool.published.lock().unwrap().len(), 1);
+
+        // GPS stalls: no new fix arrives. Ticking past several intervals must
+        // NOT re-broadcast the same position — re-sending a fix we already
+        // sent would just spin the relay/radio for nothing.
+        tokio::time::advance(Duration::from_secs(31)).await;
+        f.engine.handle(EngineCmd::Tick);
+        tokio::time::advance(Duration::from_secs(31)).await;
+        f.engine.handle(EngineCmd::Tick);
+        assert_eq!(
+            f.pool.published.lock().unwrap().len(),
+            1,
+            "an already-broadcast fix is never re-sent"
+        );
+
+        // A genuinely new fix resumes broadcasting.
+        f.engine.handle(EngineCmd::Location(sample(now_secs() * 1000)));
+        assert_eq!(f.pool.published.lock().unwrap().len(), 2);
     }
 
     #[tokio::test(start_paused = true)]
