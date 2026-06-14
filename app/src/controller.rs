@@ -19,7 +19,7 @@ use ntrack_core::engine::{
 use ntrack_core::keys::{parse_group_key, ParsedGroupKey};
 use ntrack_core::protocol::Status;
 use ntrack_core::relay::{normalize_relay_url, RelayPool};
-use slint::{ComponentHandle, Weak};
+use slint::Weak;
 use tokio::sync::mpsc;
 
 use crate::platform::{Platform, PlatformEvent};
@@ -153,24 +153,6 @@ impl Controller {
                             .send(EngineCmd::LocationUnavailable("permission denied".into()));
                     }
                 }
-            }
-            PlatformEvent::Insets {
-                top,
-                bottom,
-                left,
-                right,
-            } => {
-                // Push the OS safe-area insets into the UI so content isn't
-                // drawn under the status/navigation bars (edge-to-edge). The
-                // insets arrive in physical pixels; Slint lengths are logical,
-                // so divide by the window scale factor.
-                let _ = self.ui.upgrade_in_event_loop(move |ui| {
-                    let scale = ui.window().scale_factor().max(1.0);
-                    ui.set_safe_top(top.max(0) as f32 / scale);
-                    ui.set_safe_bottom(bottom.max(0) as f32 / scale);
-                    ui.set_safe_left(left.max(0) as f32 / scale);
-                    ui.set_safe_right(right.max(0) as f32 / scale);
-                });
             }
         }
     }

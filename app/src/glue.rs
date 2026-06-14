@@ -21,7 +21,7 @@ use std::ffi::c_void;
 use std::sync::OnceLock;
 
 use jni::objects::{GlobalRef, JClass, JObject, JValue};
-use jni::sys::{jboolean, jdouble, jfloat, jint, jlong};
+use jni::sys::{jboolean, jdouble, jfloat, jlong};
 use jni::{JNIEnv, JavaVM, NativeMethod};
 use ntrack_core::engine::LocationSample;
 use tokio::sync::mpsc;
@@ -95,32 +95,13 @@ impl AndroidPlatform {
                         sig: "(Z)V".into(),
                         fn_ptr: native_on_permission as *mut c_void,
                     },
-                    NativeMethod {
-                        name: "nativeOnInsets".into(),
-                        sig: "(IIII)V".into(),
-                        fn_ptr: native_on_insets as *mut c_void,
-                    },
                 ],
             )
             .map_err(|e| format!("register natives: {e}"))?;
-
-            // Install the event sink before asking Java to (re)dispatch the
-            // window insets below, so the first inset callback isn't dropped.
-            let _ = PLATFORM_TX.set(tx);
-
-            // Now that the native callbacks are registered, ask the Java side
-            // to (re)dispatch the current window insets so the UI can pad
-            // around the status and navigation bars (edge-to-edge). This
-            // covers the startup race where the activity's inset listener
-            // fired before RegisterNatives. Non-fatal on failure.
-            let class_ref: &JClass = (&bridge_obj).into();
-            let _ = env.call_static_method(class_ref, "requestInsets", "()V", &[]);
-            if env.exception_check().unwrap_or(false) {
-                let _ = env.exception_clear();
-            }
             bridge
         };
 
+        let _ = PLATFORM_TX.set(tx);
         Ok(Self { vm, bridge })
     }
 
@@ -260,26 +241,5 @@ extern "system" fn native_on_location(
 extern "system" fn native_on_permission(_env: JNIEnv, _class: JClass, granted: jboolean) {
     if let Some(tx) = PLATFORM_TX.get() {
         let _ = tx.send(PlatformEvent::PermissionResult(granted != 0));
-    }
-}
-
-/// `static native void nativeOnInsets(int, int, int, int)` — system-bar and
-/// display-cutout insets (physical pixels) from the activity's window-inset
-/// listener.
-extern "system" fn native_on_insets(
-    _env: JNIEnv,
-    _class: JClass,
-    top: jint,
-    bottom: jint,
-    left: jint,
-    right: jint,
-) {
-    if let Some(tx) = PLATFORM_TX.get() {
-        let _ = tx.send(PlatformEvent::Insets {
-            top,
-            bottom,
-            left,
-            right,
-        });
     }
 }
