@@ -33,6 +33,13 @@ website: https://github.com/f321x/ntrack
 # can't be extracted from the APK; point at the committed branding asset.
 icon: https://raw.githubusercontent.com/f321x/ntrack/master/docs/branding/ntrack-square-1024.png
 
+# Listing screenshots. Like the icon above, these point at committed branding
+# assets (zsp re-hosts them on publish). Order is the display order: the main
+# screenshot (a live share) first, then the secondary one (settings).
+images:
+  - https://raw.githubusercontent.com/f321x/ntrack/master/docs/branding/ntrack-screenshot-1-share.png
+  - https://raw.githubusercontent.com/f321x/ntrack/master/docs/branding/ntrack-screenshot-2-settings.png
+
 tags:
   - Security
   - Connectivity
