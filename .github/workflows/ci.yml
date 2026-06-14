@@ -19,6 +19,11 @@ jobs:
         with:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
+      - name: Install system dependencies
+        # Slint's core text layout (parley -> fontique) links fontconfig on
+        # Linux, so even a host `cargo test` of the GUI crate needs its dev
+        # package; the build script shells out to pkg-config for fontconfig.pc.
+        run: sudo apt-get update && sudo apt-get install -y libfontconfig1-dev
       - name: Tests
         run: cargo test --workspace
       - name: Clippy
