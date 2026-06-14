@@ -44,8 +44,53 @@ public final class LocationBridge {
 
     static native void nativeOnLocation(double lat, double lng, float accuracy, long timeMillis);
     static native void nativeOnPermission(boolean granted);
+    static native void nativeOnInsets(int top, int bottom, int left, int right);
 
     private static LocationListener listener;
+
+    // ---- window insets (edge-to-edge) ------------------------------------
+
+    // Cached so a late-registering native side can be re-flushed via
+    // requestInsets(): the activity's inset listener may fire before Rust has
+    // called RegisterNatives.
+    private static volatile boolean haveInsets;
+    private static volatile int insetTop, insetBottom, insetLeft, insetRight;
+
+    /**
+     * Forward window insets (physical pixels) to native code. Called by
+     * {@link MainActivity}'s OnApplyWindowInsetsListener.
+     */
+    public static void dispatchInsets(int top, int bottom, int left, int right) {
+        insetTop = top;
+        insetBottom = bottom;
+        insetLeft = left;
+        insetRight = right;
+        haveInsets = true;
+        try {
+            nativeOnInsets(top, bottom, left, right);
+        } catch (UnsatisfiedLinkError e) {
+            // Native callback not registered yet — requestInsets() re-flushes.
+        }
+    }
+
+    /**
+     * Re-emit the last known insets and force a fresh dispatch. Rust calls this
+     * once it has registered the native callbacks, covering the startup race
+     * where the first inset dispatch arrived before RegisterNatives.
+     */
+    public static void requestInsets() {
+        if (haveInsets) {
+            try {
+                nativeOnInsets(insetTop, insetBottom, insetLeft, insetRight);
+            } catch (UnsatisfiedLinkError e) {
+                Log.e(TAG, "nativeOnInsets unavailable in requestInsets", e);
+            }
+        }
+        final Activity activity = MainActivity.current();
+        if (activity == null) return;
+        activity.runOnUiThread(() ->
+                activity.getWindow().getDecorView().requestApplyInsets());
+    }
 
     // ---- permissions -----------------------------------------------------
 

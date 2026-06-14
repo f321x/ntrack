@@ -11,6 +11,16 @@ pub enum PlatformEvent {
     /// Result of a permission request triggered by
     /// [`Platform::request_location_permission`].
     PermissionResult(bool),
+    /// System safe-area insets in physical pixels (status bar, navigation
+    /// bar, display cutout), pushed by the Android side so the UI can lay
+    /// itself out edge-to-edge without drawing under the system bars. Never
+    /// emitted on the desktop.
+    Insets {
+        top: i32,
+        bottom: i32,
+        left: i32,
+        right: i32,
+    },
 }
 
 pub trait Platform: Send + Sync + 'static {
