@@ -711,7 +711,7 @@ impl<P: EnginePool> Engine<P> {
             });
         }
         // Most recently updated first.
-        out.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        out.sort_by_key(|t| std::cmp::Reverse(t.created_at));
         let _ = self.ui_tx.send(UiEvent::Tracks(out));
     }
 }
