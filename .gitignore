@@ -10,6 +10,11 @@
 /android/.gradle
 /.gradle-docker
 
+# Release signing — never commit signing keys (see docs/RELEASING.md)
+/release-signing
+*.jks
+*.keystore
+
 # IDE / misc
 *.iml
 .idea/

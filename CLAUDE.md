@@ -22,12 +22,19 @@ cargo run -p ntrack-core --example genkey                # print a fresh keypair
 cargo run -p ntrack-core --example mock_relay -- 127.0.0.1:7777   # in-memory dev relay
 
 ./build.sh            # build the debug APK in Docker -> dist/ntrack-debug.apk
+./build.sh release    # build a SIGNED release APK -> dist/ntrack-release.apk (needs signing env; see docs/RELEASING.md)
 ./build.sh test       # run the Rust test suite inside the builder container
 ./build.sh shell      # interactive shell in the builder container
 ./build.sh clean      # remove (possibly root-owned) build artifacts
 ABIS="arm64-v8a x86_64" ./build.sh          # build extra ABIs (x86_64 for the emulator)
 SKIP_TESTS=1 ./build.sh                      # skip the test gate during an APK build
+SKIP_IMAGE_BUILD=1 ./build.sh               # reuse an existing builder image (CI pre-builds it with layer caching)
 ```
+
+**CI** (`.github/workflows/ci.yml`): host tests + clippy on every push to `master`
+and every PR; a debug APK (ephemeral key) on PRs; a *signed* release APK attached
+to the GitHub Release on every `v*` tag. Release signing secrets and the
+tag→version mapping are in `docs/RELEASING.md`.
 
 **Host build dependency:** Slint's text layer links fontconfig on Linux, so even a host
 `cargo test`/`clippy` of the GUI crate needs the dev package: `libfontconfig1-dev` (Debian/Ubuntu)

@@ -2,6 +2,17 @@ plugins {
     id 'com.android.application'
 }
 
+// Build-time injection: CI (and local release builds) pass values through the
+// environment (set by scripts/build-apk.sh); a -P<prop> fallback covers manual
+// Gradle invocations, and a hardcoded default covers plain dev builds.
+def fromEnvOrProp = { String envName, String propName, fallback ->
+    def v = System.getenv(envName)
+    if (v == null || v.toString().isEmpty()) {
+        v = project.findProperty(propName)
+    }
+    return (v == null || v.toString().isEmpty()) ? fallback : v
+}
+
 android {
     namespace 'io.ntrack.app'
     compileSdk 34
@@ -10,8 +21,11 @@ android {
         applicationId "io.ntrack.app"
         minSdk 26
         targetSdk 34
-        versionCode 1
-        versionName "0.1.0"
+        // Overridable so a tag build can stamp the release version (CI sets
+        // NTRACK_VERSION_NAME from the tag and NTRACK_VERSION_CODE from the run
+        // number — see docs/RELEASING.md).
+        versionCode fromEnvOrProp('NTRACK_VERSION_CODE', 'ntrackVersionCode', '1').toString().toInteger()
+        versionName fromEnvOrProp('NTRACK_VERSION_NAME', 'ntrackVersionName', '0.1.0').toString()
 
         // ABIs are controlled by which jniLibs cargo-ndk produced; this
         // filter just guards against stray folders.
@@ -21,15 +35,36 @@ android {
         }
     }
 
+    // Release signing is wired up only when a keystore is supplied. CI on a tag
+    // decodes it from the RELEASE_KEYSTORE_BASE64 secret and exports the env
+    // vars below (see docs/RELEASING.md). Without a keystore the release config
+    // is left empty and unassigned, so scripts/build-apk.sh refuses a release
+    // build rather than emit an unsigned APK.
+    def keystorePath = fromEnvOrProp('NTRACK_KEYSTORE', 'ntrackKeystore', null)
+    signingConfigs {
+        release {
+            if (keystorePath != null) {
+                storeFile file(keystorePath)
+                storePassword fromEnvOrProp('NTRACK_KEYSTORE_PASSWORD', 'ntrackKeystorePassword', '').toString()
+                keyAlias fromEnvOrProp('NTRACK_KEY_ALIAS', 'ntrackKeyAlias', '').toString()
+                keyPassword fromEnvOrProp('NTRACK_KEY_PASSWORD', 'ntrackKeyPassword', '').toString()
+            }
+        }
+    }
+
     buildTypes {
         debug {
             // Rust code is compiled by cargo-ndk before Gradle runs; the
             // "debug" APK intentionally packages release-profile .so files
-            // (a debug-profile Slint+Skia build is huge and slow).
+            // (a debug-profile Slint+Skia build is huge and slow). It is
+            // signed with AGP's auto-generated, ephemeral debug keystore.
             debuggable true
         }
         release {
             minifyEnabled false
+            if (keystorePath != null) {
+                signingConfig signingConfigs.release
+            }
         }
     }
 

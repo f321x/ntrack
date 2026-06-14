@@ -40,6 +40,13 @@ adb install -r dist/ntrack-debug.apk
 - Podman is auto-detected if Docker is absent. Behind a TLS-inspecting proxy, drop its CA `.crt`
   into `docker/certs/` (see `docker/certs/README.md`).
 
+### Releases
+
+Tagged releases (`v*`) publish a signed APK to the repository's **Releases** page on
+GitHub — download `ntrack-<version>.apk` and `adb install` it. Maintainers: see
+[docs/RELEASING.md](docs/RELEASING.md) for the one-time signing-key setup and how to
+cut a release.
+
 ## Develop
 
 ```sh

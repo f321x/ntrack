@@ -1,26 +1,54 @@
 #!/usr/bin/env bash
-# Builds the ntrack debug APK. Runs INSIDE the ntrack-builder container
-# (see ../build.sh), with the repository mounted at /work.
+# Builds the ntrack APK (debug or release). Runs INSIDE the ntrack-builder
+# container (see ../build.sh), with the repository mounted at /work.
 #
 # Environment:
 #   ABIS        space-separated Android ABIs (default: "arm64-v8a";
 #               also supported: armeabi-v7a x86_64)
 #   SKIP_TESTS  set to 1 to skip the Rust test suite
+#   BUILD_TYPE  "debug" (default) or "release"
 #   CHOWN_UID/CHOWN_GID  hand artifact ownership to this host user
+#
+# A release build (BUILD_TYPE=release) is signed with a persistent key that
+# android/app/build.gradle reads from the environment (see docs/RELEASING.md):
+#   NTRACK_KEYSTORE           path to the keystore (.jks) inside the container
+#   NTRACK_KEYSTORE_PASSWORD  keystore password
+#   NTRACK_KEY_ALIAS          key alias
+#   NTRACK_KEY_PASSWORD       key password
+# and honours optional version overrides:
+#   NTRACK_VERSION_NAME / NTRACK_VERSION_CODE
 
 set -euo pipefail
 cd /work
 
 ABIS="${ABIS:-arm64-v8a}"
+BUILD_TYPE="${BUILD_TYPE:-debug}"
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-/work/.docker-target}"
 JNILIBS=android/app/src/main/jniLibs
+
+case "$BUILD_TYPE" in
+    debug)   GRADLE_TASK=assembleDebug;   VARIANT=debug ;;
+    release) GRADLE_TASK=assembleRelease; VARIANT=release ;;
+    *) echo "error: BUILD_TYPE must be 'debug' or 'release' (got '$BUILD_TYPE')" >&2; exit 1 ;;
+esac
+
+# A release build without a keystore would silently produce an unsigned APK
+# (app-release-unsigned.apk) that Android refuses to install — fail loudly.
+if [ "$BUILD_TYPE" = "release" ] && [ -z "${NTRACK_KEYSTORE:-}" ]; then
+    echo "error: a release build needs a signing key (NTRACK_KEYSTORE et al.)." >&2
+    echo "       See docs/RELEASING.md." >&2
+    exit 1
+fi
 
 if [ "${SKIP_TESTS:-0}" != "1" ]; then
     echo "==> Running Rust test suite"
     cargo test --workspace
 fi
 
-echo "==> Building Rust library for ABIs: $ABIS"
+# The native libs are always built with the release profile regardless of the
+# APK variant: a debug-profile Slint+Skia build is huge and slow, so even the
+# "debug" APK ships release-profile .so files.
+echo "==> Building Rust native libs (release profile) for ABIs: $ABIS"
 rm -rf "$JNILIBS"
 
 # Slint's android backend compiles a small Java helper at build time and
@@ -53,12 +81,13 @@ for abi in $ABIS; do
     fi
 done
 
-echo "==> Building debug APK"
+echo "==> Building $VARIANT APK"
 ABIS_CSV="${ABIS// /,}"
-(cd android && gradle --no-daemon -PntrackAbis="$ABIS_CSV" assembleDebug)
+(cd android && gradle --no-daemon -PntrackAbis="$ABIS_CSV" "$GRADLE_TASK")
 
 mkdir -p dist
-cp android/app/build/outputs/apk/debug/app-debug.apk dist/ntrack-debug.apk
+OUT="dist/ntrack-${VARIANT}.apk"
+cp "android/app/build/outputs/apk/${VARIANT}/app-${VARIANT}.apk" "$OUT"
 
 # Bind-mounted builds run as root; hand the artifacts back to the host user.
 if [ -n "${CHOWN_UID:-}" ]; then
@@ -66,5 +95,5 @@ if [ -n "${CHOWN_UID:-}" ]; then
         dist "$JNILIBS" android/app/build android/.gradle 2>/dev/null || true
 fi
 
-echo "==> Done: dist/ntrack-debug.apk"
-ls -lh dist/ntrack-debug.apk
+echo "==> Done: $OUT"
+ls -lh "$OUT"
