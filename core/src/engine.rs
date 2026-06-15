@@ -1293,6 +1293,15 @@ mod tests {
         LocationSample { lat: 48.1, lng: 11.5, accuracy_m: 5.0, ts_millis }
     }
 
+    /// Decrypt one published event back to its payload for `group`, using a
+    /// fresh replay window (each test only decrypts a handful of distinct
+    /// events, so dedup is irrelevant here).
+    fn decrypt_for(ev: &Event, group: &Group) -> protocol::Incoming {
+        let mut seen = SeenIds::new(16);
+        protocol::process_incoming(ev, &[group.member_keys().unwrap()], &mut seen)
+            .expect("published event must decrypt for the group")
+    }
+
     fn drain(f: &mut Fixture) -> Vec<UiEvent> {
         let mut out = Vec::new();
         while let Ok(ev) = f.ui_rx.try_recv() {
@@ -1381,6 +1390,84 @@ mod tests {
         // A genuinely new fix resumes broadcasting.
         f.engine.handle(EngineCmd::Location(sample(now_secs() * 1000)));
         assert_eq!(f.pool.published.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn interval_change_while_sharing_adjusts_cadence_without_restart() {
+        // The publish cadence is read from config on every fix/tick, never
+        // cached in the share state, so changing "Update every" mid-share
+        // governs the running session immediately — no stop/start required.
+        let mut f = fixture();
+        add_member_group(&mut f, "G");
+        drain(&mut f);
+
+        // Default 30 s interval. Start sharing; the first fix publishes at once.
+        f.engine.handle(EngineCmd::StartShare { msg: None });
+        f.engine.handle(EngineCmd::Location(sample(now_secs() * 1000)));
+        assert_eq!(f.pool.published.lock().unwrap().len(), 1);
+
+        // Lengthen to 5 min mid-share. A fix at +31 s — which WOULD publish
+        // under the 30 s default — is now held back, proving the longer
+        // interval already governs the ongoing share.
+        f.engine.handle(EngineCmd::Mutate(Box::new(|c| c.interval_secs = 300)));
+        tokio::time::advance(Duration::from_secs(31)).await;
+        f.engine.handle(EngineCmd::Location(sample(now_secs() * 1000)));
+        assert_eq!(
+            f.pool.published.lock().unwrap().len(),
+            1,
+            "a lengthened interval immediately governs the running share"
+        );
+
+        // Shorten to 15 s. The previous publish was ~31 s ago, so the next fix
+        // is due again and broadcasts — once more without a restart.
+        f.engine.handle(EngineCmd::Mutate(Box::new(|c| c.interval_secs = 15)));
+        tokio::time::advance(Duration::from_secs(1)).await;
+        f.engine.handle(EngineCmd::Location(sample(now_secs() * 1000)));
+        assert_eq!(
+            f.pool.published.lock().unwrap().len(),
+            2,
+            "a shortened interval takes effect on the running share"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn message_change_while_sharing_applies_on_next_broadcast() {
+        // SetMessage mutates the live share's message; the next ACTIVE publish
+        // reads it fresh, so an edited message rides the ongoing session
+        // without stopping and re-starting the share.
+        let mut f = fixture();
+        let group = add_member_group(&mut f, "G");
+        drain(&mut f);
+
+        // Share starts carrying an initial message.
+        f.engine.handle(EngineCmd::StartShare { msg: Some("first".into()) });
+        f.engine.handle(EngineCmd::Location(sample(now_secs() * 1000)));
+        let ev = f.pool.published.lock().unwrap()[0].clone();
+        assert_eq!(decrypt_for(&ev, &group).payload.msg.as_deref(), Some("first"));
+
+        // Edit the message mid-share; the next due broadcast must carry it.
+        f.engine.handle(EngineCmd::SetMessage(Some("updated".into())));
+        tokio::time::advance(Duration::from_secs(31)).await;
+        f.engine.handle(EngineCmd::Location(sample(now_secs() * 1000)));
+        let published = f.pool.published.lock().unwrap().clone();
+        assert_eq!(published.len(), 2);
+        assert_eq!(
+            decrypt_for(&published[1], &group).payload.msg.as_deref(),
+            Some("updated"),
+            "the running share adopts the edited message on its next broadcast"
+        );
+
+        // Clearing it (blank collapses to None) omits the field next broadcast.
+        f.engine.handle(EngineCmd::SetMessage(Some("   ".into())));
+        tokio::time::advance(Duration::from_secs(31)).await;
+        f.engine.handle(EngineCmd::Location(sample(now_secs() * 1000)));
+        let published = f.pool.published.lock().unwrap().clone();
+        assert_eq!(published.len(), 3);
+        assert_eq!(
+            decrypt_for(&published[2], &group).payload.msg,
+            None,
+            "a blank message clears it on the running share"
+        );
     }
 
     #[tokio::test(start_paused = true)]
