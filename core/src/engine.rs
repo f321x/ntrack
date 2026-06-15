@@ -124,7 +124,7 @@ pub struct ConfigSnapshot {
     pub default_name: String,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct ShareSnapshot {
     pub sharing: bool,
     pub test_pending: bool,
@@ -224,6 +224,19 @@ struct HistPoint {
     lng: f64,
     ts: u64,
     created_at: u64,
+}
+
+impl HistPoint {
+    /// The point an ACTIVE/TEST broadcast contributes to a track, or `None` for
+    /// a STOP (a boundary, not a point) or a payload missing coordinates.
+    fn from_incoming(inc: &protocol::Incoming) -> Option<Self> {
+        match (inc.payload.status, inc.payload.lat, inc.payload.lng, inc.payload.ts) {
+            (Status::Active | Status::Test, Some(lat), Some(lng), Some(ts)) => {
+                Some(Self { lat, lng, ts, created_at: inc.created_at })
+            }
+            _ => None,
+        }
+    }
 }
 
 /// Bounded, time-ordered point history for one (sender, group) session.
@@ -800,18 +813,10 @@ impl<P: EnginePool> Engine<P> {
     /// ACTIVE/TEST with coordinates become points; STOP is a boundary, not a
     /// point. Additive and order-independent.
     fn record_history(&mut self, key: &(String, String), inc: &protocol::Incoming) {
-        let (Status::Active | Status::Test, Some(lat), Some(lng), Some(ts)) = (
-            inc.payload.status,
-            inc.payload.lat,
-            inc.payload.lng,
-            inc.payload.ts,
-        ) else {
+        let Some(point) = HistPoint::from_incoming(inc) else {
             return;
         };
-        self.history
-            .entry(key.clone())
-            .or_default()
-            .insert(HistPoint { lat, lng, ts, created_at: inc.created_at });
+        self.history.entry(key.clone()).or_default().insert(point);
         self.prune_history_global();
     }
 
@@ -900,14 +905,9 @@ impl<P: EnginePool> Engine<P> {
         if inc.sender.to_hex() != sender_hex {
             return;
         }
-        if let (Status::Active | Status::Test, Some(lat), Some(lng), Some(ts)) = (
-            inc.payload.status,
-            inc.payload.lat,
-            inc.payload.lng,
-            inc.payload.ts,
-        ) {
+        if let Some(point) = HistPoint::from_incoming(&inc) {
             if let Some(p) = self.pending_exports.get_mut(&corr) {
-                p.collected.push(HistPoint { lat, lng, ts, created_at: inc.created_at });
+                p.collected.push(point);
             }
         }
     }
@@ -1051,12 +1051,8 @@ impl<P: EnginePool> Engine<P> {
                 waiting_for_fix: s.last_sample.is_none(),
             },
             None => ShareSnapshot {
-                sharing: false,
                 test_pending: self.test_pending.is_some(),
-                last_publish: None,
-                publish_count: 0,
-                last_acked: false,
-                waiting_for_fix: false,
+                ..Default::default()
             },
         };
         let _ = self.ui_tx.send(UiEvent::Share(snap));

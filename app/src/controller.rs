@@ -289,21 +289,15 @@ impl Controller {
                 // The shared artifact is a self-describing invite URI carrying
                 // the group name alongside the key, so the recipient never has
                 // to type the name. The QR, Copy and Share all use it.
-                let key = share
-                    .nsec
-                    .as_ref()
-                    .map(|s| s.expose().to_string())
-                    .unwrap_or_else(|| share.npub.clone());
+                let nsec = share.nsec.as_ref().map(|s| s.expose().to_string());
+                // Members share the secret; send-only groups fall back to the npub.
+                let key = nsec.clone().unwrap_or_else(|| share.npub.clone());
                 let invite = ntrack_core::invite::build_invite(&share.name, &key, &share.relays);
                 // Build the QR off the UI thread; create the image on it.
                 let qr = qr_pixel_buffer(&invite);
                 let name = share.name.clone();
                 let npub = share.npub.clone();
-                let nsec = share
-                    .nsec
-                    .as_ref()
-                    .map(|s| s.expose().to_string())
-                    .unwrap_or_default();
+                let nsec = nsec.unwrap_or_default();
                 let _ = self.ui.upgrade_in_event_loop(move |ui| {
                     ui.set_key_dialog_name(name.into());
                     ui.set_key_dialog_npub(npub.into());
@@ -400,14 +394,7 @@ impl Controller {
         let connected = view.relays.iter().filter(|(_, c)| *c).count();
         let total = view.relays.len();
 
-        let share = view.share.clone().unwrap_or(ShareSnapshot {
-            sharing: false,
-            test_pending: false,
-            last_publish: None,
-            publish_count: 0,
-            last_acked: false,
-            waiting_for_fix: false,
-        });
+        let share = view.share.clone().unwrap_or_default();
         ui.set_sharing(share.sharing);
         ui.set_test_pending(share.test_pending);
         ui.set_waiting_fix(share.sharing && share.waiting_for_fix);
@@ -770,10 +757,7 @@ impl Controller {
                 self.mutate(move |c| {
                     c.merge_group_relays(&public, &relays);
                 });
-                self.toast(&format!(
-                    "Group already imported · {added} relay{} added",
-                    if added == 1 { "" } else { "s" }
-                ));
+                self.toast(&format!("Group already imported{}", relays_added_suffix(added)));
             } else {
                 self.toast("This group key is already imported");
             }
@@ -801,7 +785,7 @@ impl Controller {
             "Group imported (send-only)".to_string()
         };
         if added > 0 {
-            msg.push_str(&format!(" · {added} relay{} added", if added == 1 { "" } else { "s" }));
+            msg.push_str(&relays_added_suffix(added));
         }
         self.toast(&msg);
     }
@@ -816,6 +800,12 @@ impl Controller {
         // Give the engine a moment to flush state and emit the final STOP.
         std::thread::sleep(Duration::from_millis(300));
     }
+}
+
+/// " · N relay(s) added" — the import-toast suffix when an invite contributed
+/// `added` new relays. Empty input still formats fine; callers gate on `added`.
+fn relays_added_suffix(added: usize) -> String {
+    format!(" · {added} relay{} added", if added == 1 { "" } else { "s" })
 }
 
 /// "now", "12 s ago", "5 min ago", "3 h ago" — based on the location fix
