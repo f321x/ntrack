@@ -160,14 +160,19 @@ impl Publisher for RelayPool {
 pub fn normalize_relay_url(input: &str) -> Result<String, crate::Error> {
     let s = input.trim();
     let invalid = || crate::Error::Other(format!("invalid relay url: {input:?}"));
-    let (scheme, rest) = if let Some(r) = s.strip_prefix("wss://") {
-        ("wss", r)
-    } else if let Some(r) = s.strip_prefix("ws://") {
-        ("ws", r)
-    } else if let Some(r) = s.strip_prefix("https://") {
-        ("wss", r)
-    } else if let Some(r) = s.strip_prefix("http://") {
-        ("ws", r)
+    // The scheme is case-insensitive (RFC 3986). Match it on a lowercased copy,
+    // then slice the original so the remainder keeps its case until we decide
+    // which part of it (the authority) to lowercase below. ASCII lowercasing
+    // preserves byte offsets, so the fixed prefix lengths are valid on `s`.
+    let lower = s.to_ascii_lowercase();
+    let (scheme, rest) = if lower.starts_with("wss://") {
+        ("wss", &s["wss://".len()..])
+    } else if lower.starts_with("ws://") {
+        ("ws", &s["ws://".len()..])
+    } else if lower.starts_with("https://") {
+        ("wss", &s["https://".len()..])
+    } else if lower.starts_with("http://") {
+        ("ws", &s["http://".len()..])
     } else if s.contains("://") {
         return Err(crate::Error::Other(format!("unsupported scheme: {s}")));
     } else {
@@ -177,7 +182,42 @@ pub fn normalize_relay_url(input: &str) -> Result<String, crate::Error> {
     if rest.is_empty() || rest.contains(char::is_whitespace) {
         return Err(invalid());
     }
-    Ok(format!("{scheme}://{rest}"))
+    // The host is case-insensitive and is lowercased so case-only differences
+    // don't create duplicate relays; the path is case-sensitive and is kept
+    // verbatim. Within the authority, any userinfo (`user:pass@`) is also
+    // case-sensitive (RFC 3986), so only the `host[:port]` part is folded.
+    let normalized = match rest.split_once('/') {
+        Some((authority, path)) => format!("{scheme}://{}/{path}", lower_host(authority)),
+        None => format!("{scheme}://{}", lower_host(rest)),
+    };
+    Ok(normalized)
+}
+
+/// Lowercase the `host[:port]` of an authority, leaving any `user:pass@`
+/// userinfo untouched. Uses full Unicode case folding so non-ASCII hosts dedup
+/// too (IDN/punycode unification is not attempted — relays use ASCII/punycode
+/// hostnames).
+fn lower_host(authority: &str) -> String {
+    match authority.rsplit_once('@') {
+        Some((userinfo, hostport)) => format!("{userinfo}@{}", hostport.to_lowercase()),
+        None => authority.to_lowercase(),
+    }
+}
+
+/// Normalize a list of relay URLs, dropping any that are invalid and removing
+/// duplicates while preserving first-seen order. Normalization is
+/// case-insensitive (see [`normalize_relay_url`]), so URLs differing only by
+/// case collapse to a single entry.
+pub fn normalize_dedup(urls: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for u in urls {
+        if let Ok(n) = normalize_relay_url(u) {
+            if !out.contains(&n) {
+                out.push(n);
+            }
+        }
+    }
+    out
 }
 
 /// Per-relay connection task: connect → resubscribe → pump messages,
@@ -462,5 +502,53 @@ mod tests {
         assert!(normalize_relay_url("ftp://x").is_err());
         assert!(normalize_relay_url("wss://").is_err());
         assert!(normalize_relay_url("has space.com").is_err());
+    }
+
+    #[test]
+    fn normalize_dedup_collapses_case_and_drops_invalid() {
+        let input = vec![
+            "wss://relay.damus.io".to_string(),
+            "WSS://Relay.Damus.IO".to_string(), // case-only duplicate of the first
+            "nos.lol".to_string(),              // bare host → wss://
+            "ftp://bad".to_string(),            // invalid → dropped
+            "wss://nos.lol".to_string(),        // duplicate of the bare host above
+        ];
+        assert_eq!(
+            normalize_dedup(&input),
+            vec!["wss://relay.damus.io".to_string(), "wss://nos.lol".to_string()]
+        );
+    }
+
+    #[test]
+    fn url_normalization_lowercases_scheme_and_host() {
+        // Case-only differences must collapse so they don't create duplicate
+        // relays. The host is case-insensitive; the path is not.
+        assert_eq!(
+            normalize_relay_url("WSS://Relay.Damus.IO").unwrap(),
+            "wss://relay.damus.io"
+        );
+        assert_eq!(
+            normalize_relay_url("Relay.Example.COM").unwrap(),
+            "wss://relay.example.com"
+        );
+        // Path/query case is preserved (only the authority is lowercased).
+        assert_eq!(
+            normalize_relay_url("wss://Relay.example.com/Nostr").unwrap(),
+            "wss://relay.example.com/Nostr"
+        );
+    }
+
+    #[test]
+    fn url_normalization_folds_non_ascii_host_and_keeps_userinfo() {
+        // A non-ASCII host must case-fold so a case-only variant still dedups.
+        assert_eq!(
+            normalize_relay_url("WSS://Ärger.example").unwrap(),
+            normalize_relay_url("wss://ärger.example").unwrap(),
+        );
+        // Userinfo is case-sensitive (RFC 3986): only the host is lowercased.
+        assert_eq!(
+            normalize_relay_url("wss://User:Pass@Relay.COM/Path").unwrap(),
+            "wss://User:Pass@relay.com/Path"
+        );
     }
 }

@@ -28,6 +28,12 @@ pub struct Group {
     /// Selected for sharing on the Share screen.
     #[serde(default = "default_true")]
     pub selected: bool,
+    /// Relays this group's invite carried (normalized, deduped, at most
+    /// [`crate::invite::MAX_INVITE_RELAYS`]). Records provenance so the relays a
+    /// group brought in can be pruned when it is removed; empty for groups not
+    /// imported from a relay-bearing invite.
+    #[serde(default)]
+    pub relays: Vec<String>,
 }
 
 fn default_true() -> bool {
@@ -42,6 +48,7 @@ impl Group {
             public: k.public_key().to_hex(),
             secret: Some(keys::nsec(&k)),
             selected: true,
+            relays: Vec::new(),
         })
     }
 
@@ -79,6 +86,12 @@ pub struct Config {
     pub sender_secret: Option<SecretString>,
     #[serde(default = "default_relays")]
     pub relays: Vec<String>,
+    /// Relays that were auto-added by importing a relay-bearing invite and are
+    /// therefore eligible for auto-removal when the groups that brought them are
+    /// removed. Default and manually-added relays are never listed here, so they
+    /// are never auto-removed. Kept in lockstep with `relays`.
+    #[serde(default)]
+    pub auto_relays: Vec<String>,
     #[serde(default)]
     pub groups: Vec<Group>,
     /// Seconds between location publishes while sharing.
@@ -104,6 +117,19 @@ pub struct Config {
     pub resume_msg: Option<String>,
 }
 
+/// Floor on the relay count for *automatic* removal. Auto-pruning never takes a
+/// user below this many relays; going lower is a deliberate manual action.
+pub const MIN_RELAYS: usize = 3;
+
+/// Normalize, dedup and cap a set of invite relay hints (the shared front door
+/// for both fresh imports and re-scan merges).
+fn normalize_invite_relays(urls: &[String]) -> Vec<String> {
+    crate::relay::normalize_dedup(urls)
+        .into_iter()
+        .take(crate::invite::MAX_INVITE_RELAYS)
+        .collect()
+}
+
 pub fn default_relays() -> Vec<String> {
     vec![
         "wss://relay.damus.io".into(),
@@ -121,6 +147,7 @@ impl Default for Config {
         Self {
             sender_secret: None,
             relays: default_relays(),
+            auto_relays: Vec::new(),
             groups: Vec::new(),
             interval_secs: default_interval(),
             use_expiration: true,
@@ -149,6 +176,135 @@ impl Config {
     pub fn rotate_sender(&mut self) -> Result<Keys> {
         self.sender_secret = None;
         self.sender_keys()
+    }
+
+    /// The relays to advertise in an invite: the oldest (first-added) up to
+    /// [`crate::invite::MAX_INVITE_RELAYS`]. Insertion order is age, and the
+    /// bundled defaults lead the list.
+    pub fn invite_relays(&self) -> Vec<String> {
+        self.relays
+            .iter()
+            .take(crate::invite::MAX_INVITE_RELAYS)
+            .cloned()
+            .collect()
+    }
+
+    /// Add a group imported from an invite, merging the relays the invite
+    /// carried. Relays not already present are appended to `relays` and recorded
+    /// in `auto_relays` (eligible for later auto-removal). Returns the number of
+    /// relays newly added to the app.
+    pub fn add_imported_group(
+        &mut self,
+        name: String,
+        public: String,
+        secret: Option<SecretString>,
+        invite_relays: &[String],
+    ) -> usize {
+        let relays: Vec<String> = normalize_invite_relays(invite_relays);
+        let added = self.absorb_relays(&relays);
+        self.groups.push(Group { name, public, secret, selected: true, relays });
+        added
+    }
+
+    /// Add relays not already present to `relays`, marking each new one auto
+    /// (eligible for later auto-removal). Returns how many were newly added.
+    /// Input must already be normalized.
+    fn absorb_relays(&mut self, relays: &[String]) -> usize {
+        let mut added = 0;
+        for r in relays {
+            if !self.relays.contains(r) {
+                self.relays.push(r.clone());
+                // r was absent from `relays`, and `auto_relays` ⊆ `relays`, so
+                // it cannot already be present here — no dedup needed.
+                self.auto_relays.push(r.clone());
+                added += 1;
+            }
+        }
+        added
+    }
+
+    /// Merge relays from a re-scanned invite into an already-imported group:
+    /// add any not-yet-present relays (as auto-removable) and union them into
+    /// the group's provenance list so they're pruned with it. No-op if the group
+    /// isn't present. Returns the number of relays newly added to the app.
+    pub fn merge_group_relays(&mut self, public: &str, invite_relays: &[String]) -> usize {
+        if !self.groups.iter().any(|g| g.public == public) {
+            return 0;
+        }
+        let relays = normalize_invite_relays(invite_relays);
+        let added = self.absorb_relays(&relays);
+        if let Some(g) = self.groups.iter_mut().find(|g| g.public == public) {
+            for r in relays {
+                if !g.relays.contains(&r) {
+                    g.relays.push(r);
+                }
+            }
+        }
+        added
+    }
+
+    /// Collapse the persisted relay lists to their normalized, deduped form.
+    /// Migrates configs written before relay URLs were case-normalized so legacy
+    /// mixed-case entries don't linger as duplicates. Keeps `auto_relays` ⊆
+    /// `relays` and normalizes each group's provenance list.
+    fn normalize_relays(&mut self) {
+        self.relays = crate::relay::normalize_dedup(&self.relays);
+        let valid: std::collections::HashSet<String> = self.relays.iter().cloned().collect();
+        self.auto_relays = crate::relay::normalize_dedup(&self.auto_relays)
+            .into_iter()
+            .filter(|r| valid.contains(r))
+            .collect();
+        for g in &mut self.groups {
+            g.relays = crate::relay::normalize_dedup(&g.relays);
+        }
+    }
+
+    /// Remove the group with the given public key (hex). Relays the group
+    /// brought in are pruned if no longer referenced by another group, but never
+    /// below [`MIN_RELAYS`]. Returns true if a group was removed.
+    pub fn remove_group(&mut self, public: &str) -> bool {
+        let Some(pos) = self.groups.iter().position(|g| g.public == public) else {
+            return false;
+        };
+        let removed = self.groups.remove(pos);
+        self.prune_auto_relays(&removed.relays);
+        true
+    }
+
+    /// Auto-remove the given (just-orphaned) relays: only those marked auto and
+    /// no longer referenced by a surviving group, and never below [`MIN_RELAYS`].
+    fn prune_auto_relays(&mut self, candidates: &[String]) {
+        let still_used: std::collections::HashSet<String> = self
+            .groups
+            .iter()
+            .flat_map(|g| g.relays.iter().cloned())
+            .collect();
+        for r in candidates {
+            if self.relays.len() <= MIN_RELAYS {
+                break; // floor: never auto-remove below MIN_RELAYS
+            }
+            if self.auto_relays.contains(r) && !still_used.contains(r) {
+                self.relays.retain(|x| x != r);
+                self.auto_relays.retain(|x| x != r);
+            }
+        }
+    }
+
+    /// Add a relay the user typed in manually. `url` must already be normalized.
+    /// Marks it user-owned (drops it from `auto_relays`) so it is never
+    /// auto-removed.
+    pub fn add_relay(&mut self, url: &str) {
+        if !self.relays.iter().any(|r| r == url) {
+            self.relays.push(url.to_string());
+        }
+        self.auto_relays.retain(|r| r != url);
+    }
+
+    /// Remove a relay the user removed manually, clearing it from `auto_relays`
+    /// too.
+    pub fn remove_relay(&mut self, url: &str) {
+        self.relays.retain(|r| r != url);
+        self.auto_relays.retain(|r| r != url);
     }
 
     pub fn label_for(&self, pubkey_hex: &str) -> Option<&str> {
@@ -212,7 +368,11 @@ impl ConfigStore {
     /// silently wipe keys).
     pub fn load(&self) -> Result<Config> {
         match std::fs::read(&self.path) {
-            Ok(bytes) => serde_json::from_slice(&bytes).map_err(Error::from),
+            Ok(bytes) => {
+                let mut cfg: Config = serde_json::from_slice(&bytes).map_err(Error::from)?;
+                cfg.normalize_relays();
+                Ok(cfg)
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Config::default()),
             Err(e) => Err(e.into()),
         }
@@ -324,6 +484,205 @@ mod tests {
         let dir = tmpdir();
         let store = ConfigStore::new(&dir);
         assert_eq!(store.resume_flag_path(), dir.join("resume.flag"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn member() -> (String, Option<SecretString>) {
+        let k = keys::generate();
+        (k.public_key().to_hex(), Some(keys::nsec(&k)))
+    }
+
+    #[test]
+    fn invite_relays_returns_oldest_three() {
+        let c = Config {
+            relays: ["a", "b", "c", "d", "e"].iter().map(|s| format!("wss://{s}")).collect(),
+            ..Default::default()
+        };
+        assert_eq!(
+            c.invite_relays(),
+            vec!["wss://a".to_string(), "wss://b".to_string(), "wss://c".to_string()]
+        );
+    }
+
+    #[test]
+    fn add_imported_group_adds_only_new_relays() {
+        let mut c = Config::default(); // 3 default relays, no auto relays
+        let (public, secret) = member();
+        let invite = vec![
+            "wss://new.example".to_string(),
+            "wss://relay.damus.io".to_string(), // already a default
+        ];
+        let added = c.add_imported_group("G".into(), public.clone(), secret, &invite);
+        assert_eq!(added, 1, "only the genuinely-new relay is counted");
+        assert!(c.relays.contains(&"wss://new.example".to_string()));
+        assert_eq!(c.auto_relays, vec!["wss://new.example".to_string()]);
+        let g = c.groups.iter().find(|g| g.public == public).unwrap();
+        // The group stores the full normalized provenance list (incl. the
+        // already-present default), not just the newly-added relays.
+        assert_eq!(
+            g.relays,
+            vec!["wss://new.example".to_string(), "wss://relay.damus.io".to_string()]
+        );
+    }
+
+    #[test]
+    fn add_imported_group_collapses_case_duplicates() {
+        let mut c = Config::default();
+        let (public, secret) = member();
+        let added = c.add_imported_group(
+            "G".into(),
+            public,
+            secret,
+            &["WSS://New.Example".to_string(), "wss://new.example".to_string()],
+        );
+        assert_eq!(added, 1);
+        assert_eq!(c.auto_relays, vec!["wss://new.example".to_string()]);
+    }
+
+    #[test]
+    fn remove_group_prunes_its_auto_relay() {
+        let mut c = Config::default();
+        let (public, secret) = member();
+        c.add_imported_group("G".into(), public.clone(), secret, &["wss://new.example".into()]);
+        assert!(c.relays.contains(&"wss://new.example".to_string()));
+        assert!(c.remove_group(&public));
+        assert!(!c.relays.contains(&"wss://new.example".to_string()));
+        assert!(c.auto_relays.is_empty());
+        assert!(c.groups.is_empty());
+    }
+
+    #[test]
+    fn remove_group_keeps_relay_used_by_another_group() {
+        let mut c = Config::default();
+        let (p1, s1) = member();
+        let (p2, s2) = member();
+        c.add_imported_group("G1".into(), p1.clone(), s1, &["wss://shared.example".into()]);
+        c.add_imported_group("G2".into(), p2.clone(), s2, &["wss://shared.example".into()]);
+        assert!(c.remove_group(&p1));
+        assert!(
+            c.relays.contains(&"wss://shared.example".to_string()),
+            "still referenced by G2"
+        );
+        assert!(c.remove_group(&p2));
+        assert!(
+            !c.relays.contains(&"wss://shared.example".to_string()),
+            "now unused → pruned"
+        );
+    }
+
+    #[test]
+    fn remove_group_keeps_default_relay_carried_by_invite() {
+        let mut c = Config::default();
+        let (public, secret) = member();
+        // The invite re-lists a relay the user already had as a default.
+        c.add_imported_group("G".into(), public.clone(), secret, &["wss://relay.damus.io".into()]);
+        assert!(c.auto_relays.is_empty(), "a default is never marked auto");
+        assert!(c.remove_group(&public));
+        assert!(c.relays.contains(&"wss://relay.damus.io".to_string()));
+    }
+
+    #[test]
+    fn auto_prune_respects_min_relays_floor() {
+        let mut c = Config {
+            relays: vec!["wss://d1".into(), "wss://d2".into()], // user trimmed below the floor
+            ..Default::default()
+        };
+        let (public, secret) = member();
+        c.add_imported_group("G".into(), public.clone(), secret, &["wss://n1".into(), "wss://n2".into()]);
+        assert_eq!(c.relays.len(), 4);
+        assert!(c.remove_group(&public));
+        // Pruning stops at the floor: only one of the two auto relays is removed.
+        assert_eq!(c.relays.len(), MIN_RELAYS);
+        assert_eq!(c.auto_relays.len(), 1);
+    }
+
+    #[test]
+    fn manual_add_protects_relay_from_auto_prune() {
+        let mut c = Config::default();
+        let (public, secret) = member();
+        c.add_imported_group("G".into(), public.clone(), secret, &["wss://n1".into()]);
+        assert_eq!(c.auto_relays, vec!["wss://n1".to_string()]);
+        c.add_relay("wss://n1"); // user now owns it
+        assert!(c.auto_relays.is_empty());
+        assert!(c.remove_group(&public));
+        assert!(c.relays.contains(&"wss://n1".to_string()), "user-owned relay survives");
+    }
+
+    #[test]
+    fn add_relay_dedups() {
+        let mut c = Config::default();
+        let before = c.relays.len();
+        c.add_relay("wss://new.example");
+        c.add_relay("wss://new.example");
+        assert_eq!(c.relays.len(), before + 1);
+    }
+
+    #[test]
+    fn merge_group_relays_adds_to_existing_group() {
+        let mut c = Config::default();
+        let (public, secret) = member();
+        c.add_imported_group("G".into(), public.clone(), secret, &["wss://n1".into()]);
+        // Re-scanning an updated invite brings a second relay; n1 is already known.
+        let added = c.merge_group_relays(&public, &["wss://n2".into(), "wss://n1".into()]);
+        assert_eq!(added, 1, "only n2 is new");
+        assert!(c.relays.contains(&"wss://n2".to_string()));
+        assert!(c.auto_relays.contains(&"wss://n2".to_string()));
+        let g = c.groups.iter().find(|g| g.public == public).unwrap();
+        assert!(g.relays.contains(&"wss://n1".to_string()));
+        assert!(g.relays.contains(&"wss://n2".to_string()), "provenance unions both");
+        // Removing the group now prunes both auto relays it brought.
+        assert!(c.remove_group(&public));
+        assert!(!c.relays.contains(&"wss://n1".to_string()));
+        assert!(!c.relays.contains(&"wss://n2".to_string()));
+    }
+
+    #[test]
+    fn merge_group_relays_unknown_group_is_noop() {
+        let mut c = Config::default();
+        let before = c.relays.clone();
+        assert_eq!(c.merge_group_relays("deadbeef", &["wss://n1".into()]), 0);
+        assert_eq!(c.relays, before);
+    }
+
+    #[test]
+    fn load_normalizes_legacy_mixed_case_relays() {
+        // A config written before relay URLs were lowercased can hold case-only
+        // duplicates; load must collapse them so they don't double up.
+        let dir = tmpdir();
+        let store = ConfigStore::new(&dir);
+        std::fs::write(
+            store.path(),
+            br#"{"relays":["wss://Relay.Example.COM","wss://relay.example.com"],"groups":[]}"#,
+        )
+        .unwrap();
+        let cfg = store.load().unwrap();
+        assert_eq!(cfg.relays, vec!["wss://relay.example.com".to_string()]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn remove_relay_also_clears_auto_relays() {
+        let mut c = Config::default();
+        let (public, secret) = member();
+        c.add_imported_group("G".into(), public, secret, &["wss://n1".into()]);
+        assert!(c.auto_relays.contains(&"wss://n1".to_string()));
+        c.remove_relay("wss://n1");
+        assert!(!c.relays.contains(&"wss://n1".to_string()));
+        assert!(!c.auto_relays.contains(&"wss://n1".to_string()));
+    }
+
+    #[test]
+    fn auto_relays_and_group_relays_default_empty_for_old_config() {
+        let dir = tmpdir();
+        let store = ConfigStore::new(&dir);
+        std::fs::write(
+            store.path(),
+            br#"{"relays":["wss://a"],"groups":[{"name":"G","public":"deadbeef","selected":true}]}"#,
+        )
+        .unwrap();
+        let cfg = store.load().unwrap();
+        assert!(cfg.auto_relays.is_empty());
+        assert!(cfg.groups[0].relays.is_empty());
         std::fs::remove_dir_all(&dir).ok();
     }
 

@@ -83,7 +83,7 @@ mod tests {
         // so the QR payload stays ASCII).
         let k = crate::keys::generate();
         let nsec = crate::keys::nsec(&k);
-        let invite = crate::invite::build_invite("Família 🇧🇷", nsec.expose());
+        let invite = crate::invite::build_invite("Família 🇧🇷", nsec.expose(), &[]);
         let (w, h, luma) = render_qr(&invite, 6, 4);
 
         let scanned = decode_luma(w, h, w, &luma).expect("decode");
@@ -92,6 +92,30 @@ mod tests {
         let parsed = crate::invite::parse_shared(&scanned).expect("parse");
         assert_eq!(parsed.name.as_deref(), Some("Família 🇧🇷"));
         assert_eq!(parsed.key, nsec.expose());
+    }
+
+    #[test]
+    fn full_pipeline_with_relays() {
+        // Mirror the production share path (the controller threads share.relays
+        // into build_invite): a relay-bearing invite is the larger real-world QR
+        // payload (name + nsec + up to 3 r= params). Exercise it end-to-end.
+        let k = crate::keys::generate();
+        let nsec = crate::keys::nsec(&k);
+        let relays = vec![
+            "wss://relay.damus.io".to_string(),
+            "wss://nos.lol".to_string(),
+            "wss://relay.snort.social".to_string(),
+        ];
+        let invite = crate::invite::build_invite("Família 🇧🇷", nsec.expose(), &relays);
+        let (w, h, luma) = render_qr(&invite, 6, 4);
+
+        let scanned = decode_luma(w, h, w, &luma).expect("decode");
+        assert_eq!(scanned, invite);
+
+        let parsed = crate::invite::parse_shared(&scanned).expect("parse");
+        assert_eq!(parsed.name.as_deref(), Some("Família 🇧🇷"));
+        assert_eq!(parsed.key, nsec.expose());
+        assert_eq!(parsed.relays, relays);
     }
 
     #[test]

@@ -61,6 +61,9 @@ struct ViewState {
     confirm: Option<Confirm>,
     after_permission: Option<AfterPermission>,
     location_active: bool,
+    /// Relays from the last scanned/tapped invite, kept so importing the group
+    /// (whose form only shows the bare key) still adds the relays it carried.
+    pending_invite: Option<ntrack_core::invite::Invite>,
 }
 
 pub struct Controller {
@@ -193,6 +196,10 @@ impl Controller {
             self.toast("Not an ntrack invite");
             return;
         };
+        // Stash so import_group can add the invite's relays: the form only shows
+        // the bare key, so the relays would otherwise be lost between here and
+        // the user tapping Import.
+        self.view.lock().unwrap().pending_invite = Some(invite.clone());
         let name = invite.name.unwrap_or_default();
         let key = invite.key;
         let _ = self.ui.upgrade_in_event_loop(move |ui| {
@@ -253,7 +260,7 @@ impl Controller {
                     .as_ref()
                     .map(|s| s.expose().to_string())
                     .unwrap_or_else(|| share.npub.clone());
-                let invite = ntrack_core::invite::build_invite(&share.name, &key);
+                let invite = ntrack_core::invite::build_invite(&share.name, &key, &share.relays);
                 // Build the QR off the UI thread; create the image on it.
                 let qr = qr_pixel_buffer(&invite);
                 let name = share.name.clone();
@@ -531,7 +538,9 @@ impl Controller {
                     let _ = ctrl.cmd_tx.send(EngineCmd::RotateGroup { group_hex: id });
                 }
                 Some(Confirm::DeleteGroup(id)) => {
-                    ctrl.mutate(move |c| c.groups.retain(|g| g.public != id));
+                    ctrl.mutate(move |c| {
+                        c.remove_group(&id);
+                    });
                 }
                 None => {}
             }
@@ -539,18 +548,14 @@ impl Controller {
 
         hook!(on_add_relay, |ctrl, url: slint::SharedString| {
             match normalize_relay_url(url.as_str()) {
-                Ok(u) => ctrl.mutate(move |c| {
-                    if !c.relays.contains(&u) {
-                        c.relays.push(u);
-                    }
-                }),
+                Ok(u) => ctrl.mutate(move |c| c.add_relay(&u)),
                 Err(_) => ctrl.toast("Invalid relay URL"),
             }
         });
 
         hook!(on_remove_relay, |ctrl, url: slint::SharedString| {
             let u = url.to_string();
-            ctrl.mutate(move |c| c.relays.retain(|r| r != &u));
+            ctrl.mutate(move |c| c.remove_relay(&u));
         });
 
         hook!(on_rotate_sender, |ctrl| {
@@ -612,6 +617,25 @@ impl Controller {
         }
     }
 
+    /// Best-effort count of how many of `relays` are not already configured,
+    /// for the import toast. Mirrors `Config::add_imported_group`'s
+    /// normalize/dedup/cap so the number matches what the engine actually adds.
+    /// Falls back to the bundled defaults before the first config snapshot
+    /// arrives (the engine starts from `Config::default`).
+    fn count_new_relays(self: &Arc<Self>, relays: &[String]) -> usize {
+        let view = self.view.lock().unwrap();
+        let existing = view
+            .config
+            .as_ref()
+            .map(|c| c.relays.clone())
+            .unwrap_or_else(ntrack_core::config::default_relays);
+        ntrack_core::relay::normalize_dedup(relays)
+            .into_iter()
+            .take(ntrack_core::invite::MAX_INVITE_RELAYS)
+            .filter(|r| !existing.contains(r))
+            .count()
+    }
+
     fn import_group(self: &Arc<Self>, name: String, key: String) {
         let raw = key.trim();
         if raw.is_empty() {
@@ -621,10 +645,18 @@ impl Controller {
         // Accept a full `ntrack://join` invite pasted into the key field too,
         // not just a bare key; an embedded name fills in when the name field
         // was left blank.
-        let (embedded_name, key) = match ntrack_core::invite::parse_shared(raw) {
-            Some(invite) => (invite.name, invite.key),
-            None => (None, raw.to_string()),
+        let (embedded_name, key, mut relays) = match ntrack_core::invite::parse_shared(raw) {
+            Some(invite) => (invite.name, invite.key, invite.relays),
+            None => (None, raw.to_string(), Vec::new()),
         };
+        // A scanned/tapped invite pre-fills only the bare key into the form, so
+        // its relays arrive via the stash rather than via `raw`. Use them only
+        // when they belong to the key actually being imported.
+        if let Some(p) = self.view.lock().unwrap().pending_invite.take() {
+            if p.key == key {
+                relays.extend(p.relays);
+            }
+        }
         let parsed = match parse_group_key(&key) {
             Ok(p) => p,
             Err(e) => {
@@ -648,7 +680,21 @@ impl Controller {
             .map(|c| c.groups.iter().any(|g| g.id == public))
             .unwrap_or(false);
         if exists {
-            self.toast("This group key is already imported");
+            // Re-scanning an updated invite for a group we already have should
+            // still converge relays: merge any it carries instead of dropping
+            // them (e.g. the group migrated to or added a relay).
+            let added = self.count_new_relays(&relays);
+            if added > 0 {
+                self.mutate(move |c| {
+                    c.merge_group_relays(&public, &relays);
+                });
+                self.toast(&format!(
+                    "Group already imported · {added} relay{} added",
+                    if added == 1 { "" } else { "s" }
+                ));
+            } else {
+                self.toast("This group key is already imported");
+            }
             return;
         }
         // Name precedence: what the user typed, else the invite's embedded
@@ -663,19 +709,19 @@ impl Controller {
                 .unwrap_or_else(|| format!("Group {}", &public[..8]))
         };
         let receive = secret.is_some();
+        let added = self.count_new_relays(&relays);
         self.mutate(move |c| {
-            c.groups.push(Group {
-                name,
-                public,
-                secret,
-                selected: true,
-            });
+            c.add_imported_group(name, public, secret, &relays);
         });
-        self.toast(if receive {
-            "Group imported — you can send and receive"
+        let mut msg = if receive {
+            "Group imported — you can send and receive".to_string()
         } else {
-            "Group imported (send-only)"
-        });
+            "Group imported (send-only)".to_string()
+        };
+        if added > 0 {
+            msg.push_str(&format!(" · {added} relay{} added", if added == 1 { "" } else { "s" }));
+        }
+        self.toast(&msg);
     }
 
     /// Drive location samples from the platform forwarder in tests/sim.

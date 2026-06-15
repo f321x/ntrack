@@ -6,13 +6,17 @@
 //! the "Copy"/"Share" buttons emit, and what a tapped `ntrack://` deep link
 //! carries — one artifact for all three sharing paths.
 //!
-//! Wire form: `ntrack://join?n=<percent-encoded name>&k=<bech32 key>`
+//! Wire form: `ntrack://join?n=<percent-encoded name>&k=<bech32 key>&r=<relay>…`
 //!
 //! * `k` is today's shared key, unchanged: an `nsec1…` for full members or an
 //!   `npub1…` for send-only groups. It is bech32 (URL-safe), so it is never
 //!   percent-encoded.
 //! * `n` is optional and percent-encoded (names may contain spaces, `&`,
 //!   emoji, …).
+//! * `r` is an optional relay hint, repeated once per relay (at most
+//!   [`MAX_INVITE_RELAYS`]) — the sharer's oldest relays, so importers converge
+//!   on the same relays. Values are percent-encoded (URL-safe characters kept
+//!   readable); on parse they are normalized, deduped and capped.
 //!
 //! This is purely an app convenience layer; it is **not** part of the NIP-GART
 //! wire protocol and never appears in a kind:694 event. For backward
@@ -31,6 +35,22 @@ const PREFIX: &str = "ntrack://join";
 /// `=`→`%3D`, multibyte UTF-8 → `%XX%XX…`).
 const NAME_SET: &AsciiSet = NON_ALPHANUMERIC;
 
+/// Encode a relay URL inside an `r=` query value. Keep the URL-safe characters
+/// that occur in `wss://host:port/path` readable (`:`, `/`, `.`, `-`, `_`, `~`)
+/// and encode everything else — in particular the query delimiters `&`, `=`,
+/// `#` and any whitespace — so the value can't break out of its parameter.
+const RELAY_SET: &AsciiSet = &NON_ALPHANUMERIC
+    .remove(b':')
+    .remove(b'/')
+    .remove(b'.')
+    .remove(b'-')
+    .remove(b'_')
+    .remove(b'~');
+
+/// Maximum number of relay hints carried by an invite. Bounds the URI/QR size
+/// and caps how many relays a single invite can add to (or imply for) a client.
+pub const MAX_INVITE_RELAYS: usize = 3;
+
 /// A parsed invite: the (optional) group name and the bech32 key string.
 ///
 /// The key is kept as the raw string the user will import; validation into a
@@ -40,12 +60,17 @@ const NAME_SET: &AsciiSet = NON_ALPHANUMERIC;
 pub struct Invite {
     pub name: Option<String>,
     pub key: String,
+    /// Relay hints carried by the invite (normalized, deduped, at most
+    /// [`MAX_INVITE_RELAYS`]). Empty for a bare key or an older invite without
+    /// `r=` parameters.
+    pub relays: Vec<String>,
 }
 
-/// Build an `ntrack://join` invite URI from a group name and bech32 key.
+/// Build an `ntrack://join` invite URI from a group name, bech32 key and up to
+/// [`MAX_INVITE_RELAYS`] relay hints (extra relays are ignored).
 ///
 /// An empty (or whitespace-only) name is omitted entirely.
-pub fn build_invite(name: &str, key: &str) -> String {
+pub fn build_invite(name: &str, key: &str, relays: &[String]) -> String {
     let name = name.trim();
     let mut uri = String::from(PREFIX);
     uri.push('?');
@@ -56,6 +81,10 @@ pub fn build_invite(name: &str, key: &str) -> String {
     }
     uri.push_str("k=");
     uri.push_str(key);
+    for relay in relays.iter().take(MAX_INVITE_RELAYS) {
+        uri.push_str("&r=");
+        uri.extend(utf8_percent_encode(relay, RELAY_SET));
+    }
     uri
 }
 
@@ -78,6 +107,7 @@ pub fn parse_invite(s: &str) -> Option<Invite> {
 
     let mut name = None;
     let mut key = None;
+    let mut relays: Vec<String> = Vec::new();
     for pair in query.split('&') {
         let Some((k, v)) = pair.split_once('=') else {
             continue;
@@ -85,10 +115,22 @@ pub fn parse_invite(s: &str) -> Option<Invite> {
         match k {
             "n" => name = decode(v),
             "k" => key = decode(v),
+            "r" => {
+                if let Some(r) = decode(v) {
+                    relays.push(r);
+                }
+            }
             _ => {}
         }
     }
-    Some(Invite { name, key: key.filter(|k| !k.is_empty())? })
+    // Normalize + dedup defends against case-only duplicates and bad URLs; the
+    // cap bounds how many relays a single invite can imply (a hostile or
+    // oversized URI can't inject an unbounded list).
+    let relays = crate::relay::normalize_dedup(&relays)
+        .into_iter()
+        .take(MAX_INVITE_RELAYS)
+        .collect();
+    Some(Invite { name, key: key.filter(|k| !k.is_empty())?, relays })
 }
 
 /// Parse an arbitrary shared string into an [`Invite`]: either an
@@ -101,7 +143,7 @@ pub fn parse_shared(s: &str) -> Option<Invite> {
     let s = s.trim();
     // Backward compatibility: a bare key shared the old way.
     if keys::parse_group_key(s).is_ok() {
-        return Some(Invite { name: None, key: s.to_string() });
+        return Some(Invite { name: None, key: s.to_string(), relays: Vec::new() });
     }
     None
 }
@@ -122,7 +164,7 @@ mod tests {
     #[test]
     fn build_then_parse_roundtrip() {
         let key = member_nsec();
-        let uri = build_invite("Family", &key);
+        let uri = build_invite("Family", &key, &[]);
         assert!(uri.starts_with("ntrack://join?"), "got {uri}");
         let inv = parse_invite(&uri).expect("should parse");
         assert_eq!(inv.name.as_deref(), Some("Family"));
@@ -133,7 +175,7 @@ mod tests {
     fn name_with_special_chars_roundtrips_exactly() {
         let key = member_nsec();
         let name = "Mom & Dad's 🚗 trip = fun";
-        let uri = build_invite(name, &key);
+        let uri = build_invite(name, &key, &[]);
         // The raw URI must not contain unencoded separators from the name.
         assert!(!uri.contains("Dad's"), "name must be percent-encoded: {uri}");
         let inv = parse_invite(&uri).expect("should parse");
@@ -144,7 +186,7 @@ mod tests {
     #[test]
     fn empty_name_is_omitted_and_parses_to_none() {
         let key = member_nsec();
-        let uri = build_invite("   ", &key);
+        let uri = build_invite("   ", &key, &[]);
         assert_eq!(uri, format!("ntrack://join?k={key}"));
         let inv = parse_invite(&uri).expect("should parse");
         assert_eq!(inv.name, None);
@@ -195,19 +237,88 @@ mod tests {
         let npub = keys::npub(&k.public_key());
 
         let a = parse_shared(&nsec).expect("bare nsec");
-        assert_eq!(a, Invite { name: None, key: nsec });
+        assert_eq!(a, Invite { name: None, key: nsec, relays: vec![] });
 
         let b = parse_shared(&npub).expect("bare npub");
-        assert_eq!(b, Invite { name: None, key: npub });
+        assert_eq!(b, Invite { name: None, key: npub, relays: vec![] });
     }
 
     #[test]
     fn parse_shared_accepts_invite_uri() {
         let key = member_nsec();
-        let uri = build_invite("Hike", &key);
+        let uri = build_invite("Hike", &key, &[]);
         let inv = parse_shared(&uri).expect("uri");
         assert_eq!(inv.name.as_deref(), Some("Hike"));
         assert_eq!(inv.key, key);
+    }
+
+    #[test]
+    fn build_with_relays_roundtrips() {
+        let key = member_nsec();
+        let relays = vec!["wss://relay.damus.io".to_string(), "wss://nos.lol".to_string()];
+        let uri = build_invite("Family", &key, &relays);
+        let inv = parse_invite(&uri).expect("parse");
+        assert_eq!(inv.name.as_deref(), Some("Family"));
+        assert_eq!(inv.key, key);
+        assert_eq!(inv.relays, relays);
+    }
+
+    #[test]
+    fn build_without_relays_has_no_r_param_and_parses_empty() {
+        let key = member_nsec();
+        let uri = build_invite("Family", &key, &[]);
+        assert!(!uri.contains("&r="), "no relays → no r= param: {uri}");
+        let inv = parse_invite(&uri).expect("parse");
+        assert!(inv.relays.is_empty());
+    }
+
+    #[test]
+    fn build_caps_relays_at_three() {
+        let key = member_nsec();
+        let relays: Vec<String> = (0..5).map(|i| format!("wss://r{i}.example")).collect();
+        let uri = build_invite("X", &key, &relays);
+        assert_eq!(uri.matches("&r=").count(), 3, "uri: {uri}");
+    }
+
+    #[test]
+    fn parse_collects_relays_normalized_and_deduped() {
+        let key = member_nsec();
+        // A case-only duplicate and a bare host that normalizes to an existing
+        // entry must both collapse.
+        let uri = format!(
+            "ntrack://join?k={key}&r=WSS://Relay.Damus.IO&r=wss://relay.damus.io&r=nos.lol"
+        );
+        let inv = parse_invite(&uri).expect("parse");
+        assert_eq!(
+            inv.relays,
+            vec!["wss://relay.damus.io".to_string(), "wss://nos.lol".to_string()]
+        );
+    }
+
+    #[test]
+    fn parse_caps_relays_at_three() {
+        let key = member_nsec();
+        let uri = format!(
+            "ntrack://join?k={key}&r=wss://a.example&r=wss://b.example&r=wss://c.example&r=wss://d.example"
+        );
+        let inv = parse_invite(&uri).expect("parse");
+        assert_eq!(
+            inv.relays,
+            vec![
+                "wss://a.example".to_string(),
+                "wss://b.example".to_string(),
+                "wss://c.example".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_relay_value_with_path_roundtrips() {
+        let key = member_nsec();
+        let relays = vec!["wss://relay.example.com/Nostr".to_string()];
+        let uri = build_invite("P", &key, &relays);
+        let inv = parse_invite(&uri).expect("parse");
+        assert_eq!(inv.relays, relays);
     }
 
     #[test]

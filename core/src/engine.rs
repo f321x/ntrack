@@ -129,6 +129,9 @@ pub struct GroupShare {
     pub npub: String,
     /// nsec to hand to new members; `None` for send-only groups.
     pub nsec: Option<keys::SecretString>,
+    /// Oldest relays to embed in the shared invite so recipients converge on
+    /// the same relays (see [`crate::config::Config::invite_relays`]).
+    pub relays: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -297,6 +300,7 @@ impl<P: EnginePool> Engine<P> {
                             .map(|pk| keys::npub(&pk))
                             .unwrap_or_else(|_| g.public.clone()),
                         nsec: g.secret.clone(),
+                        relays: self.config.invite_relays(),
                     };
                     let _ = self.ui_tx.send(UiEvent::GroupShare(share));
                 }
@@ -1316,5 +1320,55 @@ mod tests {
         assert_eq!(share.name, "G");
         assert!(share.npub.starts_with("npub1"));
         assert!(share.nsec.as_ref().unwrap().expose().starts_with("nsec1"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn group_share_carries_oldest_relays() {
+        let mut f = fixture();
+        f.engine.handle(EngineCmd::Mutate(Box::new(|c| {
+            c.relays = ["a", "b", "c", "d"].iter().map(|s| format!("wss://{s}")).collect();
+        })));
+        let g = add_member_group(&mut f, "G");
+        drain(&mut f);
+        f.engine.handle(EngineCmd::RequestGroupShare { group_hex: g.public.clone() });
+        let evs = drain(&mut f);
+        let share = evs
+            .iter()
+            .find_map(|e| match e {
+                UiEvent::GroupShare(s) => Some(s),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(
+            share.relays,
+            vec!["wss://a".to_string(), "wss://b".to_string(), "wss://c".to_string()]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn imported_group_relays_reach_pool_and_prune_on_remove() {
+        let mut f = fixture();
+        let public = "deadbeef".to_string();
+        // Import a (send-only) group carrying a new relay via the same Config
+        // API the controller drives through EngineCmd::Mutate.
+        let p = public.clone();
+        f.engine.handle(EngineCmd::Mutate(Box::new(move |c| {
+            c.add_imported_group("G".into(), p, None, &["wss://new.example".to_string()]);
+        })));
+        drain(&mut f);
+        assert!(
+            f.pool.relays.lock().unwrap().iter().any(|r| r == "wss://new.example"),
+            "imported relay must reach the pool"
+        );
+        // Removing the group prunes the auto-added relay, and the prune reaches
+        // the pool on the next sync.
+        f.engine.handle(EngineCmd::Mutate(Box::new(move |c| {
+            c.remove_group(&public);
+        })));
+        drain(&mut f);
+        assert!(
+            !f.pool.relays.lock().unwrap().iter().any(|r| r == "wss://new.example"),
+            "pruned relay must be removed from the pool"
+        );
     }
 }

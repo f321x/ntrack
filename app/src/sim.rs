@@ -99,7 +99,13 @@ impl Platform for SimPlatform {
         // pre-fill flow can be exercised on the workstation.
         let k = ntrack_core::keys::generate();
         let nsec = ntrack_core::keys::nsec(&k);
-        let invite = ntrack_core::invite::build_invite("Scanned Demo", nsec.expose());
+        // Include a non-default relay so the desktop demo also exercises the
+        // relay-import path (it should get auto-added on import).
+        let invite = ntrack_core::invite::build_invite(
+            "Scanned Demo",
+            nsec.expose(),
+            &["wss://relay.sim.example".to_string()],
+        );
         log::info!("sim: scan_qr -> synthetic invite");
         let _ = self.tx.send(PlatformEvent::IncomingInvite(invite));
     }
