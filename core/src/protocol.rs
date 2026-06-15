@@ -25,6 +25,8 @@
 //! * `lat`, `lng`, `ts`: required for ACTIVE/TEST, MUST be omitted for STOP
 //! * `msg`: optional, MUST be omitted for STOP
 //! * `tester`: optional array of bech32 npubs, only allowed for TEST
+//! * `name`: optional sender-chosen display name (ntrack extension; absent →
+//!   the receiver derives a default handle from the sender key)
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -79,19 +81,33 @@ pub struct GartPayload {
     /// TEST only: bech32 npubs of the members that should surface the test.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub tester: Option<Vec<String>>,
+    /// Sender-chosen display name (ntrack extension, non-normative). Carried on
+    /// ACTIVE/TEST; omitted from STOP to keep it minimal. Receivers that don't
+    /// understand it ignore it (forward compatibility) and fall back to a name
+    /// derived from the sender key.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub name: Option<String>,
 }
 
 impl GartPayload {
     pub fn active(lat: f64, lng: f64, ts: u64, msg: Option<String>) -> Self {
-        Self { status: Status::Active, lat: Some(lat), lng: Some(lng), ts: Some(ts), msg, tester: None }
+        Self { status: Status::Active, lat: Some(lat), lng: Some(lng), ts: Some(ts), msg, tester: None, name: None }
     }
 
     pub fn test(lat: f64, lng: f64, ts: u64, msg: Option<String>, tester: Option<Vec<String>>) -> Self {
-        Self { status: Status::Test, lat: Some(lat), lng: Some(lng), ts: Some(ts), msg, tester }
+        Self { status: Status::Test, lat: Some(lat), lng: Some(lng), ts: Some(ts), msg, tester, name: None }
     }
 
     pub fn stop() -> Self {
-        Self { status: Status::Stop, lat: None, lng: None, ts: None, msg: None, tester: None }
+        Self { status: Status::Stop, lat: None, lng: None, ts: None, msg: None, tester: None, name: None }
+    }
+
+    /// Attach the sender's self-declared display name to an ACTIVE/TEST
+    /// payload. Whitespace is trimmed and an empty name clears the field, so a
+    /// blank configured name omits it from the wire entirely.
+    pub fn with_name(mut self, name: Option<String>) -> Self {
+        self.name = name.map(|n| n.trim().to_string()).filter(|n| !n.is_empty());
+        self
     }
 
     /// Enforce the normative payload rules of NIP-GART.
@@ -116,6 +132,9 @@ impl GartPayload {
                 if self.tester.is_some() {
                     return invalid("tester is only allowed for TEST");
                 }
+                // `name` is a non-normative extension describing the sender, not
+                // the broadcast, so it carries no per-status rule — we simply
+                // never emit it on STOP (see `stop`) and tolerate it on receive.
             }
         }
         Ok(())
@@ -723,6 +742,28 @@ mod tests {
             process_for_export(&tampered, &[group]).unwrap_err(),
             DropReason::BadSignature
         );
+    }
+
+    #[test]
+    fn name_roundtrips_through_the_payload() {
+        let sender = generate();
+        let group = generate();
+        let payload = GartPayload::active(1.0, 2.0, 3, None).with_name(Some("Anna".into()));
+        assert_eq!(payload.name.as_deref(), Some("Anna"));
+        let event = build_event(&sender, &[group.public_key()], &payload, None).unwrap();
+        let mut s = seen();
+        let inc = process_incoming(&event, std::slice::from_ref(&group), &mut s).unwrap();
+        assert_eq!(inc.payload.name.as_deref(), Some("Anna"));
+    }
+
+    #[test]
+    fn with_name_trims_and_drops_blank() {
+        let p = GartPayload::active(1.0, 2.0, 3, None).with_name(Some("  Bob ".into()));
+        assert_eq!(p.name.as_deref(), Some("Bob"));
+        let p = GartPayload::active(1.0, 2.0, 3, None).with_name(Some("   ".into()));
+        assert_eq!(p.name, None, "a blank name is omitted from the wire");
+        // STOP stays minimal: name is never serialized.
+        assert_eq!(serde_json::to_string(&GartPayload::stop()).unwrap(), r#"{"status":"STOP"}"#);
     }
 
     #[test]

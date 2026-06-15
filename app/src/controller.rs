@@ -377,6 +377,8 @@ impl Controller {
             ui.set_groups(slint::ModelRc::new(slint::VecModel::from(groups)));
             ui.set_can_receive_any(cfg.groups.iter().any(|g| g.can_receive));
             ui.set_sender_npub(cfg.sender_npub.clone().into());
+            ui.set_display_name(cfg.display_name.clone().into());
+            ui.set_default_name(cfg.default_name.clone().into());
             ui.set_interval_index(
                 INTERVALS
                     .iter()
@@ -417,17 +419,21 @@ impl Controller {
             .tracks
             .iter()
             .map(|t| {
+                // The receiver's own label wins; otherwise the sender's
+                // broadcast name (or a key-derived handle), computed by core.
                 let title = if t.label.is_empty() {
-                    t.sender_short.clone()
+                    t.name.clone()
                 } else {
                     t.label.clone()
                 };
                 let has_coords = !(t.lat == 0.0 && t.lng == 0.0 && t.ts == 0);
                 let (status, live) = track_liveness(t);
+                let (r, g, b) = t.color;
                 TrackItem {
                     sender: t.sender_hex.clone().into(),
                     title: title.into(),
                     label: t.label.clone().into(),
+                    npub: t.sender_short.clone().into(),
                     group: t.group_name.clone().into(),
                     status: status.into(),
                     coords: if has_coords {
@@ -437,6 +443,7 @@ impl Controller {
                     },
                     ago: ago_string(t.ts, t.created_at),
                     msg: t.msg.clone().into(),
+                    color: slint::Color::from_rgb_u8(r, g, b),
                     live,
                     is_test: t.is_test,
                     has_coords,
@@ -507,7 +514,7 @@ impl Controller {
                 .get(idx.max(0) as usize)
                 .cloned();
             if let Some(t) = item {
-                let label = if t.label.is_empty() { &t.sender_short } else { &t.label };
+                let label = if t.label.is_empty() { &t.name } else { &t.label };
                 ctrl.platform.open_map(t.lat, t.lng, label);
             }
         });
@@ -630,6 +637,14 @@ impl Controller {
                 let _ = c.rotate_sender();
             });
             ctrl.toast("Sender key rotated — receivers will see you as a new sender");
+        });
+
+        hook!(on_set_display_name, |ctrl, name: slint::SharedString| {
+            // Trimmed and stored verbatim; empty falls back to the derived
+            // handle. Broadcast on the next location publish.
+            let n = name.trim().to_string();
+            ctrl.mutate(move |c| c.display_name = n);
+            ctrl.toast("Name saved");
         });
 
         hook!(on_copy_text, |ctrl, text: slint::SharedString| {
@@ -933,6 +948,8 @@ mod tests {
             sender_hex: "ab".into(),
             sender_short: "npub1abc".into(),
             label: String::new(),
+            name: "Swift Otter".into(),
+            color: (140, 90, 200),
             group_name: "G".into(),
             status,
             live: status == Status::Active,

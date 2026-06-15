@@ -84,6 +84,11 @@ pub struct Config {
     /// Nostr identity (ntrack has no concept of one).
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub sender_secret: Option<SecretString>,
+    /// The user's chosen display name, broadcast with each location so members
+    /// see it in their Track tab. Empty → receivers derive a default handle
+    /// from the sender key (see [`crate::keys::derive_name`]).
+    #[serde(default)]
+    pub display_name: String,
     #[serde(default = "default_relays")]
     pub relays: Vec<String>,
     /// Relays that were auto-added by importing a relay-bearing invite and are
@@ -146,6 +151,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             sender_secret: None,
+            display_name: String::new(),
             relays: default_relays(),
             auto_relays: Vec::new(),
             groups: Vec::new(),
@@ -464,6 +470,21 @@ mod tests {
         assert_eq!(cfg.label_for("ab"), Some("Alice"));
         cfg.set_label("ab", "  ");
         assert_eq!(cfg.label_for("ab"), None);
+    }
+
+    #[test]
+    fn display_name_defaults_empty_and_roundtrips() {
+        let dir = tmpdir();
+        let store = ConfigStore::new(&dir);
+        // An older config.json predating the display name still loads.
+        std::fs::write(store.path(), br#"{"relays":[],"groups":[]}"#).unwrap();
+        let mut cfg = store.load().unwrap();
+        assert_eq!(cfg.display_name, "");
+        // It persists and round-trips once set.
+        cfg.display_name = "Anna".into();
+        store.save(&cfg).unwrap();
+        assert_eq!(store.load().unwrap().display_name, "Anna");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
