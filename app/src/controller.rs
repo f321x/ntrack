@@ -22,8 +22,9 @@ use ntrack_core::relay::{normalize_relay_url, RelayPool};
 use slint::Weak;
 use tokio::sync::mpsc;
 
+use crate::map;
 use crate::platform::{Platform, PlatformEvent};
-use crate::{GroupItem, MainWindow, RelayItem, TrackItem};
+use crate::{GroupItem, MainWindow, MapMarker, MapTile, RelayItem, TrackItem};
 
 /// Publish interval choices shown in the UI, in seconds.
 pub const INTERVALS: [u64; 4] = [15, 30, 60, 300];
@@ -63,7 +64,13 @@ struct ViewState {
     /// Relays from the last scanned/tapped invite, kept so importing the group
     /// (whose form only shows the bare key) still adds the relays it carried.
     pending_invite: Option<ntrack_core::invite::Invite>,
+    /// Live-map view + tile cache (only touched while the map overlay is open).
+    map: map::MapState,
 }
+
+/// Overscan (px) added around the viewport when choosing tiles to fetch, so a
+/// short drag reveals already-loaded tiles instead of blank space.
+const TILE_MARGIN: f64 = 128.0;
 
 pub struct Controller {
     rt: tokio::runtime::Runtime,
@@ -71,6 +78,8 @@ pub struct Controller {
     platform: Arc<dyn Platform>,
     ui: Weak<MainWindow>,
     view: Arc<Mutex<ViewState>>,
+    /// Shared TLS config for fetching map tiles (rustls + ring, webpki roots).
+    tls: Arc<tokio_rustls::rustls::ClientConfig>,
 }
 
 impl Controller {
@@ -112,6 +121,7 @@ impl Controller {
             platform,
             ui,
             view: Arc::new(Mutex::new(ViewState::default())),
+            tls: map::tls_config(),
         });
         ctrl.clone().spawn_ui_event_loop(ui_rx);
         ctrl
@@ -432,6 +442,182 @@ impl Controller {
             })
             .collect();
         ui.set_tracks(slint::ModelRc::new(slint::VecModel::from(tracks)));
+
+        // ---- live map overlay ----
+        ui.set_map_visible(view.map.open);
+        if view.map.open {
+            let m = &view.map;
+            let placements =
+                map::visible_tiles(m.center_lat, m.center_lng, m.zoom, m.vw, m.vh, TILE_MARGIN);
+            let tiles: Vec<MapTile> = placements
+                .iter()
+                .filter_map(|p| match m.get(&p.id) {
+                    Some(map::TileSlot::Loaded(buf)) => Some(MapTile {
+                        dx: p.dx as f32,
+                        dy: p.dy as f32,
+                        img: slint::Image::from_rgba8(buf.clone()),
+                    }),
+                    _ => None,
+                })
+                .collect();
+            ui.set_map_tiles(slint::ModelRc::new(slint::VecModel::from(tiles)));
+
+            let mut markers: Vec<MapMarker> = Vec::new();
+            let mut has_peers = false;
+            for t in &view.tracks {
+                if !is_live_with_coords(t) {
+                    continue;
+                }
+                has_peers = true;
+                let (dx, dy) = map::marker_offset(m.center_lat, m.center_lng, t.lat, t.lng, m.zoom);
+                // Skip dots well outside the viewport (keeps offsets small too).
+                if dx.abs() > m.vw / 2.0 + 64.0 || dy.abs() > m.vh / 2.0 + 64.0 {
+                    continue;
+                }
+                let (r, g, b) = t.color;
+                let title = if t.label.is_empty() {
+                    t.name.clone()
+                } else {
+                    t.label.clone()
+                };
+                markers.push(MapMarker {
+                    dx: dx as f32,
+                    dy: dy as f32,
+                    color: slint::Color::from_rgb_u8(r, g, b),
+                    label: title.into(),
+                });
+            }
+            ui.set_map_markers(slint::ModelRc::new(slint::VecModel::from(markers)));
+            ui.set_map_has_peers(has_peers);
+        }
+    }
+
+    /// Render synchronously when called on the UI thread (Slint callbacks
+    /// are), so a pan/zoom redraws before the gesture's visual offset resets;
+    /// falls back to posting if somehow off-thread.
+    fn render_now(self: &Arc<Self>) {
+        if let Some(ui) = self.ui.upgrade() {
+            self.render(&ui);
+        } else {
+            self.schedule_render();
+        }
+    }
+
+    // ---- live map overlay ------------------------------------------------
+
+    /// Open the map, framed to show all current live peers.
+    fn open_map_view(self: &Arc<Self>) {
+        {
+            let mut view = self.view.lock().unwrap();
+            view.map.open = true;
+            // Drop stale loading/failed tiles so a reopen retries cleanly while
+            // keeping already-loaded imagery for an instant first paint.
+            view.map.retain_loaded();
+            let pts = live_points(&view.tracks);
+            let (vw, vh) = (view.map.vw, view.map.vh);
+            let (lat, lng, z) = map::fit(&pts, vw, vh);
+            view.map.center_lat = lat;
+            view.map.center_lng = lng;
+            view.map.zoom = z;
+        }
+        self.refresh_map();
+    }
+
+    /// Re-frame the open map around the current live peers.
+    fn map_fit(self: &Arc<Self>) {
+        {
+            let mut view = self.view.lock().unwrap();
+            let pts = live_points(&view.tracks);
+            let (vw, vh) = (view.map.vw, view.map.vh);
+            let (lat, lng, z) = map::fit(&pts, vw, vh);
+            view.map.center_lat = lat;
+            view.map.center_lng = lng;
+            view.map.zoom = z;
+        }
+        self.refresh_map();
+    }
+
+    fn map_pan(self: &Arc<Self>, dx: f64, dy: f64) {
+        {
+            let mut view = self.view.lock().unwrap();
+            let m = &mut view.map;
+            let (lat, lng) = map::pan(m.center_lat, m.center_lng, m.zoom, dx, dy);
+            m.center_lat = lat;
+            m.center_lng = lng;
+        }
+        self.refresh_map();
+    }
+
+    fn map_zoom(self: &Arc<Self>, delta: i32) {
+        {
+            let mut view = self.view.lock().unwrap();
+            let z = (view.map.zoom as i32 + delta)
+                .clamp(map::MIN_ZOOM as i32, map::MAX_ZOOM as i32) as u32;
+            view.map.zoom = z;
+        }
+        self.refresh_map();
+    }
+
+    fn map_viewport(self: &Arc<Self>, w: f64, h: f64) {
+        if w <= 0.0 || h <= 0.0 {
+            return;
+        }
+        {
+            let mut view = self.view.lock().unwrap();
+            if (view.map.vw - w).abs() < 0.5 && (view.map.vh - h).abs() < 0.5 {
+                return; // unchanged — avoid a needless refetch/render
+            }
+            view.map.vw = w;
+            view.map.vh = h;
+        }
+        self.refresh_map();
+    }
+
+    /// Mark visible-but-missing tiles as loading, spawn their fetches, then
+    /// redraw whatever is already cached.
+    fn refresh_map(self: &Arc<Self>) {
+        let to_fetch: Vec<map::TileId> = {
+            let mut view = self.view.lock().unwrap();
+            if !view.map.open {
+                return;
+            }
+            let (clat, clng, z, vw, vh) = {
+                let m = &view.map;
+                (m.center_lat, m.center_lng, m.zoom, m.vw, m.vh)
+            };
+            let placements = map::visible_tiles(clat, clng, z, vw, vh, TILE_MARGIN);
+            let mut fetch = Vec::new();
+            for p in &placements {
+                if !view.map.contains(&p.id) {
+                    view.map.insert(p.id, map::TileSlot::Loading);
+                    fetch.push(p.id);
+                }
+            }
+            fetch
+        };
+        for id in to_fetch {
+            self.spawn_tile_fetch(id);
+        }
+        self.render_now();
+    }
+
+    fn spawn_tile_fetch(self: &Arc<Self>, id: map::TileId) {
+        let ctrl = self.clone();
+        let tls = self.tls.clone();
+        self.rt.spawn(async move {
+            let slot = match map::fetch_tile(tls, id).await {
+                Some(buf) => map::TileSlot::Loaded(buf),
+                None => map::TileSlot::Failed,
+            };
+            {
+                let mut view = ctrl.view.lock().unwrap();
+                if !view.map.open {
+                    return; // map was closed before the tile arrived
+                }
+                view.map.insert(id, slot);
+            }
+            ctrl.schedule_render();
+        });
     }
 
     // ---- UI callback wiring ---------------------------------------------
@@ -494,6 +680,30 @@ impl Controller {
                 let label = if t.label.is_empty() { &t.name } else { &t.label };
                 ctrl.platform.open_map(t.lat, t.lng, label);
             }
+        });
+
+        // ---- live map overlay ----
+        hook!(on_open_map_view, |ctrl| {
+            ctrl.open_map_view();
+        });
+        hook!(on_map_close, |ctrl| {
+            ctrl.view.lock().unwrap().map.open = false;
+            ctrl.render_now();
+        });
+        hook!(on_map_pan, |ctrl, dx: f32, dy: f32| {
+            ctrl.map_pan(dx as f64, dy as f64);
+        });
+        hook!(on_map_zoom_in, |ctrl| {
+            ctrl.map_zoom(1);
+        });
+        hook!(on_map_zoom_out, |ctrl| {
+            ctrl.map_zoom(-1);
+        });
+        hook!(on_map_fit, |ctrl| {
+            ctrl.map_fit();
+        });
+        hook!(on_map_viewport, |ctrl, w: f32, h: f32| {
+            ctrl.map_viewport(w as f64, h as f64);
         });
 
         hook!(on_export_track, |ctrl, idx: i32| {
@@ -824,6 +1034,22 @@ fn track_liveness(t: &TrackSnapshot) -> (&'static str, bool) {
         Status::Active if !share_timed_out(t.created_at) => ("LIVE", true),
         _ => ("ENDED", false),
     }
+}
+
+/// Whether a track is live *and* carries a real fix — the dots the map shows.
+/// Mirrors the card's "has coords" rule (a bare STOP leaves lat/lng/ts zero).
+fn is_live_with_coords(t: &TrackSnapshot) -> bool {
+    let (_, live) = track_liveness(t);
+    live && !(t.lat == 0.0 && t.lng == 0.0 && t.ts == 0)
+}
+
+/// (lat, lng) of every live peer with coordinates — the points the map frames.
+fn live_points(tracks: &[TrackSnapshot]) -> Vec<(f64, f64)> {
+    tracks
+        .iter()
+        .filter(|t| is_live_with_coords(t))
+        .map(|t| (t.lat, t.lng))
+        .collect()
 }
 
 fn shorten(npub: &str) -> String {

@@ -3352,6 +3352,7 @@ version = "0.1.0"
 dependencies = [
  "android_logger",
  "env_logger",
+ "image",
  "jni 0.21.1",
  "log",
  "ndk-context",
@@ -3361,6 +3362,8 @@ dependencies = [
  "slint",
  "slint-build",
  "tokio",
+ "tokio-rustls",
+ "webpki-roots 0.26.11",
 ]
 
 [[package]]

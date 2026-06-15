@@ -34,6 +34,23 @@ export struct RelayItem {
     connected: bool,
 }
 
+// One OSM raster tile placed on the live map. `dx`/`dy` are the tile's
+// top-left offset (px) from the map centre; Rust keeps the tile cache.
+export struct MapTile {
+    dx: length,
+    dy: length,
+    img: image,
+}
+
+// A peer's live position. `dx`/`dy` offset (px) from the map centre; `color`
+// is the same key-derived accent shown on the Track card.
+export struct MapMarker {
+    dx: length,
+    dy: length,
+    color: color,
+    label: string,
+}
+
 global Theme {
     out property <color> bg: #0f1117;
     out property <color> card: #1a1d27;
@@ -660,6 +677,169 @@ component ModalScrim inherits Rectangle {
     TouchArea { clicked => { root.dismiss(); } }
 }
 
+// --------------------------------------------------------------- map --
+
+// A round, translucent control overlaid on the map (close, zoom, fit).
+component MapCtlButton inherits Rectangle {
+    in property <string> text;
+    callback clicked;
+    width: 40px;
+    height: 40px;
+    border-radius: 20px;
+    background: t.pressed ? Theme.card-alt.brighter(20%) : #1a1d27dd;
+    border-width: 1px;
+    border-color: Theme.line;
+    Text {
+        text: root.text;
+        color: Theme.text;
+        font-size: 20px;
+        font-weight: 700;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+    t := TouchArea { clicked => { root.clicked(); } }
+}
+
+// Full-screen live map: OSM raster tiles with a coloured dot per live peer.
+// All projection/tiling lives in Rust; this component renders the pushed
+// `tiles`/`markers` models and reports gestures back through callbacks.
+component MapOverlay inherits Rectangle {
+    in property <[MapTile]> tiles;
+    in property <[MapMarker]> markers;
+    in property <bool> has-peers;
+    callback close();
+    callback pan(length, length);
+    callback zoom-in();
+    callback zoom-out();
+    callback fit();
+    callback viewport(length, length);
+
+    // Live drag offset, applied to tiles + markers together for a smooth pan;
+    // committed (and reset) on release once Rust re-centres the view.
+    private property <length> pan-x: 0;
+    private property <length> pan-y: 0;
+
+    background: Theme.bg;
+
+    map-area := Rectangle {
+        width: 100%;
+        height: 100%;
+        clip: true;
+        // Report the real viewport size so Rust fetches the right tile set.
+        init => { root.viewport(self.width, self.height); }
+        changed width => { root.viewport(self.width, self.height); }
+        changed height => { root.viewport(self.width, self.height); }
+
+        for t in root.tiles : Image {
+            x: parent.width / 2 + t.dx + root.pan-x;
+            y: parent.height / 2 + t.dy + root.pan-y;
+            width: 256px;
+            height: 256px;
+            source: t.img;
+        }
+
+        for m in root.markers : Rectangle {
+            x: parent.width / 2 + m.dx + root.pan-x - self.width / 2;
+            y: parent.height / 2 + m.dy + root.pan-y - self.height / 2;
+            width: 18px;
+            height: 18px;
+            border-radius: 9px;
+            background: m.color;
+            border-width: 2px;
+            border-color: #ffffff;
+            drop-shadow-blur: 4px;
+            drop-shadow-color: #000000aa;
+            // Name pill above the dot.
+            Rectangle {
+                y: -22px;
+                x: parent.width / 2 - self.width / 2;
+                width: lbl.preferred-width + 12px;
+                height: 18px;
+                border-radius: 9px;
+                background: #000000aa;
+                lbl := Text {
+                    text: m.label;
+                    color: #ffffff;
+                    font-size: 11px;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+            }
+        }
+
+        drag := TouchArea {
+            moved => {
+                root.pan-x = self.mouse-x - self.pressed-x;
+                root.pan-y = self.mouse-y - self.pressed-y;
+            }
+            pointer-event(e) => {
+                if (e.kind == PointerEventKind.up) {
+                    root.pan(root.pan-x, root.pan-y);
+                    root.pan-x = 0;
+                    root.pan-y = 0;
+                } else if (e.kind == PointerEventKind.cancel) {
+                    root.pan-x = 0;
+                    root.pan-y = 0;
+                }
+            }
+        }
+    }
+
+    // Empty state.
+    if !root.has-peers : Rectangle {
+        x: (parent.width - self.width) / 2;
+        y: 70px;
+        width: min(parent.width - 32px, 320px);
+        height: hint.preferred-height + 16px;
+        border-radius: 10px;
+        background: #1a1d27ee;
+        hint := Text {
+            text: "No one is sharing a live location right now.";
+            color: Theme.muted;
+            font-size: 13px;
+            wrap: word-wrap;
+            width: parent.width - 24px;
+            horizontal-alignment: center;
+        }
+    }
+
+    // Close (top-left).
+    MapCtlButton {
+        x: 12px;
+        y: 12px;
+        text: "✕";
+        clicked => { root.close(); }
+    }
+
+    // Zoom + fit (right edge).
+    VerticalLayout {
+        x: parent.width - self.width - 12px;
+        y: 12px;
+        width: 40px;
+        spacing: 8px;
+        MapCtlButton { text: "+"; clicked => { root.zoom-in(); } }
+        MapCtlButton { text: "−"; clicked => { root.zoom-out(); } }
+        MapCtlButton { text: "⤢"; clicked => { root.fit(); } }
+    }
+
+    // Attribution — required by the OSM/ODbL tile licence.
+    Rectangle {
+        x: parent.width - self.width - 6px;
+        y: parent.height - self.height - 6px;
+        width: attribution.preferred-width + 12px;
+        height: 18px;
+        border-radius: 4px;
+        background: #000000aa;
+        attribution := Text {
+            text: "© OpenStreetMap contributors";
+            color: #ffffff;
+            font-size: 10px;
+            vertical-alignment: center;
+            horizontal-alignment: center;
+        }
+    }
+}
+
 // ---------------------------------------------------------- main window --
 
 export component MainWindow inherits Window {
@@ -708,12 +888,25 @@ export component MainWindow inherits Window {
 
     in-out property <int> current-page: 0;
 
+    // live map overlay (opened from the Track tab)
+    in-out property <bool> map-visible;
+    in property <[MapTile]> map-tiles;
+    in property <[MapMarker]> map-markers;
+    in property <bool> map-has-peers;
+
     callback toggle-group(string, bool);
     callback start-share(string);
     callback stop-share();
     callback set-interval(int);
     callback message-edited(string);
     callback open-map(int);
+    callback open-map-view();
+    callback map-close();
+    callback map-pan(length, length);
+    callback map-zoom-in();
+    callback map-zoom-out();
+    callback map-fit();
+    callback map-viewport(length, length);
     callback export-track(int);
     callback rename-sender-confirmed(string, string);
     callback create-group(string);
@@ -773,6 +966,22 @@ export component MainWindow inherits Window {
                     horizontal-alignment: center;
                     vertical-alignment: center;
                 }
+            }
+            // Open the live map (Track tab only).
+            if root.current-page == 1 : Rectangle {
+                width: maplbl.preferred-width + 26px;
+                height: 28px;
+                border-radius: 14px;
+                background: mapbtn.pressed ? Theme.accent-dim : Theme.accent;
+                maplbl := Text {
+                    text: "🗺 Map";
+                    color: #ffffff;
+                    font-size: 13px;
+                    font-weight: 700;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+                mapbtn := TouchArea { clicked => { root.open-map-view(); } }
             }
         }
 
@@ -857,6 +1066,20 @@ export component MainWindow inherits Window {
     }
 
     // ---- overlays ----
+
+    if root.map-visible : MapOverlay {
+        width: 100%;
+        height: 100%;
+        tiles: root.map-tiles;
+        markers: root.map-markers;
+        has-peers: root.map-has-peers;
+        close => { root.map-close(); }
+        pan(dx, dy) => { root.map-pan(dx, dy); }
+        zoom-in => { root.map-zoom-in(); }
+        zoom-out => { root.map-zoom-out(); }
+        fit => { root.map-fit(); }
+        viewport(w, h) => { root.map-viewport(w, h); }
+    }
 
     if root.key-dialog-visible : ModalScrim {
         dismiss => { root.key-dialog-visible = false; }

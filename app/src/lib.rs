@@ -8,6 +8,7 @@ slint::include_modules!();
 
 pub mod controller;
 pub mod glue;
+pub mod map;
 pub mod platform;
 pub mod sim;
 
