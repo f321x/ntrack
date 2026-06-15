@@ -2,6 +2,7 @@
 //! stand-ins for the Android intents. Lets the full app (UI ↔ engine ↔
 //! relays) run on a workstation: `cargo run -p ntrack-app --features desktop`.
 
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -103,6 +104,28 @@ impl Platform for SimPlatform {
 
     fn share_text(&self, text: &str) {
         log::info!("sim: share sheet ({} chars)", text.len());
+    }
+
+    fn share_file(&self, filename: &str, mime: &str, content: &[u8], prefer_view: bool) {
+        // Write the file under $NTRACK_DATA (else the temp dir) so the desktop
+        // demo can open the exported GPX in any viewer. Sanitize to a bare file
+        // name so a crafted filename can't escape the directory.
+        let dir = std::env::var_os("NTRACK_DATA")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        let name = std::path::Path::new(filename)
+            .file_name()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("export.gpx"));
+        let path = dir.join(name);
+        match std::fs::write(&path, content) {
+            Ok(()) => log::info!(
+                "sim: share_file -> {} ({} bytes, {mime}, prefer_view={prefer_view})",
+                path.display(),
+                content.len()
+            ),
+            Err(e) => log::error!("sim: share_file failed for {}: {e}", path.display()),
+        }
     }
 
     fn scan_qr(&self) {

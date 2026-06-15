@@ -260,6 +260,26 @@ impl Platform for AndroidPlatform {
         });
     }
 
+    fn share_file(&self, filename: &str, mime: &str, content: &[u8], prefer_view: bool) {
+        self.with_env("shareFile", |env, class| {
+            let jbytes = env.byte_array_from_slice(content)?;
+            let jname = env.new_string(filename)?;
+            let jmime = env.new_string(mime)?;
+            env.call_static_method(
+                class,
+                "shareFile",
+                "([BLjava/lang/String;Ljava/lang/String;Z)V",
+                &[
+                    JValue::Object(&jbytes),
+                    JValue::Object(&jname),
+                    JValue::Object(&jmime),
+                    JValue::Bool(jboolean::from(prefer_view)),
+                ],
+            )
+            .map(|_| ())
+        });
+    }
+
     fn scan_qr(&self) {
         self.with_env("scanQr", |env, class| {
             env.call_static_method(class, "scanQr", "()V", &[]).map(|_| ())

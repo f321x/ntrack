@@ -236,6 +236,53 @@ pub fn process_incoming(
         return Err(DropReason::Duplicate);
     }
 
+    // Everything past dedup is shared with the export path; only this live
+    // path records into `seen`.
+    match decrypt_and_validate(event, group_keys) {
+        Ok(incoming) => {
+            seen.insert(event.id);
+            Ok(incoming)
+        }
+        // A targeted TEST aimed at someone else was still fully processed, so
+        // record it to keep replay protection honest (matches the historical
+        // behaviour where the seen-insert lived inside the targeting check).
+        Err(DropReason::TestNotForUs) => {
+            seen.insert(event.id);
+            Err(DropReason::TestNotForUs)
+        }
+        Err(other) => Err(other),
+    }
+}
+
+/// Verify and decrypt an event for *export* (track backfill), WITHOUT the
+/// replay dedup that [`process_incoming`] applies.
+///
+/// Backfill re-fetches events the live path has already seen; routing them
+/// through [`process_incoming`] would drop nearly all of them as
+/// [`DropReason::Duplicate`] and would also churn the bounded replay window.
+/// This bypass is load-bearing: it never reads or writes any [`SeenIds`].
+pub fn process_for_export(
+    event: &Event,
+    group_keys: &[Keys],
+) -> std::result::Result<Incoming, DropReason> {
+    if event.kind != Kind::Custom(GART_KIND) {
+        return Err(DropReason::WrongKind);
+    }
+    if event.verify().is_err() {
+        return Err(DropReason::BadSignature);
+    }
+    decrypt_and_validate(event, group_keys)
+}
+
+/// Shared receiver body: ciphertext lookup → NIP-44 decrypt → payload
+/// validation → targeted-TEST filtering. Assumes the kind and signature have
+/// already been checked and performs no replay dedup, so both the live
+/// ([`process_incoming`]) and export ([`process_for_export`]) paths can layer
+/// their own policy around it.
+fn decrypt_and_validate(
+    event: &Event,
+    group_keys: &[Keys],
+) -> std::result::Result<Incoming, DropReason> {
     let tagged: BTreeSet<PublicKey> = event.tags.public_keys().copied().collect();
     let ours: Vec<&Keys> = group_keys
         .iter()
@@ -281,13 +328,11 @@ pub fn process_incoming(
     if payload.status == Status::Test {
         if let Some(tester) = &payload.tester {
             if !tester.is_empty() {
-                seen.insert(event.id); // processed, just not surfaced
                 return Err(DropReason::TestNotForUs);
             }
         }
     }
 
-    seen.insert(event.id);
     Ok(Incoming {
         event_id: event.id,
         sender: event.pubkey,
@@ -305,6 +350,24 @@ pub fn subscription_filter(group_pubkeys: &[PublicKey], since_secs_ago: u64) -> 
         .kind(Kind::Custom(GART_KIND))
         .pubkeys(group_pubkeys.iter().copied())
         .since(Timestamp::now() - since_secs_ago)
+}
+
+/// One-shot backfill filter for exporting a single sender's track within one
+/// group: `{"kinds":[694], "authors":[<sender>], "#p":[<group>], "since":…,
+/// "limit":…}`. Pinning both the `author` (the sender's signing key) and the
+/// single recipient `#p` (the group) keeps the relay result set tight.
+pub fn backfill_filter(
+    group: PublicKey,
+    sender: PublicKey,
+    since_secs_ago: u64,
+    limit: usize,
+) -> nostr::Filter {
+    nostr::Filter::new()
+        .kind(Kind::Custom(GART_KIND))
+        .author(sender)
+        .pubkey(group)
+        .since(Timestamp::now() - since_secs_ago)
+        .limit(limit)
 }
 
 #[cfg(test)]
@@ -590,6 +653,76 @@ mod tests {
             .collect();
         assert_eq!(pks, BTreeSet::from([g1.to_hex(), g2.to_hex()]));
         assert!(json["since"].as_u64().unwrap() > 0);
+    }
+
+    #[test]
+    fn backfill_filter_shape() {
+        let group = generate().public_key();
+        let sender = generate().public_key();
+        let f = backfill_filter(group, sender, 3600, 5000);
+        let json = serde_json::to_value(&f).unwrap();
+        assert_eq!(json["kinds"], serde_json::json!([694]));
+        // exactly one author (the sender) and one #p (the group)
+        assert_eq!(json["authors"], serde_json::json!([sender.to_hex()]));
+        assert_eq!(json["#p"], serde_json::json!([group.to_hex()]));
+        assert!(json["since"].as_u64().unwrap() > 0);
+        assert_eq!(json["limit"].as_u64().unwrap(), 5000);
+    }
+
+    #[test]
+    fn process_for_export_decrypts_without_touching_seen() {
+        let sender = generate();
+        let group = generate();
+        let event = build_event(
+            &sender,
+            &[group.public_key()],
+            &GartPayload::active(48.2, 11.6, 1000, None),
+            None,
+        )
+        .unwrap();
+
+        // Record the event on the live path first.
+        let mut s = seen();
+        let live = process_incoming(&event, std::slice::from_ref(&group), &mut s).unwrap();
+        assert_eq!(live.payload.lat, Some(48.2));
+        let seen_len = s.len();
+        assert!(s.contains(&event.id));
+
+        // The export path returns the same decrypted result even though the id
+        // is already "seen" — and it leaves `seen` completely untouched (it
+        // takes no SeenIds at all).
+        let exported = process_for_export(&event, std::slice::from_ref(&group)).unwrap();
+        assert_eq!(exported.payload, live.payload);
+        assert_eq!(exported.sender, sender.public_key());
+        assert_eq!(exported.group, group.public_key());
+        assert_eq!(s.len(), seen_len, "export must not grow the replay window");
+    }
+
+    #[test]
+    fn process_for_export_still_verifies_and_validates() {
+        let sender = generate();
+        let group = generate();
+        let other = generate();
+        let good = build_event(
+            &sender,
+            &[group.public_key()],
+            &GartPayload::active(1.0, 2.0, 3, None),
+            None,
+        )
+        .unwrap();
+        // not tagged for us → NotForUs
+        assert_eq!(
+            process_for_export(&good, &[other]).unwrap_err(),
+            DropReason::NotForUs
+        );
+        // tampered → BadSignature
+        let mut json: serde_json::Value = serde_json::to_value(&good).unwrap();
+        json["created_at"] = serde_json::json!(good.created_at.as_secs() + 1);
+        let tampered: Event = serde_json::from_value(json).unwrap();
+        assert_eq!(
+            process_for_export(&tampered, &[group]).unwrap_err(),
+            DropReason::BadSignature
+        );
     }
 
     #[test]

@@ -280,6 +280,7 @@ component SharePage inherits ScrollView {
 component TrackRow inherits Card {
     in property <TrackItem> item;
     callback open-map();
+    callback export-track();
     callback rename();
 
     VerticalLayout {
@@ -341,6 +342,7 @@ component TrackRow inherits Card {
             }
             SmallButton { text: "Rename"; clicked => { root.rename(); } }
             if item.has-coords : SmallButton { text: "Open map"; clicked => { root.open-map(); } }
+            if item.has-coords : SmallButton { text: "Export"; clicked => { root.export-track(); } }
         }
     }
 }
@@ -349,6 +351,7 @@ component TrackPage inherits ScrollView {
     in property <[TrackItem]> tracks;
     in property <bool> can-receive-any;
     callback open-map(int);
+    callback export-track(int);
     callback rename-request(string, string); // sender hex, current title
 
     VerticalLayout {
@@ -384,6 +387,7 @@ component TrackPage inherits ScrollView {
         for t[i] in root.tracks : TrackRow {
             item: t;
             open-map => { root.open-map(i); }
+            export-track => { root.export-track(i); }
             rename => { root.rename-request(t.sender, t.label); }
         }
     }
@@ -674,6 +678,7 @@ export component MainWindow inherits Window {
     callback set-interval(int);
     callback message-edited(string);
     callback open-map(int);
+    callback export-track(int);
     callback rename-sender-confirmed(string, string);
     callback create-group(string);
     callback import-group(string, string);
@@ -757,6 +762,7 @@ export component MainWindow inherits Window {
                 tracks: root.tracks;
                 can-receive-any: root.can-receive-any;
                 open-map(i) => { root.open-map(i); }
+                export-track(i) => { root.export-track(i); }
                 rename-request(sender, current) => {
                     root.rename-sender = sender;
                     root.rename-current = current;

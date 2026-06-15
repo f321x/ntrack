@@ -38,6 +38,13 @@ pub trait Platform: Send + Sync + 'static {
     /// import form from a copied invite/key.
     fn paste_text(&self) -> String;
     fn share_text(&self, text: &str);
+    /// Hand a generated file (e.g. an exported GPX track) to the OS. When
+    /// `prefer_view` is set the platform first tries to open it directly in a
+    /// capable app (Android `ACTION_VIEW`) and falls back to the system share
+    /// sheet; the view-vs-share decision is made platform-side, where the
+    /// intent resolver lives. The bytes are owned by the OS afterwards (Android
+    /// writes them to a content-provider–served cache file).
+    fn share_file(&self, filename: &str, mime: &str, content: &[u8], prefer_view: bool);
     /// Open the camera QR scanner. The decoded string arrives asynchronously
     /// as [`PlatformEvent::IncomingInvite`].
     fn scan_qr(&self);

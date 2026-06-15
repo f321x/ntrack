@@ -55,6 +55,17 @@
             android:exported="false"
             android:foregroundServiceType="location" />
 
+        <!-- Serves the rotating GPX export from cacheDir/shared as a
+             content:// URI so it can be opened/shared with other apps
+             (file:// is illegal across app boundaries on API 24+). Not
+             exported; access is granted per-intent via
+             FLAG_GRANT_READ_URI_PERMISSION. -->
+        <provider
+            android:name=".FileBridgeProvider"
+            android:authorities="io.ntrack.app.files"
+            android:exported="false"
+            android:grantUriPermissions="true" />
+
         <!-- Posts a "resume sharing?" notification on boot when a share was
              active at shutdown (gated by the core's resume.flag sentinel). -->
         <receiver

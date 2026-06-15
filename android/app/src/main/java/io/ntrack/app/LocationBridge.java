@@ -17,6 +17,8 @@ import android.os.Bundle;
 import android.os.Looper;
 import android.util.Log;
 
+import java.io.File;
+import java.io.FileOutputStream;
 import java.util.ArrayList;
 import java.util.List;
 
@@ -295,6 +297,78 @@ public final class LocationBridge {
                 activity.startActivity(Intent.createChooser(send, "Share group key"));
             } catch (ActivityNotFoundException e) {
                 Log.e(TAG, "no app can share text");
+            }
+        });
+    }
+
+    /**
+     * Write {@code content} to a single rotating temp file under
+     * {@code cacheDir/shared/}, expose it via {@link FileBridgeProvider}, and
+     * hand it to the OS. When {@code preferView} is set we first try to open it
+     * directly in a capable app ({@code ACTION_VIEW}, e.g. a GPX/track viewer);
+     * otherwise, and as a fallback when nothing can view it, we offer the
+     * system share sheet ({@code ACTION_SEND}). All work hops to the UI thread.
+     */
+    public static void shareFile(final byte[] content, final String filename,
+                                 final String mime, final boolean preferView) {
+        final Activity activity = MainActivity.current();
+        if (activity == null) {
+            Log.w(TAG, "shareFile: no live activity");
+            return;
+        }
+        activity.runOnUiThread(() -> {
+            try {
+                File dir = new File(activity.getCacheDir(), FileBridgeProvider.SHARED_DIR);
+                if (!dir.exists() && !dir.mkdirs()) {
+                    Log.e(TAG, "shareFile: could not create shared dir");
+                    return;
+                }
+                // Single rotating temp file: clear previous exports first so the
+                // cache never accumulates and a stale URI can't be re-resolved.
+                File[] old = dir.listFiles();
+                if (old != null) {
+                    for (File f : old) {
+                        // noinspection ResultOfMethodCallIgnored
+                        f.delete();
+                    }
+                }
+                // Sanitize to a bare file name (defence in depth; the Rust side
+                // already produces a safe name).
+                String safe = new File(filename == null ? "track.gpx" : filename).getName();
+                if (safe.isEmpty()) safe = "track.gpx";
+                File out = new File(dir, safe);
+                try (FileOutputStream fos = new FileOutputStream(out)) {
+                    fos.write(content);
+                }
+
+                Uri uri = Uri.parse("content://" + FileBridgeProvider.AUTHORITY
+                        + "/" + Uri.encode(safe));
+
+                if (preferView) {
+                    Intent view = new Intent(Intent.ACTION_VIEW);
+                    view.setDataAndType(uri, mime);
+                    view.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+                    view.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                    if (view.resolveActivity(activity.getPackageManager()) != null) {
+                        activity.startActivity(view);
+                        return;
+                    }
+                }
+
+                // Fallback (or pure-share request): the system chooser.
+                Intent send = new Intent(Intent.ACTION_SEND);
+                send.setType(mime);
+                send.putExtra(Intent.EXTRA_STREAM, uri);
+                send.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+                Intent chooser = Intent.createChooser(send, "Export track");
+                chooser.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                try {
+                    activity.startActivity(chooser);
+                } catch (ActivityNotFoundException e) {
+                    Log.e(TAG, "no app can open or share the exported file");
+                }
+            } catch (Exception e) {
+                Log.e(TAG, "shareFile failed", e);
             }
         });
     }

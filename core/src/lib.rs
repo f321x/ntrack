@@ -14,11 +14,13 @@
 //! * [`config`] — persisted app configuration (groups, relays, sender key)
 //! * [`relay`] — minimal Nostr relay pool (publish / subscribe / reconnect)
 //! * [`engine`] — share & track engines orchestrating the above
+//! * [`gpx`] — GPX 1.1 serialization for exporting a received track
 
 pub mod config;
 pub mod dedup;
 pub mod engine;
 pub mod error;
+pub mod gpx;
 pub mod invite;
 pub mod keys;
 pub mod protocol;

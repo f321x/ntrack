@@ -5,11 +5,11 @@
 //! platform layer feeds [`LocationSample`]s and reacts to
 //! [`UiEvent::NeedLocation`] by starting/stopping platform location updates.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use nostr::{EventId, Keys, PublicKey};
+use nostr::{EventId, Filter, Keys, PublicKey};
 use tokio::sync::mpsc;
 
 use crate::config::{Config, ConfigStore};
@@ -29,6 +29,25 @@ pub const SEEN_CAPACITY: usize = 4096;
 const FRESH_SAMPLE_SECS: u64 = 60;
 /// Give up on a pending TEST if no fix arrives in this time.
 const TEST_FIX_TIMEOUT: Duration = Duration::from_secs(45);
+
+// ---- track-history retention (for GPX export) --------------------------
+//
+// History is in-memory only (decision: ephemeral) and bounded by three caps,
+// so the worst case is ~MAX_HISTORY_SESSIONS × MAX_POINTS_PER_SESSION points
+// (≈13 MB across 64 sessions). The latest-point *display* path is unaffected:
+// history is additive and kept in a separate map.
+
+/// Cap on retained track points per (sender, group) session.
+const MAX_POINTS_PER_SESSION: usize = 5_000;
+/// Per-insert retention window relative to the newest point in a session.
+/// Slightly over the 24 h NIP-40 expiration so a full window survives.
+const HISTORY_WINDOW_SECS: u64 = 25 * 3600;
+/// Cap on retained sessions; the least-recently-updated is evicted past it.
+const MAX_HISTORY_SESSIONS: usize = 64;
+/// Upper bound on events requested in a one-shot export backfill.
+const BACKFILL_LIMIT: usize = 5_000;
+/// How long to wait for backfill EOSEs before exporting whatever arrived.
+const FETCH_TIMEOUT: Duration = Duration::from_secs(8);
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct LocationSample {
@@ -68,6 +87,11 @@ pub enum EngineCmd {
     /// Emits the refreshed config plus a [`UiEvent::GroupShare`] carrying the
     /// new secret for redistribution to members.
     RotateGroup { group_hex: String },
+    /// Export a received sender's track (within one group) as GPX: seed from
+    /// the live history buffer, fire a one-shot relay backfill, merge, then
+    /// emit [`UiEvent::TrackExport`] (or a toast when there is nothing to
+    /// export). Non-blocking — backfill rides the existing select!/Tick.
+    ExportTrack { sender_hex: String, group_hex: String },
     Pool(PoolEvent),
     /// Periodic flush + share tick (driven internally; exposed for tests).
     Tick,
@@ -120,6 +144,9 @@ pub struct TrackSnapshot {
     pub ts: u64,
     pub created_at: u64,
     pub msg: String,
+    /// Recipient pseudonym (group) pubkey hex this track belongs to; pairs
+    /// with `sender_hex` to identify the session for export.
+    pub group_hex: String,
 }
 
 /// Data for the "share group key" dialog.
@@ -141,6 +168,9 @@ pub enum UiEvent {
     Tracks(Vec<TrackSnapshot>),
     Relays(Vec<(String, bool)>),
     GroupShare(GroupShare),
+    /// A built GPX document for a track, ready to hand to the platform's
+    /// file-share (direct-open a maps/track app, with a share-sheet fallback).
+    TrackExport { suggested_filename: String, gpx_xml: String },
     /// Platform layer should start (true) / stop (false) location updates.
     NeedLocation(bool),
     Toast(String),
@@ -171,6 +201,66 @@ struct TrackState {
     last_coords: Option<(f64, f64, u64)>,
 }
 
+/// One retained location fix for a (sender, group) session.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct HistPoint {
+    lat: f64,
+    lng: f64,
+    ts: u64,
+    created_at: u64,
+}
+
+/// Bounded, time-ordered point history for one (sender, group) session.
+#[derive(Default)]
+struct TrackHistory {
+    /// Ascending by `ts`, deduplicated by `ts`.
+    points: VecDeque<HistPoint>,
+    /// Newest `created_at` recorded, used for global LRU eviction.
+    last_seen: u64,
+}
+
+impl TrackHistory {
+    /// Insert a point keeping the deque ascending and deduped by `ts` (a tie
+    /// keeps the larger `created_at`), then prune by the retention window and
+    /// the per-session count cap.
+    fn insert(&mut self, p: HistPoint) {
+        self.last_seen = self.last_seen.max(p.created_at);
+        match self.points.binary_search_by(|e| e.ts.cmp(&p.ts)) {
+            Ok(idx) => {
+                if p.created_at > self.points[idx].created_at {
+                    self.points[idx] = p;
+                }
+            }
+            Err(idx) => self.points.insert(idx, p),
+        }
+        // Window prune relative to the newest point.
+        if let Some(newest) = self.points.back().map(|e| e.ts) {
+            let cutoff = newest.saturating_sub(HISTORY_WINDOW_SECS);
+            while self.points.front().map(|e| e.ts < cutoff).unwrap_or(false) {
+                self.points.pop_front();
+            }
+        }
+        while self.points.len() > MAX_POINTS_PER_SESSION {
+            self.points.pop_front();
+        }
+    }
+}
+
+/// An in-flight export: a one-shot relay backfill whose results merge with the
+/// live history seed once every reached relay EOSEs (or the timeout fires).
+struct PendingExport {
+    sender_hex: String,
+    group_hex: String,
+    /// GPX track name (user label or short npub).
+    label: String,
+    suggested_filename: String,
+    /// Relays still expected to EOSE.
+    relays_pending: usize,
+    deadline: tokio::time::Instant,
+    /// Live seed plus arrived backfill points; deduped/sorted at finish.
+    collected: Vec<HistPoint>,
+}
+
 pub struct Engine<P: EnginePool> {
     store: ConfigStore,
     config: Config,
@@ -181,6 +271,12 @@ pub struct Engine<P: EnginePool> {
     test_pending: Option<(tokio::time::Instant, Option<String>)>,
     /// keyed by (sender hex, group hex)
     tracks: BTreeMap<(String, String), TrackState>,
+    /// Bounded per-session point history for export, keyed identically to
+    /// `tracks` but separate so the latest-point display path is untouched.
+    history: BTreeMap<(String, String), TrackHistory>,
+    /// In-flight exports keyed by fetch correlation id.
+    pending_exports: BTreeMap<u64, PendingExport>,
+    next_corr: u64,
     ui_tx: mpsc::UnboundedSender<UiEvent>,
 }
 
@@ -210,6 +306,9 @@ impl<P: EnginePool> Engine<P> {
             share: None,
             test_pending: None,
             tracks: BTreeMap::new(),
+            history: BTreeMap::new(),
+            pending_exports: BTreeMap::new(),
+            next_corr: 0,
             ui_tx,
         }
     }
@@ -323,6 +422,9 @@ impl<P: EnginePool> Engine<P> {
                 self.emit_config();
                 self.toast("Key rotated — distribute the new key to all members".into());
                 self.handle(EngineCmd::RequestGroupShare { group_hex: new_hex });
+            }
+            EngineCmd::ExportTrack { sender_hex, group_hex } => {
+                self.export_track(sender_hex, group_hex);
             }
             EngineCmd::Pool(ev) => self.on_pool_event(ev),
             EngineCmd::Tick => self.on_tick(),
@@ -502,6 +604,19 @@ impl<P: EnginePool> Engine<P> {
         if let Some(sample) = due_sample {
             self.publish_active(sample);
         }
+        // Ship any export whose backfill window elapsed (live seed + whatever
+        // backfill arrived) — this is the only thing that completes an export
+        // when a relay is unreachable and never sends its EOSE.
+        let now = tokio::time::Instant::now();
+        let timed_out: Vec<u64> = self
+            .pending_exports
+            .iter()
+            .filter(|(_, p)| now >= p.deadline)
+            .map(|(corr, _)| *corr)
+            .collect();
+        for corr in timed_out {
+            self.finish_export(corr);
+        }
     }
 
     fn publish_active(&mut self, sample: LocationSample) {
@@ -605,11 +720,28 @@ impl<P: EnginePool> Engine<P> {
                 }
             }
             PoolEvent::Eose { .. } => {}
+            PoolEvent::FetchEvent { corr, event, .. } => self.on_fetch_event(corr, &event),
+            PoolEvent::FetchEose { corr, .. } => {
+                let done = match self.pending_exports.get_mut(&corr) {
+                    Some(p) => {
+                        p.relays_pending = p.relays_pending.saturating_sub(1);
+                        p.relays_pending == 0
+                    }
+                    None => false,
+                };
+                if done {
+                    self.finish_export(corr);
+                }
+            }
         }
     }
 
     fn apply_incoming(&mut self, inc: protocol::Incoming) {
         let key = (inc.sender.to_hex(), inc.group.to_hex());
+        // Record into history *before* the out-of-order display guard: an
+        // out-of-order ACTIVE still represents a real past point that belongs
+        // in an exported track, even though it must not move the live display.
+        self.record_history(&key, &inc);
         let prev = self.tracks.get(&key);
         // Out-of-order delivery: only apply if not older than current state.
         if let Some(prev) = prev {
@@ -636,6 +768,165 @@ impl<P: EnginePool> Engine<P> {
             },
         );
         self.emit_tracks();
+    }
+
+    // ---- track history & export -----------------------------------------
+
+    /// Record an incoming broadcast into the per-session history buffer.
+    /// ACTIVE/TEST with coordinates become points; STOP is a boundary, not a
+    /// point. Additive and order-independent.
+    fn record_history(&mut self, key: &(String, String), inc: &protocol::Incoming) {
+        let (Status::Active | Status::Test, Some(lat), Some(lng), Some(ts)) = (
+            inc.payload.status,
+            inc.payload.lat,
+            inc.payload.lng,
+            inc.payload.ts,
+        ) else {
+            return;
+        };
+        self.history
+            .entry(key.clone())
+            .or_default()
+            .insert(HistPoint { lat, lng, ts, created_at: inc.created_at });
+        self.prune_history_global();
+    }
+
+    /// Evict whole sessions (least-recently-updated first) past the global cap.
+    fn prune_history_global(&mut self) {
+        while self.history.len() > MAX_HISTORY_SESSIONS {
+            let Some(victim) = self
+                .history
+                .iter()
+                .min_by_key(|(_, h)| h.last_seen)
+                .map(|(k, _)| k.clone())
+            else {
+                break;
+            };
+            self.history.remove(&victim);
+        }
+    }
+
+    /// Begin an export: seed from the live history buffer, fire a one-shot
+    /// relay backfill, and either emit immediately (no connected relays) or
+    /// register a pending export resolved by FetchEose / the tick timeout.
+    /// Fully non-blocking — `pool.fetch` only does non-awaiting channel sends.
+    fn export_track(&mut self, sender_hex: String, group_hex: String) {
+        let (Ok(group), Ok(sender)) =
+            (keys::parse_public(&group_hex), keys::parse_public(&sender_hex))
+        else {
+            self.toast("Cannot export this track".into());
+            return;
+        };
+        let label = self.export_label(&sender_hex);
+        let suggested_filename = export_filename(&label);
+
+        // Seed from the in-memory history for this session.
+        let key = (sender_hex.clone(), group_hex.clone());
+        let collected: Vec<HistPoint> = self
+            .history
+            .get(&key)
+            .map(|h| h.points.iter().copied().collect())
+            .unwrap_or_default();
+
+        let filter = protocol::backfill_filter(group, sender, HISTORY_WINDOW_SECS, BACKFILL_LIMIT);
+        let corr = self.next_corr;
+        self.next_corr += 1;
+        let relays_pending = self.pool.fetch(corr, filter);
+        self.pending_exports.insert(
+            corr,
+            PendingExport {
+                sender_hex,
+                group_hex,
+                label,
+                suggested_filename,
+                relays_pending,
+                deadline: tokio::time::Instant::now() + FETCH_TIMEOUT,
+                collected,
+            },
+        );
+        // No connected relays → nothing will EOSE; ship the live buffer now.
+        if relays_pending == 0 {
+            self.finish_export(corr);
+        }
+    }
+
+    /// One backfill event arrived for an in-flight export. Decrypt it
+    /// specifically for the export's target group (so a sender broadcasting to
+    /// several of our groups can't smear points across exports) via
+    /// [`protocol::process_for_export`] — NO replay dedup, so events already
+    /// seen live are recovered rather than dropped.
+    fn on_fetch_event(&mut self, corr: u64, event: &nostr::Event) {
+        let Some((group_hex, sender_hex)) = self
+            .pending_exports
+            .get(&corr)
+            .map(|p| (p.group_hex.clone(), p.sender_hex.clone()))
+        else {
+            return;
+        };
+        let group_keys: Vec<Keys> = self
+            .config
+            .groups
+            .iter()
+            .filter(|g| g.public == group_hex)
+            .filter_map(|g| g.member_keys())
+            .collect();
+        let Ok(inc) = protocol::process_for_export(event, &group_keys) else {
+            return;
+        };
+        if inc.sender.to_hex() != sender_hex {
+            return;
+        }
+        if let (Status::Active | Status::Test, Some(lat), Some(lng), Some(ts)) = (
+            inc.payload.status,
+            inc.payload.lat,
+            inc.payload.lng,
+            inc.payload.ts,
+        ) {
+            if let Some(p) = self.pending_exports.get_mut(&corr) {
+                p.collected.push(HistPoint { lat, lng, ts, created_at: inc.created_at });
+            }
+        }
+    }
+
+    /// Assemble and emit a finished export: merge + dedup by `ts` (larger
+    /// `created_at` wins) + sort ascending → GPX. Empty → a toast.
+    fn finish_export(&mut self, corr: u64) {
+        let Some(pending) = self.pending_exports.remove(&corr) else {
+            return;
+        };
+        let mut by_ts: BTreeMap<u64, HistPoint> = BTreeMap::new();
+        for p in pending.collected {
+            by_ts
+                .entry(p.ts)
+                .and_modify(|e| {
+                    if p.created_at > e.created_at {
+                        *e = p;
+                    }
+                })
+                .or_insert(p);
+        }
+        let points: Vec<(f64, f64, u64)> =
+            by_ts.into_values().map(|p| (p.lat, p.lng, p.ts)).collect();
+        if points.is_empty() {
+            self.toast("No track points to export".into());
+            return;
+        }
+        let gpx_xml = crate::gpx::build_gpx(&pending.label, &points);
+        let _ = self.ui_tx.send(UiEvent::TrackExport {
+            suggested_filename: pending.suggested_filename,
+            gpx_xml,
+        });
+    }
+
+    /// Human label for a track export: the user's sender label, else the
+    /// sender's short npub.
+    fn export_label(&self, sender_hex: &str) -> String {
+        match self.config.label_for(sender_hex) {
+            Some(l) if !l.is_empty() => l.to_string(),
+            _ => keys::parse_public(sender_hex)
+                .map(|pk| keys::short_npub(&pk))
+                .unwrap_or_else(|_| sender_hex.to_string()),
+        }
     }
 
     // ---- snapshots & plumbing -------------------------------------------
@@ -770,6 +1061,7 @@ impl<P: EnginePool> Engine<P> {
                 ts,
                 created_at: t.created_at,
                 msg: t.payload.msg.clone().unwrap_or_default(),
+                group_hex: group_hex.clone(),
             });
         }
         // Most recently updated first.
@@ -785,11 +1077,14 @@ pub fn now_secs() -> u64 {
         .as_secs()
 }
 
-// The Publisher trait lives in relay.rs but the engine needs two more pool
+// The Publisher trait lives in relay.rs but the engine needs more pool
 // operations; extend via a sub-trait so tests can mock everything at once.
 pub trait EnginePool: Publisher {
     fn set_relays_list(&self, relays: &[String]);
     fn relay_status_list(&self) -> Vec<(String, bool)>;
+    /// Dispatch a one-shot backfill REQ; returns the number of relays it
+    /// reached (i.e. how many `FetchEose` events to expect).
+    fn fetch(&self, corr: u64, filter: Filter) -> usize;
 }
 
 impl EnginePool for crate::relay::RelayPool {
@@ -799,13 +1094,50 @@ impl EnginePool for crate::relay::RelayPool {
     fn relay_status_list(&self) -> Vec<(String, bool)> {
         self.relay_status()
     }
+    fn fetch(&self, corr: u64, filter: Filter) -> usize {
+        // Fully-qualified so this dispatches to the inherent method, never
+        // back into this trait method.
+        crate::relay::RelayPool::fetch(self, corr, filter)
+    }
+}
+
+/// Build a sanitized export filename: `ntrack-<label>-YYYYMMDD.gpx`.
+fn export_filename(label: &str) -> String {
+    format!(
+        "ntrack-{}-{}.gpx",
+        slugify(label),
+        crate::gpx::yyyymmdd_utc(now_secs())
+    )
+}
+
+/// Reduce a label to a filesystem-safe slug: ASCII alphanumerics kept, every
+/// other run collapsed to a single `-`, ends trimmed. Empty → `track`.
+fn slugify(label: &str) -> String {
+    let mut out = String::with_capacity(label.len());
+    let mut prev_dash = false;
+    for c in label.chars() {
+        if c.is_ascii_alphanumeric() {
+            out.push(c);
+            prev_dash = false;
+        } else if !prev_dash {
+            out.push('-');
+            prev_dash = true;
+        }
+    }
+    let trimmed = out.trim_matches('-');
+    if trimmed.is_empty() {
+        "track".to_string()
+    } else {
+        trimmed.to_string()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::Group;
-    use nostr::{Event, Filter};
+    use nostr::nips::nip44;
+    use nostr::{Event, EventBuilder, Filter, Kind, Tag, Timestamp};
     use std::path::PathBuf;
     use std::sync::Mutex;
 
@@ -814,6 +1146,20 @@ mod tests {
         published: Mutex<Vec<Event>>,
         subscription: Mutex<Option<Filter>>,
         relays: Mutex<Vec<String>>,
+        /// Recorded (corr, filter) of every `fetch`.
+        fetches: Mutex<Vec<(u64, Filter)>>,
+        /// Canned number of relays a fetch "reaches"; tests set this to control
+        /// how many `FetchEose` they must deliver. Defaults to 0 (none).
+        fetch_relays: Mutex<usize>,
+    }
+
+    impl MockPool {
+        fn set_fetch_relays(&self, n: usize) {
+            *self.fetch_relays.lock().unwrap() = n;
+        }
+        fn last_fetch_filter(&self) -> Option<Filter> {
+            self.fetches.lock().unwrap().last().map(|(_, f)| f.clone())
+        }
     }
 
     impl Publisher for MockPool {
@@ -836,6 +1182,10 @@ mod tests {
                 .iter()
                 .map(|u| (u.clone(), true))
                 .collect()
+        }
+        fn fetch(&self, corr: u64, filter: Filter) -> usize {
+            self.fetches.lock().unwrap().push((corr, filter));
+            *self.fetch_relays.lock().unwrap()
         }
     }
 
@@ -1370,5 +1720,332 @@ mod tests {
             !f.pool.relays.lock().unwrap().iter().any(|r| r == "wss://new.example"),
             "pruned relay must be removed from the pool"
         );
+    }
+
+    // ---- track history & GPX export ------------------------------------
+
+    /// Build a signed kind:694 event from `sender` to `group` with explicit
+    /// `created_at` (event/publish time); `payload` carries the capture `ts`.
+    fn event_with(sender: &Keys, group: &Group, payload: GartPayload, created_at: u64) -> Event {
+        let plaintext = serde_json::to_string(&payload).unwrap();
+        let gpk = group.public_key().unwrap();
+        let content =
+            nip44::encrypt(sender.secret_key(), &gpk, &plaintext, nip44::Version::V2).unwrap();
+        EventBuilder::new(Kind::Custom(protocol::GART_KIND), content)
+            .tags([Tag::public_key(gpk)])
+            .custom_created_at(Timestamp::from(created_at))
+            .sign_with_keys(sender)
+            .unwrap()
+    }
+
+    fn active_event(
+        sender: &Keys,
+        group: &Group,
+        lat: f64,
+        lng: f64,
+        ts: u64,
+        created_at: u64,
+    ) -> Event {
+        event_with(sender, group, GartPayload::active(lat, lng, ts, None), created_at)
+    }
+
+    fn feed(f: &mut Fixture, ev: Event) {
+        f.engine
+            .handle(EngineCmd::Pool(PoolEvent::Incoming { url: "wss://r".into(), event: Box::new(ev) }));
+    }
+
+    fn feed_fetch(f: &mut Fixture, corr: u64, ev: Event) {
+        f.engine.handle(EngineCmd::Pool(PoolEvent::FetchEvent {
+            corr,
+            url: "wss://r".into(),
+            event: Box::new(ev),
+        }));
+    }
+
+    fn export(f: &mut Fixture, sender: &Keys, group: &Group) {
+        f.engine.handle(EngineCmd::ExportTrack {
+            sender_hex: sender.public_key().to_hex(),
+            group_hex: group.public.clone(),
+        });
+    }
+
+    /// The GPX of the last `TrackExport`, if any.
+    fn last_export_gpx(evs: Vec<UiEvent>) -> Option<String> {
+        evs.into_iter().rev().find_map(|e| match e {
+            UiEvent::TrackExport { gpx_xml, .. } => Some(gpx_xml),
+            _ => None,
+        })
+    }
+
+    fn trkpt_count(gpx: &str) -> usize {
+        gpx.matches("<trkpt ").count()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn history_accumulates_active_points_while_display_shows_newest() {
+        let mut f = fixture();
+        let group = add_member_group(&mut f, "G");
+        let sender = keys::generate();
+        let key = (sender.public_key().to_hex(), group.public.clone());
+
+        for (i, ts) in [1000u64, 1060, 1120].iter().enumerate() {
+            feed(&mut f, active_event(&sender, &group, 48.0 + i as f64, 11.0, *ts, 5000 + *ts));
+        }
+        // All three points retained, ascending by ts.
+        let pts: Vec<u64> = f.engine.history[&key].points.iter().map(|p| p.ts).collect();
+        assert_eq!(pts, vec![1000, 1060, 1120]);
+        // The latest-point display shows the newest fix only.
+        let tracks = last_tracks(drain(&mut f)).unwrap();
+        assert_eq!(tracks.len(), 1);
+        assert_eq!(tracks[0].lat, 50.0, "display tracks the newest point");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn history_dedups_by_ts_keeping_larger_created_at() {
+        let mut f = fixture();
+        let group = add_member_group(&mut f, "G");
+        let sender = keys::generate();
+        let key = (sender.public_key().to_hex(), group.public.clone());
+
+        // Same capture ts, two different publishes; the later (larger
+        // created_at) must win.
+        feed(&mut f, active_event(&sender, &group, 1.0, 1.0, 1000, 100));
+        feed(&mut f, active_event(&sender, &group, 2.0, 2.0, 1000, 200));
+        let pts = &f.engine.history[&key].points;
+        assert_eq!(pts.len(), 1, "same ts collapses to one point");
+        assert_eq!(pts[0].lat, 2.0, "the later publish wins the tie");
+        assert_eq!(pts[0].created_at, 200);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn out_of_order_active_lands_in_history_but_not_display() {
+        let mut f = fixture();
+        let group = add_member_group(&mut f, "G");
+        let sender = keys::generate();
+        let key = (sender.public_key().to_hex(), group.public.clone());
+
+        feed(&mut f, active_event(&sender, &group, 1.0, 1.0, 100, 100));
+        feed(&mut f, active_event(&sender, &group, 2.0, 2.0, 200, 200));
+        // A late-delivered older fix: must enter history but NOT move display.
+        feed(&mut f, active_event(&sender, &group, 9.0, 9.0, 150, 150));
+
+        let pts: Vec<u64> = f.engine.history[&key].points.iter().map(|p| p.ts).collect();
+        assert_eq!(pts, vec![100, 150, 200], "out-of-order point still retained");
+        let tracks = last_tracks(drain(&mut f)).unwrap();
+        assert_eq!(tracks[0].lat, 2.0, "display stays on the newest (created_at) point");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_recorded_stop_not() {
+        let mut f = fixture();
+        let group = add_member_group(&mut f, "G");
+        let sender = keys::generate();
+        let key = (sender.public_key().to_hex(), group.public.clone());
+
+        feed(&mut f, event_with(&sender, &group, GartPayload::test(1.0, 2.0, 500, None, None), 500));
+        feed(&mut f, event_with(&sender, &group, GartPayload::stop(), 600));
+        let pts = &f.engine.history[&key].points;
+        assert_eq!(pts.len(), 1, "TEST recorded, STOP is a boundary not a point");
+        assert_eq!(pts[0].ts, 500);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn global_session_cap_evicts_least_recent() {
+        let mut f = fixture();
+        let group = add_member_group(&mut f, "G");
+        drain(&mut f);
+
+        // Fill one past the cap, each a distinct sender (= distinct session),
+        // with strictly increasing recency.
+        let mut senders = Vec::new();
+        for i in 0..=MAX_HISTORY_SESSIONS as u64 {
+            let s = keys::generate();
+            feed(&mut f, active_event(&s, &group, 1.0, 1.0, 1000 + i, 1000 + i));
+            senders.push(s);
+        }
+        assert_eq!(f.engine.history.len(), MAX_HISTORY_SESSIONS, "capped");
+        // The first (least-recently-updated) session was evicted; the newest
+        // survives.
+        let oldest = (senders[0].public_key().to_hex(), group.public.clone());
+        let newest = (senders.last().unwrap().public_key().to_hex(), group.public.clone());
+        assert!(!f.engine.history.contains_key(&oldest), "oldest session evicted");
+        assert!(f.engine.history.contains_key(&newest), "newest session kept");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn export_with_no_points_emits_toast() {
+        let mut f = fixture();
+        let group = add_member_group(&mut f, "G");
+        let sender = keys::generate();
+        drain(&mut f);
+
+        // No history, no connected relays (fetch_relays defaults to 0).
+        export(&mut f, &sender, &group);
+        let evs = drain(&mut f);
+        assert!(last_export_gpx(evs.clone()).is_none(), "no GPX emitted");
+        assert!(evs
+            .iter()
+            .any(|e| matches!(e, UiEvent::Toast(t) if t.contains("No track points"))));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn export_zero_relays_emits_live_buffer_immediately() {
+        let mut f = fixture();
+        let group = add_member_group(&mut f, "G");
+        let sender = keys::generate();
+        feed(&mut f, active_event(&sender, &group, 1.0, 2.0, 1000, 1000));
+        drain(&mut f);
+
+        // fetch_relays == 0 → no backfill; ship the live buffer at once.
+        export(&mut f, &sender, &group);
+        let gpx = last_export_gpx(drain(&mut f)).expect("export emitted immediately");
+        assert_eq!(trkpt_count(&gpx), 1);
+        assert!(f.engine.pending_exports.is_empty(), "nothing left pending");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn export_merges_live_and_backfill_deduped_and_sorted() {
+        let mut f = fixture();
+        let group = add_member_group(&mut f, "G");
+        let sender = keys::generate();
+        // Live points at ts 100 and 200.
+        feed(&mut f, active_event(&sender, &group, 1.0, 1.0, 100, 100));
+        feed(&mut f, active_event(&sender, &group, 2.0, 2.0, 200, 200));
+        drain(&mut f);
+
+        f.pool.set_fetch_relays(1);
+        export(&mut f, &sender, &group);
+        assert_eq!(f.engine.pending_exports.len(), 1, "awaiting backfill");
+
+        // Backfill delivers an in-between point (150), a duplicate ts (200) and
+        // an out-of-order earlier point (50).
+        feed_fetch(&mut f, 0, active_event(&sender, &group, 5.0, 5.0, 150, 150));
+        feed_fetch(&mut f, 0, active_event(&sender, &group, 9.0, 9.0, 200, 999));
+        feed_fetch(&mut f, 0, active_event(&sender, &group, 7.0, 7.0, 50, 50));
+        f.engine.handle(EngineCmd::Pool(PoolEvent::FetchEose { corr: 0, url: "wss://r".into() }));
+
+        let gpx = last_export_gpx(drain(&mut f)).expect("export emitted on EOSE");
+        // 50, 100, 150, 200 — duplicate ts=200 collapsed.
+        assert_eq!(trkpt_count(&gpx), 4);
+        // Times appear in ascending order.
+        let p50 = gpx.find("1970-01-01T00:00:50Z").unwrap();
+        let p100 = gpx.find("1970-01-01T00:01:40Z").unwrap();
+        let p200 = gpx.find("1970-01-01T00:03:20Z").unwrap();
+        assert!(p50 < p100 && p100 < p200, "trkpts sorted ascending by time");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn refetched_already_seen_event_is_recovered_by_export() {
+        // The load-bearing bypass: after a restart the ephemeral history is
+        // empty but `seen` still holds the id (it is persisted). Backfill must
+        // recover the point — process_incoming would drop it as Duplicate.
+        let mut f = fixture();
+        let group = add_member_group(&mut f, "G");
+        let sender = keys::generate();
+        let ev = active_event(&sender, &group, 3.0, 4.0, 1000, 1000);
+        feed(&mut f, ev.clone()); // records into history AND seen
+        // Simulate the restart: drop the in-memory history, keep `seen`.
+        f.engine.history.clear();
+        assert!(f.engine.seen.contains(&ev.id), "id still in the replay window");
+        drain(&mut f);
+
+        f.pool.set_fetch_relays(1);
+        export(&mut f, &sender, &group);
+        feed_fetch(&mut f, 0, ev); // already-seen event, re-fetched
+        f.engine.handle(EngineCmd::Pool(PoolEvent::FetchEose { corr: 0, url: "wss://r".into() }));
+
+        let gpx = last_export_gpx(drain(&mut f)).expect("export emitted");
+        assert_eq!(trkpt_count(&gpx), 1, "seen-but-refetched point recovered, once");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn export_times_out_to_live_only() {
+        let mut f = fixture();
+        let group = add_member_group(&mut f, "G");
+        let sender = keys::generate();
+        feed(&mut f, active_event(&sender, &group, 1.0, 2.0, 1000, 1000));
+        drain(&mut f);
+
+        f.pool.set_fetch_relays(1);
+        export(&mut f, &sender, &group);
+        // No FetchEose arrives (unreachable relay). The tick timeout completes
+        // the export with the live buffer only.
+        assert!(last_export_gpx(drain(&mut f)).is_none(), "still waiting before timeout");
+        tokio::time::advance(FETCH_TIMEOUT + Duration::from_secs(1)).await;
+        f.engine.handle(EngineCmd::Tick);
+        let gpx = last_export_gpx(drain(&mut f)).expect("timed-out export ships live buffer");
+        assert_eq!(trkpt_count(&gpx), 1);
+        assert!(f.engine.pending_exports.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn export_does_not_block_other_commands() {
+        let mut f = fixture();
+        let group = add_member_group(&mut f, "G");
+        let sender = keys::generate();
+        f.engine.handle(EngineCmd::StartShare { msg: None });
+        drain(&mut f);
+
+        f.pool.set_fetch_relays(1);
+        export(&mut f, &sender, &group); // pending; no EOSE yet
+        assert_eq!(f.engine.pending_exports.len(), 1);
+
+        // Sharing keeps working while the backfill is in flight.
+        f.engine.handle(EngineCmd::Location(sample(now_secs() * 1000)));
+        assert_eq!(
+            f.pool.published.lock().unwrap().len(),
+            1,
+            "a location fix still publishes while an export is pending"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn export_backfill_filter_targets_sender_and_group() {
+        let mut f = fixture();
+        let group = add_member_group(&mut f, "G");
+        let sender = keys::generate();
+        drain(&mut f);
+
+        f.pool.set_fetch_relays(1);
+        export(&mut f, &sender, &group);
+        let filter = f.pool.last_fetch_filter().expect("fetch dispatched");
+        let json = serde_json::to_value(&filter).unwrap();
+        assert_eq!(json["kinds"], serde_json::json!([694]));
+        assert_eq!(json["authors"], serde_json::json!([sender.public_key().to_hex()]));
+        assert_eq!(json["#p"], serde_json::json!([group.public]));
+        assert!(json["since"].as_u64().unwrap() > 0);
+        assert_eq!(json["limit"].as_u64().unwrap(), BACKFILL_LIMIT as u64);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn export_filename_uses_label_when_present() {
+        let mut f = fixture();
+        let group = add_member_group(&mut f, "G");
+        let sender = keys::generate();
+        let hex = sender.public_key().to_hex();
+        feed(&mut f, active_event(&sender, &group, 1.0, 2.0, 1000, 1000));
+        let h = hex.clone();
+        f.engine
+            .handle(EngineCmd::Mutate(Box::new(move |c| c.set_label(&h, "Anna's phone"))));
+        drain(&mut f);
+
+        export(&mut f, &sender, &group);
+        let evs = drain(&mut f);
+        let name = evs.iter().rev().find_map(|e| match e {
+            UiEvent::TrackExport { suggested_filename, .. } => Some(suggested_filename.clone()),
+            _ => None,
+        });
+        let name = name.expect("export emitted");
+        assert!(name.starts_with("ntrack-Anna-s-phone-"), "got {name}");
+        assert!(name.ends_with(".gpx"));
+    }
+
+    #[test]
+    fn slugify_sanitizes_labels() {
+        assert_eq!(slugify("Anna's phone"), "Anna-s-phone");
+        assert_eq!(slugify("  weird // name **"), "weird-name");
+        assert_eq!(slugify("✓✓✓"), "track");
+        assert_eq!(slugify(""), "track");
+        assert_eq!(slugify("npub1abc"), "npub1abc");
     }
 }

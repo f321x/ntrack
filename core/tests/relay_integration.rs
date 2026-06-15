@@ -262,6 +262,80 @@ async fn removed_relay_is_disconnected_and_new_relay_added() {
 }
 
 #[tokio::test]
+async fn fetch_backfill_reqs_streams_events_then_closes_on_eose() {
+    let mut relay = spawn_mock_relay().await;
+    let (pool_tx, mut pool_rx) = mpsc::unbounded_channel();
+    let pool = RelayPool::new(pool_tx);
+    pool.set_relays(&[relay.addr.clone()]);
+
+    // wait for connect (so fetch sees the relay as connected)
+    loop {
+        if let PoolEvent::Status { connected: true, .. } = next_pool_event(&mut pool_rx).await {
+            break;
+        }
+    }
+
+    let (event, _, group) = test_event();
+    let filter = protocol::backfill_filter(group.public_key(), event.pubkey, 3600, 100);
+    let n = pool.fetch(7, filter);
+    assert_eq!(n, 1, "dispatched to the one connected relay");
+
+    // A one-shot REQ arrives on the correlated subid (distinct from the live one).
+    let frame = recv_frame(&mut relay).await;
+    assert_eq!(frame[0], "REQ");
+    let subid = frame[1].as_str().unwrap().to_string();
+    assert_eq!(subid, "ntrack-fetch-7");
+    assert_eq!(frame[2]["kinds"][0], 694);
+    assert_eq!(frame[2]["authors"][0], event.pubkey.to_hex());
+
+    // The relay streams one stored event, then EOSE on that subid.
+    relay
+        .tx
+        .send(serde_json::json!(["EVENT", subid, event]).to_string())
+        .unwrap();
+    relay
+        .tx
+        .send(serde_json::json!(["EOSE", subid]).to_string())
+        .unwrap();
+
+    let mut got_event = false;
+    let mut got_eose = false;
+    while !(got_event && got_eose) {
+        match next_pool_event(&mut pool_rx).await {
+            PoolEvent::FetchEvent { corr, event: got, .. } => {
+                assert_eq!(corr, 7);
+                assert_eq!(got.id, event.id);
+                got_event = true;
+            }
+            PoolEvent::FetchEose { corr, .. } => {
+                assert_eq!(corr, 7);
+                got_eose = true;
+            }
+            other => panic!("unexpected pool event during backfill: {other:?}"),
+        }
+    }
+
+    // After EOSE the pool closes the one-shot subscription so it never lingers.
+    let frame = recv_frame(&mut relay).await;
+    assert_eq!(frame[0], "CLOSE");
+    assert_eq!(frame[1].as_str().unwrap(), "ntrack-fetch-7");
+    pool.shutdown();
+}
+
+#[tokio::test]
+async fn fetch_skips_disconnected_relays() {
+    // A relay we never connect to (bogus address) must not be counted.
+    let (pool_tx, _pool_rx) = mpsc::unbounded_channel();
+    let pool = RelayPool::new(pool_tx);
+    pool.set_relays(&["ws://127.0.0.1:1".to_string()]); // refused, never connects
+
+    let (event, _, group) = test_event();
+    let filter = protocol::backfill_filter(group.public_key(), event.pubkey, 3600, 100);
+    assert_eq!(pool.fetch(1, filter), 0, "no connected relays → reaches none");
+    pool.shutdown();
+}
+
+#[tokio::test]
 async fn publish_fans_out_to_all_relays() {
     let mut relay_a = spawn_mock_relay().await;
     let mut relay_b = spawn_mock_relay().await;

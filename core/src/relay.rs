@@ -19,6 +19,10 @@ use tokio::time::Instant;
 use tokio_tungstenite::tungstenite::Message;
 
 const SUB_ID: &str = "ntrack";
+/// Subid prefix for one-shot backfill fetches; the correlation id is appended
+/// (`ntrack-fetch-<corr>`) so a fetch's frames route separately from the live
+/// `SUB_ID` subscription sharing the same socket.
+const FETCH_SUB_PREFIX: &str = "ntrack-fetch-";
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const PING_INTERVAL: Duration = Duration::from_secs(25);
 const STALE_AFTER: Duration = Duration::from_secs(90);
@@ -32,12 +36,21 @@ pub enum PoolEvent {
     Incoming { url: String, event: Box<Event> },
     PublishAck { url: String, event_id: EventId, accepted: bool, message: String },
     Eose { url: String },
+    /// One stored event from an in-flight one-shot backfill fetch, tagged with
+    /// the `corr` correlation id from [`RelayPool::fetch`]. Kept distinct from
+    /// `Incoming` so the engine routes backfill to the matching export without
+    /// going through the live replay-dedup path.
+    FetchEvent { corr: u64, url: String, event: Box<Event> },
+    /// End of stored events for a backfill fetch on one relay.
+    FetchEose { corr: u64, url: String },
 }
 
 #[derive(Debug, Clone)]
 enum RelayCmd {
     Publish(Box<Event>),
     SetSubscription(Option<Box<Filter>>),
+    /// One-shot backfill REQ correlated by `corr` (see [`RelayPool::fetch`]).
+    Fetch { corr: u64, filter: Box<Filter> },
     Shutdown,
 }
 
@@ -126,6 +139,28 @@ impl RelayPool {
             .collect();
         v.sort();
         v
+    }
+
+    /// Dispatch a one-shot backfill REQ (subid `ntrack-fetch-<corr>`) to every
+    /// *currently connected* relay, returning how many it reached so the caller
+    /// knows how many `FetchEose` events to expect. Offline relays are skipped
+    /// (the caller's timeout covers a fetch that never completes); a relay that
+    /// drops between this check and handling the command is absorbed by the
+    /// no-op offline `Fetch` arm.
+    pub fn fetch(&self, corr: u64, filter: Filter) -> usize {
+        let relays = self.relays.lock().unwrap();
+        let boxed = Box::new(filter);
+        let mut sent = 0;
+        for h in relays.values() {
+            if h.connected.load(Ordering::Relaxed)
+                && h.cmd_tx
+                    .send(RelayCmd::Fetch { corr, filter: boxed.clone() })
+                    .is_ok()
+            {
+                sent += 1;
+            }
+        }
+        sent
     }
 
     pub fn shutdown(&self) {
@@ -314,11 +349,27 @@ async fn relay_task(
                             healthy &= send_req(&mut sink, f).await;
                         }
                     }
+                    Some(RelayCmd::Fetch { corr, filter }) => {
+                        // One-shot REQ on its own subid; closed when its EOSE
+                        // arrives (handled below) so it never lingers.
+                        healthy &= send_json(
+                            &mut sink,
+                            &serde_json::json!(["REQ", fetch_subid(corr), filter]),
+                        )
+                        .await;
+                    }
                 },
                 msg = stream.next() => match msg {
                     Some(Ok(Message::Text(text))) => {
                         last_rx = Instant::now();
-                        handle_incoming(&url, text.as_str(), &event_tx);
+                        if let Some(corr) = handle_incoming(&url, text.as_str(), &event_tx) {
+                            // A backfill completed on this relay → close its sub.
+                            healthy &= send_json(
+                                &mut sink,
+                                &serde_json::json!(["CLOSE", fetch_subid(corr)]),
+                            )
+                            .await;
+                        }
                     }
                     Some(Ok(Message::Ping(_) | Message::Pong(_))) => {
                         last_rx = Instant::now();
@@ -371,6 +422,10 @@ fn apply_offline_cmd(
             *sub = f;
             false
         }
+        // One-shot fetches are never queued: while offline we simply drop the
+        // REQ. The engine's fetch timeout covers the missing EOSE, and
+        // re-issuing on reconnect could double-count a completed backfill.
+        RelayCmd::Fetch { .. } => false,
     }
 }
 
@@ -429,58 +484,197 @@ async fn send_event(sink: &mut WsSink, event: &Event) -> bool {
     send_json(sink, &serde_json::json!(["EVENT", event])).await
 }
 
-fn handle_incoming(url: &str, text: &str, event_tx: &mpsc::UnboundedSender<PoolEvent>) {
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
-        log::debug!("relay {url}: unparseable frame");
-        return;
-    };
-    let Some(arr) = value.as_array() else { return };
-    match arr.first().and_then(|v| v.as_str()) {
-        Some("EVENT") => {
-            let Some(ev) = arr.get(2) else { return };
-            match serde_json::from_value::<Event>(ev.clone()) {
-                Ok(event) => {
-                    let _ = event_tx.send(PoolEvent::Incoming {
-                        url: url.to_string(),
-                        event: Box::new(event),
-                    });
-                }
-                Err(e) => log::debug!("relay {url}: bad event: {e}"),
+fn fetch_subid(corr: u64) -> String {
+    format!("{FETCH_SUB_PREFIX}{corr}")
+}
+
+/// Parse a `ntrack-fetch-<corr>` subid back to its correlation id.
+fn parse_fetch_subid(subid: &str) -> Option<u64> {
+    subid.strip_prefix(FETCH_SUB_PREFIX)?.parse().ok()
+}
+
+/// A NIP-01 frame after subid routing. The live subscription (`SUB_ID`) and
+/// one-shot backfill fetches (`ntrack-fetch-<corr>`) share one socket, so
+/// EVENT/EOSE split by subid; OK/NOTICE/CLOSED behave as before.
+#[derive(Debug, PartialEq)]
+enum Frame {
+    Incoming(Box<Event>),
+    Eose,
+    FetchEvent { corr: u64, event: Box<Event> },
+    FetchEose { corr: u64 },
+    Ack { event_id: EventId, accepted: bool, message: String },
+    Notice,
+    Ignore,
+}
+
+/// Pure classifier for an inbound frame's JSON array. Malformed, unparseable
+/// or unknown frames become [`Frame::Ignore`]. This is a strict superset of
+/// the pre-backfill behaviour — the `SUB_ID` live path is untouched.
+fn classify_frame(arr: &[serde_json::Value]) -> Frame {
+    let tag = arr.first().and_then(|v| v.as_str()).unwrap_or_default();
+    let subid = arr.get(1).and_then(|v| v.as_str()).unwrap_or_default();
+    match tag {
+        "EVENT" => {
+            let Some(raw) = arr.get(2) else { return Frame::Ignore };
+            let Ok(event) = serde_json::from_value::<Event>(raw.clone()) else {
+                return Frame::Ignore;
+            };
+            let event = Box::new(event);
+            if subid == SUB_ID {
+                Frame::Incoming(event)
+            } else if let Some(corr) = parse_fetch_subid(subid) {
+                Frame::FetchEvent { corr, event }
+            } else {
+                Frame::Ignore
             }
         }
-        Some("OK") => {
-            let id = arr
+        "EOSE" => {
+            if subid == SUB_ID {
+                Frame::Eose
+            } else if let Some(corr) = parse_fetch_subid(subid) {
+                Frame::FetchEose { corr }
+            } else {
+                Frame::Ignore
+            }
+        }
+        "OK" => {
+            let Some(event_id) = arr
                 .get(1)
                 .and_then(|v| v.as_str())
-                .and_then(|s| EventId::from_hex(s).ok());
+                .and_then(|s| EventId::from_hex(s).ok())
+            else {
+                return Frame::Ignore;
+            };
             let accepted = arr.get(2).and_then(|v| v.as_bool()).unwrap_or(false);
             let message = arr
                 .get(3)
                 .and_then(|v| v.as_str())
                 .unwrap_or_default()
                 .to_string();
-            if let Some(event_id) = id {
-                let _ = event_tx.send(PoolEvent::PublishAck {
-                    url: url.to_string(),
-                    event_id,
-                    accepted,
-                    message,
-                });
-            }
+            Frame::Ack { event_id, accepted, message }
         }
-        Some("EOSE") => {
+        "NOTICE" | "CLOSED" => Frame::Notice,
+        _ => Frame::Ignore,
+    }
+}
+
+/// Parse, classify and route one inbound text frame, emitting the matching
+/// [`PoolEvent`]. Returns `Some(corr)` when a backfill fetch reached EOSE on
+/// this relay, so the caller (which owns the sink) can send its `CLOSE`.
+fn handle_incoming(
+    url: &str,
+    text: &str,
+    event_tx: &mpsc::UnboundedSender<PoolEvent>,
+) -> Option<u64> {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
+        log::debug!("relay {url}: unparseable frame");
+        return None;
+    };
+    let arr = value.as_array()?;
+    match classify_frame(arr) {
+        Frame::Incoming(event) => {
+            let _ = event_tx.send(PoolEvent::Incoming { url: url.to_string(), event });
+            None
+        }
+        Frame::Eose => {
             let _ = event_tx.send(PoolEvent::Eose { url: url.to_string() });
+            None
         }
-        Some("NOTICE") | Some("CLOSED") => {
+        Frame::FetchEvent { corr, event } => {
+            let _ = event_tx.send(PoolEvent::FetchEvent { corr, url: url.to_string(), event });
+            None
+        }
+        Frame::FetchEose { corr } => {
+            let _ = event_tx.send(PoolEvent::FetchEose { corr, url: url.to_string() });
+            Some(corr)
+        }
+        Frame::Ack { event_id, accepted, message } => {
+            let _ = event_tx.send(PoolEvent::PublishAck {
+                url: url.to_string(),
+                event_id,
+                accepted,
+                message,
+            });
+            None
+        }
+        Frame::Notice => {
             log::warn!("relay {url}: {text}");
+            None
         }
-        _ => {}
+        Frame::Ignore => None,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nostr::{EventBuilder, Keys, Kind};
+
+    /// A real signed kind:694 event, for the EVENT-routing cases.
+    fn signed_event() -> Event {
+        let keys = Keys::generate();
+        EventBuilder::new(Kind::Custom(694), "ciphertext")
+            .sign_with_keys(&keys)
+            .unwrap()
+    }
+
+    fn arr(text: &str) -> Vec<serde_json::Value> {
+        serde_json::from_str::<serde_json::Value>(text)
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .clone()
+    }
+
+    #[test]
+    fn classify_routes_by_subid() {
+        // Live subscription EOSE/EVENT keep their existing meaning.
+        assert_eq!(classify_frame(&arr(r#"["EOSE","ntrack"]"#)), Frame::Eose);
+        let ev = signed_event();
+        let live = serde_json::json!(["EVENT", "ntrack", ev]);
+        assert!(matches!(
+            classify_frame(live.as_array().unwrap()),
+            Frame::Incoming(e) if e.id == ev.id
+        ));
+
+        // Backfill subids carry the correlation id.
+        assert_eq!(
+            classify_frame(&arr(r#"["EOSE","ntrack-fetch-7"]"#)),
+            Frame::FetchEose { corr: 7 }
+        );
+        let fetch = serde_json::json!(["EVENT", "ntrack-fetch-42", ev]);
+        assert!(matches!(
+            classify_frame(fetch.as_array().unwrap()),
+            Frame::FetchEvent { corr: 42, event } if event.id == ev.id
+        ));
+
+        // An unknown subid, malformed event, and unknown frame all ignore.
+        assert_eq!(classify_frame(&arr(r#"["EOSE","stranger"]"#)), Frame::Ignore);
+        assert_eq!(
+            classify_frame(&arr(r#"["EVENT","ntrack-fetch-1",{"not":"an event"}]"#)),
+            Frame::Ignore
+        );
+        assert_eq!(classify_frame(&arr(r#"["WAT"]"#)), Frame::Ignore);
+    }
+
+    #[test]
+    fn classify_ok_and_notice_unchanged() {
+        let id = signed_event().id;
+        let ok = serde_json::json!(["OK", id.to_hex(), true, "stored"]);
+        assert_eq!(
+            classify_frame(ok.as_array().unwrap()),
+            Frame::Ack { event_id: id, accepted: true, message: "stored".into() }
+        );
+        assert_eq!(classify_frame(&arr(r#"["NOTICE","hi"]"#)), Frame::Notice);
+        assert_eq!(classify_frame(&arr(r#"["CLOSED","ntrack","x"]"#)), Frame::Notice);
+    }
+
+    #[test]
+    fn fetch_subid_roundtrips() {
+        assert_eq!(parse_fetch_subid(&fetch_subid(13)), Some(13));
+        assert_eq!(parse_fetch_subid("ntrack"), None);
+        assert_eq!(parse_fetch_subid("ntrack-fetch-"), None);
+    }
 
     #[test]
     fn crypto_provider_is_installed_for_tls() {

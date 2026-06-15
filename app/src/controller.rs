@@ -316,6 +316,19 @@ impl Controller {
                 });
                 return; // dialog props set directly; no full render needed
             }
+            UiEvent::TrackExport { suggested_filename, gpx_xml } => {
+                // Hand the GPX to the platform: prefer opening it directly in a
+                // track/maps app, falling back to the system share sheet. The
+                // Android impl hops to the UI thread itself, so doing this from
+                // the tokio worker is fine. No view-state change.
+                self.platform.share_file(
+                    &suggested_filename,
+                    "application/gpx+xml",
+                    gpx_xml.as_bytes(),
+                    true,
+                );
+                return;
+            }
         }
         self.schedule_render();
     }
@@ -496,6 +509,22 @@ impl Controller {
             if let Some(t) = item {
                 let label = if t.label.is_empty() { &t.sender_short } else { &t.label };
                 ctrl.platform.open_map(t.lat, t.lng, label);
+            }
+        });
+
+        hook!(on_export_track, |ctrl, idx: i32| {
+            let item = ctrl
+                .view
+                .lock()
+                .unwrap()
+                .tracks
+                .get(idx.max(0) as usize)
+                .cloned();
+            if let Some(t) = item {
+                let _ = ctrl.cmd_tx.send(EngineCmd::ExportTrack {
+                    sender_hex: t.sender_hex,
+                    group_hex: t.group_hex,
+                });
             }
         });
 
@@ -913,6 +942,7 @@ mod tests {
             ts: created_at,
             created_at,
             msg: String::new(),
+            group_hex: "cd".into(),
         }
     }
 

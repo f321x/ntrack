@@ -98,6 +98,20 @@ Implemented in `protocol::process_incoming`, exercised end-to-end in
 `TEST` broadcasts are always rendered with a distinct **TEST** badge and are
 never displayed like a live share (*"receivers MUST render this as a test"*).
 
+### Export path (track backfill)
+
+`process_for_export` runs the same verify → decrypt → validate body as
+`process_incoming` (steps 1, 2, 4–7) but deliberately **omits the replay
+dedup** (step 3) and never reads or writes `SeenIds`. It exists because
+exporting a track re-fetches `kind:694` events the live path has already
+seen; routing those through `process_incoming` would drop nearly all of them
+as `Duplicate` and churn the bounded replay window. The shared body is
+factored into a private `decrypt_and_validate`, so the live receiver's
+behaviour is unchanged (tests: `process_for_export_decrypts_without_touching_seen`,
+`process_for_export_still_verifies_and_validates`). The one-shot backfill
+filter is `backfill_filter` — `{"kinds":[694], "authors":[<sender>],
+"#p":[<group>], "since":…, "limit":…}`.
+
 ## Subscription
 
 ```json
