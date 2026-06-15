@@ -28,6 +28,9 @@ use crate::{GroupItem, MainWindow, MapMarker, MapTile, RelayItem, TrackItem};
 
 /// Publish interval choices shown in the UI, in seconds.
 pub const INTERVALS: [u64; 4] = [15, 30, 60, 300];
+/// Check-in (dead-man's switch) duration choices on the Share screen, in
+/// seconds. Index-aligned with the combo box in `app.slint`.
+pub const CHECKIN_OPTIONS: [u64; 4] = [300, 900, 1800, 3600];
 /// Index of the Groups page in the bottom tab bar (Share, Track, Groups,
 /// Settings). An incoming invite switches here to pre-fill the import form.
 const GROUPS_PAGE: i32 = 2;
@@ -48,6 +51,10 @@ enum Confirm {
 #[derive(Clone)]
 enum AfterPermission {
     StartShare { msg: String },
+    /// One-tap panic deferred until location permission is granted, so the
+    /// engine's share-start isn't immediately torn down by a permission-denied
+    /// report from `start_location` racing the permission dialog.
+    Panic,
 }
 
 #[derive(Default)]
@@ -152,6 +159,9 @@ impl Controller {
                             let _ = self.cmd_tx.send(EngineCmd::StartShare {
                                 msg: Some(msg).filter(|m| !m.trim().is_empty()),
                             });
+                        }
+                        Some(AfterPermission::Panic) => {
+                            let _ = self.cmd_tx.send(EngineCmd::Panic);
                         }
                         None => {}
                     }
@@ -287,6 +297,20 @@ impl Controller {
                     self.platform.stop_location();
                 }
             }
+            UiEvent::SetLocationInterval(ms) => {
+                // A duress alert boosting/relaxing the cadence: restart the
+                // running location session at the new interval.
+                let active = self.view.lock().unwrap().location_active;
+                if active {
+                    self.platform.stop_location();
+                    self.platform.start_location(ms);
+                }
+                return; // no view-state change
+            }
+            UiEvent::Notify { title, body, .. } => {
+                self.platform.notify_alert(&title, &body);
+                return; // fire-and-forget; no view-state change
+            }
             UiEvent::GroupShare(share) => {
                 // The shared artifact is a self-describing invite URI carrying
                 // the group name alongside the key, so the recipient never has
@@ -403,6 +427,20 @@ impl Controller {
         ui.set_status_headline(headline.into());
         ui.set_status_detail(detail.into());
 
+        // ---- duress alert + check-in (dead-man's switch) ----
+        ui.set_alert(share.alert);
+        let (checkin_armed, checkin_grace, checkin_countdown) = match share.checkin_deadline {
+            Some(deadline) => (
+                true,
+                share.checkin_grace,
+                fmt_countdown(deadline.saturating_sub(now_secs())),
+            ),
+            None => (false, false, String::new()),
+        };
+        ui.set_checkin_armed(checkin_armed);
+        ui.set_checkin_grace(checkin_grace);
+        ui.set_checkin_countdown(checkin_countdown.into());
+
         let tracks: Vec<TrackItem> = view
             .tracks
             .iter()
@@ -434,6 +472,7 @@ impl Controller {
                     color: slint::Color::from_rgb_u8(r, g, b),
                     live,
                     has_coords,
+                    alert: t.alert,
                 }
             })
             .collect();
@@ -658,6 +697,24 @@ impl Controller {
             let _ = ctrl.cmd_tx.send(EngineCmd::StopShare);
         });
 
+        // ---- duress alert / panic / check-in ----
+        hook!(on_panic, |ctrl| {
+            ctrl.trigger_panic();
+        });
+        hook!(on_clear_alert, |ctrl| {
+            let _ = ctrl.cmd_tx.send(EngineCmd::SetAlert(false));
+        });
+        hook!(on_arm_checkin, |ctrl, idx: i32| {
+            let secs = CHECKIN_OPTIONS
+                .get(idx.max(0) as usize)
+                .copied()
+                .unwrap_or(900);
+            let _ = ctrl.cmd_tx.send(EngineCmd::ArmCheckin { secs });
+        });
+        hook!(on_checkin_safe, |ctrl| {
+            let _ = ctrl.cmd_tx.send(EngineCmd::Checkin);
+        });
+
         hook!(on_set_interval, |ctrl, idx: i32| {
             let secs = INTERVALS
                 .get(idx.max(0) as usize)
@@ -865,6 +922,20 @@ impl Controller {
         let _ = self.cmd_tx.send(EngineCmd::Mutate(Box::new(f)));
     }
 
+    /// One-tap panic: raise the alert and force-start a share to the emergency
+    /// audience. With permission in hand we fire immediately; otherwise we
+    /// request it and defer the panic to the grant (so a permission-denied
+    /// report from `start_location` can't tear the just-started share down
+    /// before the dialog resolves).
+    fn trigger_panic(self: &Arc<Self>) {
+        if self.platform.has_location_permission() {
+            let _ = self.cmd_tx.send(EngineCmd::Panic);
+        } else {
+            self.view.lock().unwrap().after_permission = Some(AfterPermission::Panic);
+            self.platform.request_location_permission();
+        }
+    }
+
     fn start_share(self: &Arc<Self>, msg: String) {
         // Refuse early when no group is selected so we don't pointlessly
         // prompt for permissions (engine re-checks anyway).
@@ -1032,6 +1103,17 @@ fn ago_string(ts: u64, created_at: u64) -> slint::SharedString {
     s.into()
 }
 
+/// A check-in countdown, "M:SS" (or "H:MM:SS" past an hour), re-rendered each
+/// second by the UI timer.
+fn fmt_countdown(secs: u64) -> String {
+    let (h, m, s) = (secs / 3600, (secs % 3600) / 60, secs % 60);
+    if h > 0 {
+        format!("{h}:{m:02}:{s:02}")
+    } else {
+        format!("{m}:{s:02}")
+    }
+}
+
 /// Whether an ACTIVE share whose last event arrived at `created_at` (unix
 /// seconds) has been silent long enough to no longer count as live.
 fn share_timed_out(created_at: u64) -> bool {
@@ -1163,6 +1245,7 @@ mod tests {
             group_name: "G".into(),
             status,
             live: status == Status::Active,
+            alert: false,
             lat: 1.0,
             lng: 2.0,
             ts: created_at,
@@ -1213,6 +1296,7 @@ mod tests {
             publish_count: 0,
             last_acked: false,
             waiting_for_fix: false,
+            ..Default::default()
         };
         let (h, d) = share_status_strings(&s, 2, 3);
         assert_eq!(h, "Not sharing");
@@ -1224,6 +1308,7 @@ mod tests {
             publish_count: 7,
             last_acked: true,
             waiting_for_fix: false,
+            ..Default::default()
         };
         let (h, d) = share_status_strings(&s, 3, 3);
         assert_eq!(h, "Sharing live location");

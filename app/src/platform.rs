@@ -28,6 +28,11 @@ pub trait Platform: Send + Sync + 'static {
     fn start_location(&self, interval_ms: u64);
     fn stop_location(&self);
     fn open_map(&self, lat: f64, lng: f64, label: &str);
+    /// Raise a high-urgency notification the user should see even when the app
+    /// is backgrounded (sound/vibration, bypassing Do-Not-Disturb where the OS
+    /// allows): an incoming peer alert, or a check-in grace/escalation. Tapping
+    /// it opens the app. Fire-and-forget.
+    fn notify_alert(&self, title: &str, body: &str);
     fn copy_text(&self, text: &str);
     /// Read the current clipboard text (empty string if the clipboard is empty
     /// or unreadable). Called synchronously from the UI thread to fill the

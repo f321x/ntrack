@@ -67,6 +67,7 @@ start with) and only requires that *its own* entry decrypts.
 | `ts`     | unix seconds    | location capture time; same rules as `lat`/`lng`   |
 | `msg`    | string, optional| MUST be omitted for STOP                           |
 | `name`   | string, optional| sender display name (see below)                    |
+| `alert`  | unix seconds, optional | duress-alert marker (see below); MUST be omitted for STOP |
 
 A minimal STOP payload is exactly `{"status":"STOP"}` (test:
 `stop_payload_serializes_minimal`). Unknown *fields* are tolerated on
@@ -96,6 +97,34 @@ Tests: `name_roundtrips_through_the_payload`, `with_name_trims_and_drops_blank`
 `outgoing_active_omits_blank_name` (engine);
 `derived_name_is_deterministic_and_well_formed`,
 `display_color_is_deterministic_and_visible` (keys).
+
+### Duress alert (`alert`)
+
+`alert` escalates an ACTIVE broadcast into a duress alert. Its value is the
+unix-seconds time the sender raised it; mere presence is the signal, and the
+timestamp lets receivers show how long it has been up.
+
+* It is **sticky / level-triggered**: the sender stamps it on *every* ACTIVE
+  while the alert is up — re-broadcast every cycle even without a fresh fix — so
+  any single broadcast that reaches a receiver re-asserts the alert, surviving
+  dropped relays. It MUST be omitted from STOP, which clears the alert (STOP
+  stays minimal).
+* Receivers escalate on the no-alert→alert *edge* (one high-urgency
+  notification per transition, never one per heartbeat) and pin the sender's
+  track to the top, styled as an alert.
+* Receivers predating the field ignore it (forward compatibility, like any
+  unknown field) and just show a normal live track — an un-updated peer still
+  sees the location, never a dropped event. This is the reason the alert is an
+  additive field and **not** a new `status` value, which older receivers would
+  drop (`unknown_status_is_dropped`).
+
+Tests: `alert_roundtrips_and_is_omitted_on_stop` (protocol);
+`raising_alert_publishes_immediately_marked_and_boosts_cadence`,
+`alert_heartbeat_rebroadcasts_a_stale_fix`,
+`clearing_alert_drops_the_marker_and_relaxes_cadence`,
+`incoming_alert_notifies_once_and_pins_the_track`,
+`alerting_track_pins_above_a_newer_normal_track`,
+`panic_force_starts_share_and_alerts` (engine).
 
 ## Receiver pipeline
 
@@ -164,5 +193,17 @@ overlap harmless. (Test: `subscription_filter_shape`.)
 * Stopping a share (including when location becomes unavailable, and on
   app shutdown, best effort) publishes a `STOP` so receivers don't show a
   stale live state.
+* A **duress alert** — raised from the Share screen, or by a one-tap panic that
+  force-starts the share first — marks each `ACTIVE` with `alert` and overrides
+  the configured interval with a fast fixed cadence (15 s), re-broadcasting the
+  last-known fix every cycle even if the GPS has stalled: being found quickly
+  outweighs battery in an emergency. Raising or clearing it re-publishes
+  immediately so the change reaches the group without waiting for the next tick.
+* A **check-in** (dead-man's switch) is a local timer, not a wire concept: if
+  the user doesn't confirm safety before it elapses, ntrack escalates to the
+  same alert+share. It is persisted, so a deadline that lapses while the app is
+  down is re-evaluated at startup — granting a brief grace window (with a
+  notification) before firing, rather than a false alarm on a phone that merely
+  ran out of battery.
 * ntrack originates only `ACTIVE` and `STOP` events. The first `ACTIVE` goes
   out as soon as sharing starts.

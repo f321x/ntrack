@@ -32,6 +32,20 @@ pub const SINCE_LOOKBACK_SECS: u64 = EXPIRATION_SECS;
 pub const SEEN_CAPACITY: usize = 4096;
 /// Cap on a sender-declared display name once cleaned for display.
 const MAX_NAME_CHARS: usize = 48;
+/// Location cadence (seconds) forced while a duress alert is active, overriding
+/// the configured battery-saving interval: in an emergency, being found fast
+/// outweighs battery. A deliberate exception to "never sample faster than the
+/// configured interval".
+pub const ALERT_INTERVAL_SECS: u64 = 15;
+/// Grace window (seconds) granted at startup when a check-in deadline already
+/// elapsed while the app/device was down. Rather than escalate instantly (the
+/// battery may simply have died and the phone was just plugged in), the user
+/// gets this long to confirm they're safe — prompted by a notification — before
+/// the alert fires.
+pub const STARTUP_GRACE_SECS: u64 = 60;
+/// How long before a check-in deadline to nudge the user once with a reminder
+/// (only when the armed period comfortably exceeds it).
+const CHECKIN_REMINDER_LEAD_SECS: u64 = 120;
 
 // ---- track-history retention (for GPX export) --------------------------
 //
@@ -79,6 +93,24 @@ pub enum EngineCmd {
     ResumeShareIfArmed,
     /// Update the message attached to subsequent location publishes.
     SetMessage(Option<String>),
+    /// Raise (true) or clear (false) the duress alert on the live share.
+    /// Raising re-broadcasts at once, marks every ACTIVE as an alert and boosts
+    /// the location cadence; clearing reverts. No-op without an active share.
+    SetAlert(bool),
+    /// One-tap panic: force-start a share to the emergency audience (the
+    /// selected groups, or — if none are selected — every group) AND raise the
+    /// alert. If already sharing, just raises the alert.
+    Panic,
+    /// Arm a dead-man's-switch check-in: escalate to [`Panic`](Self::Panic)
+    /// unless the user confirms safety within `secs`.
+    ArmCheckin { secs: u64 },
+    /// Confirm safety: disarm any armed check-in (live countdown or the
+    /// post-startup grace window).
+    Checkin,
+    /// Evaluate a persisted check-in at startup (driven by `run`/the boot path,
+    /// exposed for tests): resume its countdown, or — if its deadline elapsed
+    /// while the app was down — open a grace window and notify rather than fire.
+    EvaluateCheckinOnStart,
     StopShare,
     Location(LocationSample),
     /// Permission was denied or location turned off by the platform.
@@ -133,6 +165,15 @@ pub struct ShareSnapshot {
     /// At least one relay acknowledged the latest event.
     pub last_acked: bool,
     pub waiting_for_fix: bool,
+    /// A duress alert is currently raised on the live share.
+    pub alert: bool,
+    /// Unix-seconds deadline of an armed check-in (a live countdown, or the
+    /// startup grace window), for the UI countdown. `None` when none is armed.
+    pub checkin_deadline: Option<u64>,
+    /// The armed check-in is in the post-startup grace window (its deadline
+    /// elapsed while the app was down) — the UI shows a "confirm you're safe"
+    /// prompt rather than an ordinary countdown.
+    pub checkin_grace: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -149,6 +190,9 @@ pub struct TrackSnapshot {
     pub group_name: String,
     pub status: Status,
     pub live: bool,
+    /// This sender is broadcasting a duress alert (their latest ACTIVE carried
+    /// the alert marker). Drives the escalated card styling and pins the track.
+    pub alert: bool,
     pub lat: f64,
     pub lng: f64,
     /// Location capture time (unix seconds); 0 when unknown (bare STOP).
@@ -172,6 +216,20 @@ pub struct GroupShare {
     pub relays: Vec<String>,
 }
 
+/// Category of a [`UiEvent::Notify`], so the platform can pick the right
+/// notification channel / urgency.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotifyKind {
+    /// A group member raised a duress alert.
+    PeerAlert,
+    /// A check-in deadline elapsed while the app was down — confirm safety soon.
+    CheckinGrace,
+    /// A check-in deadline is approaching (one-shot pre-escalation reminder).
+    CheckinReminder,
+    /// A check-in lapsed and escalated to sharing + alert.
+    CheckinEscalated,
+}
+
 #[derive(Debug, Clone)]
 pub enum UiEvent {
     Config(ConfigSnapshot),
@@ -184,6 +242,14 @@ pub enum UiEvent {
     TrackExport { suggested_filename: String, gpx_xml: String },
     /// Platform layer should start (true) / stop (false) location updates.
     NeedLocation(bool),
+    /// Platform layer should change the GPS sampling cadence (milliseconds) of
+    /// the *running* location session — emitted when a duress alert boosts or
+    /// relaxes the interval. Only sent while a share is active.
+    SetLocationInterval(u64),
+    /// A high-urgency notification the platform should surface even when the app
+    /// is backgrounded (sound/vibration, bypassing Do-Not-Disturb where
+    /// allowed): an incoming peer alert, or a check-in grace/reminder/escalation.
+    Notify { kind: NotifyKind, title: String, body: String },
     Toast(String),
 }
 
@@ -191,6 +257,11 @@ struct ShareState {
     sender: Keys,
     recipients: Vec<PublicKey>,
     msg: Option<String>,
+    /// Unix-seconds the duress alert was raised on this share; `None` when not
+    /// alerting. While set, the publish cadence is forced to
+    /// [`ALERT_INTERVAL_SECS`] and every ACTIVE carries the alert marker (and is
+    /// re-broadcast even without a fresh fix).
+    alert_since: Option<u64>,
     last_publish_at: Option<tokio::time::Instant>,
     last_sample: Option<LocationSample>,
     /// Whether `last_sample` has already been broadcast. Guards the tick
@@ -273,6 +344,19 @@ impl TrackHistory {
     }
 }
 
+/// Dead-man's-switch state. Escalates to a [`Panic`](EngineCmd::Panic) unless
+/// the user confirms safety in time.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum CheckinState {
+    /// A live countdown to `deadline` (unix seconds). `period_secs` is the armed
+    /// span (retained for display); `reminded` guards the one-shot reminder.
+    Armed { deadline: u64, period_secs: u64, reminded: bool },
+    /// A deadline that elapsed while the app/device was down, detected at
+    /// startup. The user has until `until` (unix seconds) to confirm safety —
+    /// the notification was already posted — before escalating.
+    StartupGrace { until: u64 },
+}
+
 /// An in-flight export: a one-shot relay backfill whose results merge with the
 /// live history seed once every reached relay EOSEs (or the timeout fires).
 struct PendingExport {
@@ -295,6 +379,9 @@ pub struct Engine<P: EnginePool> {
     seen: SeenIds,
     seen_dirty: bool,
     share: Option<ShareState>,
+    /// Armed dead-man's-switch, if any. Independent of an active share — a
+    /// check-in can be armed without sharing, and escalates into one.
+    checkin: Option<CheckinState>,
     /// keyed by (sender hex, group hex)
     tracks: BTreeMap<(String, String), TrackState>,
     /// Bounded per-session point history for export, keyed identically to
@@ -330,6 +417,7 @@ impl<P: EnginePool> Engine<P> {
             seen,
             seen_dirty: false,
             share: None,
+            checkin: None,
             tracks: BTreeMap::new(),
             history: BTreeMap::new(),
             pending_exports: BTreeMap::new(),
@@ -344,6 +432,9 @@ impl<P: EnginePool> Engine<P> {
         self.emit_config();
         self.emit_share();
         self.emit_tracks();
+        // Evaluate any persisted check-in: resume its countdown, or — if it
+        // lapsed while we were down — open a grace window and notify.
+        self.handle(EngineCmd::EvaluateCheckinOnStart);
 
         let mut tick = tokio::time::interval(Duration::from_secs(1));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -383,7 +474,16 @@ impl<P: EnginePool> Engine<P> {
             EngineCmd::ResumeShareIfArmed => {
                 if self.config.resume_share && self.share.is_none() {
                     let msg = self.config.resume_msg.clone();
-                    self.start_share(msg);
+                    // Restore the alert too, so a reboot mid-emergency resumes
+                    // alerting rather than a plain share.
+                    let alert_since = self.config.alert_active.then(now_secs);
+                    let recipients = self.selected_recipients();
+                    if recipients.is_empty() {
+                        self.toast("Select at least one group to share with".into());
+                        self.emit_share();
+                    } else {
+                        self.begin_share(recipients, msg, alert_since);
+                    }
                 }
             }
             EngineCmd::SetMessage(msg) => {
@@ -391,10 +491,21 @@ impl<P: EnginePool> Engine<P> {
                     s.msg = msg.filter(|m| !m.trim().is_empty());
                 }
             }
+            EngineCmd::SetAlert(on) => self.set_alert(on),
+            EngineCmd::Panic => self.trigger_panic(),
+            EngineCmd::ArmCheckin { secs } => self.arm_checkin(secs),
+            EngineCmd::Checkin => {
+                let was_armed = self.checkin.is_some();
+                self.disarm_checkin();
+                if was_armed {
+                    self.toast("Checked in — you're safe".into());
+                }
+            }
+            EngineCmd::EvaluateCheckinOnStart => self.evaluate_checkin_on_start(),
             EngineCmd::StopShare => {
-                // An explicit user stop disarms boot-resume; a process-death
-                // STOP (run()'s shutdown tail) goes through stop_share()
-                // directly and deliberately leaves the flag armed.
+                // An explicit user stop disarms boot-resume (and the alert); a
+                // process-death STOP (run()'s shutdown tail) goes through
+                // stop_share() directly and deliberately leaves the flag armed.
                 self.disarm_resume();
                 self.stop_share();
             }
@@ -467,13 +578,59 @@ impl<P: EnginePool> Engine<P> {
     }
 
     fn start_share(&mut self, msg: Option<String>) {
-        if self.share.is_some() {
-            return;
-        }
         let recipients = self.selected_recipients();
         if recipients.is_empty() {
             self.toast("Select at least one group to share with".into());
             self.emit_share();
+            return;
+        }
+        self.begin_share(recipients, msg, None);
+    }
+
+    /// One-tap panic: force-start a share to the emergency audience and raise
+    /// the duress alert. If already sharing, just raises the alert.
+    fn trigger_panic(&mut self) {
+        if self.share.is_some() {
+            self.set_alert(true);
+            return;
+        }
+        let recipients = self.emergency_recipients();
+        if recipients.is_empty() {
+            self.toast("Add a group before raising an alert".into());
+            return;
+        }
+        self.begin_share(recipients, None, Some(now_secs()));
+    }
+
+    /// Recipients an alert/panic broadcasts to: the groups selected for sharing,
+    /// or — if none are selected — every group, so a panic never silently
+    /// no-ops just because nothing was ticked on the Share screen.
+    fn emergency_recipients(&self) -> Vec<PublicKey> {
+        let selected = self.selected_recipients();
+        if !selected.is_empty() {
+            return selected;
+        }
+        self.config
+            .groups
+            .iter()
+            .filter_map(|g| g.public_key().ok())
+            .collect()
+    }
+
+    /// Shared share-start: validate the sender key, arm boot-resume (with the
+    /// alert state, if any), install the share, and ask the platform for
+    /// location at the effective cadence. `alert_since` set → start alerting.
+    fn begin_share(
+        &mut self,
+        recipients: Vec<PublicKey>,
+        msg: Option<String>,
+        alert_since: Option<u64>,
+    ) {
+        if self.share.is_some() {
+            // Already sharing: at most fold the alert into the running share.
+            if alert_since.is_some() {
+                self.set_alert(true);
+            }
             return;
         }
         let sender = match self.config.sender_keys() {
@@ -484,15 +641,18 @@ impl<P: EnginePool> Engine<P> {
             }
         };
         let msg = msg.filter(|m| !m.trim().is_empty());
-        // Arm boot-resume: persisted so a reboot/crash while sharing can offer
-        // to continue. Cleared only on an explicit stop (see disarm_resume).
+        // Arm boot-resume: persisted so a reboot/crash while sharing can
+        // continue. The alert rides along so an emergency resumes as one.
+        // Cleared only on an explicit stop / permission loss (see disarm_resume).
         self.config.resume_share = true;
         self.config.resume_msg = msg.clone();
+        self.config.alert_active = alert_since.is_some();
         self.persist();
         self.share = Some(ShareState {
             sender,
             recipients,
             msg,
+            alert_since,
             last_publish_at: None,
             last_sample: None,
             last_sample_published: false,
@@ -502,16 +662,75 @@ impl<P: EnginePool> Engine<P> {
             last_acked: false,
         });
         let _ = self.ui_tx.send(UiEvent::NeedLocation(true));
+        // A panic starts already alerting, so push the boosted cadence down to
+        // the just-started location session (NeedLocation alone starts it at the
+        // configured interval).
+        if alert_since.is_some() {
+            let _ = self
+                .ui_tx
+                .send(UiEvent::SetLocationInterval(self.effective_interval_secs() * 1000));
+        }
         self.emit_share();
     }
 
-    /// Clear the persisted boot-resume flag (and its sentinel). Called on an
-    /// explicit user stop or a permission/GPS loss — never on the best-effort
-    /// shutdown STOP, which must leave resume armed.
+    /// Raise (true) or clear (false) the duress alert on the live share:
+    /// re-broadcast the current fix at once, persist the alert (so a reboot
+    /// resumes it) and boost/relax the location cadence. No-op without a share.
+    fn set_alert(&mut self, on: bool) {
+        let Some(share) = &mut self.share else {
+            if on {
+                self.toast("Start sharing to raise an alert".into());
+            }
+            return;
+        };
+        if on == share.alert_since.is_some() {
+            return; // already in the requested state
+        }
+        share.alert_since = on.then(now_secs);
+        let sample = share.last_sample;
+        self.config.alert_active = on;
+        self.persist();
+        // Re-broadcast immediately so the change reaches the group without
+        // waiting for the next interval.
+        if let Some(sample) = sample {
+            self.publish_active(sample);
+        }
+        // Boost / relax the GPS cadence of the running location session.
+        let _ = self
+            .ui_tx
+            .send(UiEvent::SetLocationInterval(self.effective_interval_secs() * 1000));
+        self.emit_share();
+        self.toast(if on {
+            "Alert raised — your group is being notified".into()
+        } else {
+            "Alert cleared".into()
+        });
+    }
+
+    /// The location cadence (seconds) that currently governs both publishing and
+    /// GPS sampling: the fast [`ALERT_INTERVAL_SECS`] while alerting, otherwise
+    /// the configured interval (floored at 5 s).
+    fn effective_interval_secs(&self) -> u64 {
+        let alerting = self
+            .share
+            .as_ref()
+            .map(|s| s.alert_since.is_some())
+            .unwrap_or(false);
+        if alerting {
+            ALERT_INTERVAL_SECS
+        } else {
+            self.config.interval_secs.max(5)
+        }
+    }
+
+    /// Clear the persisted boot-resume flag, its message and the alert (and the
+    /// sentinel). Called on an explicit user stop or a permission/GPS loss —
+    /// never on the best-effort shutdown STOP, which must leave resume armed.
     fn disarm_resume(&mut self) {
-        if self.config.resume_share || self.config.resume_msg.is_some() {
+        if self.config.resume_share || self.config.resume_msg.is_some() || self.config.alert_active {
             self.config.resume_share = false;
             self.config.resume_msg = None;
+            self.config.alert_active = false;
             self.persist();
         }
     }
@@ -533,7 +752,7 @@ impl<P: EnginePool> Engine<P> {
     }
 
     fn on_location(&mut self, sample: LocationSample) {
-        let interval = Duration::from_secs(self.config.interval_secs.max(5));
+        let interval = Duration::from_secs(self.effective_interval_secs());
         let due = match &self.share {
             Some(s) => match s.last_publish_at {
                 None => true,
@@ -553,18 +772,21 @@ impl<P: EnginePool> Engine<P> {
     }
 
     fn on_tick(&mut self) {
-        let interval = Duration::from_secs(self.config.interval_secs.max(5));
+        let interval = Duration::from_secs(self.effective_interval_secs());
         // The tick only catches up a fix that arrived off-cycle (before its
         // interval elapsed); fresh fixes are published on arrival in
-        // `on_location`. An already-published position is never re-sent —
-        // when the GPS stalls we go quiet rather than re-broadcasting a stale
-        // point, saving the radio and bandwidth.
+        // `on_location`. Normally an already-published position is never re-sent
+        // — when the GPS stalls we go quiet rather than re-broadcasting a stale
+        // point, saving the radio and bandwidth. While alerting we make the
+        // opposite trade: re-broadcast even an already-sent fix so receivers
+        // keep getting "still in danger" heartbeats and the last-known point.
         let due_sample = self.share.as_ref().and_then(|s| {
             let due = match s.last_publish_at {
                 None => true,
                 Some(at) => at.elapsed() >= interval,
             };
-            if due && !s.last_sample_published {
+            let alerting = s.alert_since.is_some();
+            if due && (alerting || !s.last_sample_published) {
                 s.last_sample
             } else {
                 None
@@ -573,6 +795,7 @@ impl<P: EnginePool> Engine<P> {
         if let Some(sample) = due_sample {
             self.publish_active(sample);
         }
+        self.tick_checkin();
         // Ship any export whose backfill window elapsed (live seed + whatever
         // backfill arrived) — this is the only thing that completes an export
         // when a relay is unreachable and never sends its EOSE.
@@ -589,10 +812,15 @@ impl<P: EnginePool> Engine<P> {
     }
 
     fn publish_active(&mut self, sample: LocationSample) {
-        let msg = self.share.as_ref().and_then(|s| s.msg.clone());
+        let (msg, alert) = match &self.share {
+            Some(s) => (s.msg.clone(), s.alert_since),
+            None => (None, None),
+        };
         let name = self.outgoing_name();
         self.publish_payload(
-            Payload::active(sample.lat, sample.lng, sample.ts_secs(), msg).with_name(name),
+            Payload::active(sample.lat, sample.lng, sample.ts_secs(), msg)
+                .with_name(name)
+                .with_alert(alert),
         );
     }
 
@@ -636,6 +864,126 @@ impl<P: EnginePool> Engine<P> {
 
     fn expiration(&self) -> Option<u64> {
         self.config.use_expiration.then_some(EXPIRATION_SECS)
+    }
+
+    // ---- check-in (dead-man's switch) ----------------------------------
+
+    /// Arm (or re-arm) a check-in that escalates to a panic unless confirmed
+    /// within `secs`. Persisted (plus a boot sentinel) so it survives a reboot.
+    fn arm_checkin(&mut self, secs: u64) {
+        let secs = secs.max(1);
+        let deadline = now_secs() + secs;
+        self.checkin = Some(CheckinState::Armed { deadline, period_secs: secs, reminded: false });
+        self.config.checkin_deadline = Some(deadline);
+        self.config.checkin_period_secs = Some(secs);
+        self.persist();
+        self.store.set_checkin_flag(true);
+        self.toast(format!("Check-in armed — confirm within {}", fmt_duration(secs)));
+        self.emit_share();
+    }
+
+    /// Disarm any check-in (a confirmed "I'm safe", or after an escalation
+    /// fired) and clear its persisted state and boot sentinel.
+    fn disarm_checkin(&mut self) {
+        let had_state = self.checkin.is_some()
+            || self.config.checkin_deadline.is_some()
+            || self.config.checkin_period_secs.is_some();
+        if !had_state {
+            return;
+        }
+        self.checkin = None;
+        self.config.checkin_deadline = None;
+        self.config.checkin_period_secs = None;
+        self.persist();
+        self.store.set_checkin_flag(false);
+        self.emit_share();
+    }
+
+    /// Evaluate a persisted check-in at startup. A deadline still in the future
+    /// resumes its countdown; one that elapsed while the app/device was down
+    /// opens a brief grace window (and posts a notification) rather than firing
+    /// at once — a phone whose battery died and was just plugged in shouldn't
+    /// trip a false alarm. The persisted deadline is left untouched in the grace
+    /// case, so a second kill before the user confirms re-grants a fresh grace.
+    fn evaluate_checkin_on_start(&mut self) {
+        let Some(deadline) = self.config.checkin_deadline else {
+            return;
+        };
+        let period = self.config.checkin_period_secs.unwrap_or(0);
+        let now = now_secs();
+        if now < deadline {
+            self.checkin =
+                Some(CheckinState::Armed { deadline, period_secs: period, reminded: false });
+        } else {
+            let until = now + STARTUP_GRACE_SECS;
+            self.checkin = Some(CheckinState::StartupGrace { until });
+            self.notify(
+                NotifyKind::CheckinGrace,
+                "Check-in lapsed while you were away".into(),
+                format!(
+                    "Open ntrack and tap \"I'm safe\" within {}, or an alert will be sent to your groups.",
+                    fmt_duration(STARTUP_GRACE_SECS)
+                ),
+            );
+        }
+        self.emit_share();
+    }
+
+    /// Per-tick check-in driver: nudge once before the deadline, then escalate
+    /// to a panic once the deadline (or startup grace window) elapses.
+    fn tick_checkin(&mut self) {
+        enum Action {
+            None,
+            Remind,
+            Escalate,
+        }
+        let now = now_secs();
+        let action = match &mut self.checkin {
+            Some(CheckinState::Armed { deadline, period_secs, reminded }) => {
+                if now >= *deadline {
+                    Action::Escalate
+                } else if !*reminded
+                    && *period_secs > CHECKIN_REMINDER_LEAD_SECS
+                    && now >= deadline.saturating_sub(CHECKIN_REMINDER_LEAD_SECS)
+                {
+                    *reminded = true;
+                    Action::Remind
+                } else {
+                    Action::None
+                }
+            }
+            Some(CheckinState::StartupGrace { until }) => {
+                if now >= *until {
+                    Action::Escalate
+                } else {
+                    Action::None
+                }
+            }
+            None => Action::None,
+        };
+        match action {
+            Action::None => {}
+            Action::Remind => self.notify(
+                NotifyKind::CheckinReminder,
+                "Check-in due soon".into(),
+                "Open ntrack and confirm you're safe, or an alert will be sent.".into(),
+            ),
+            Action::Escalate => {
+                // Clear the check-in first so the escalation's share-start isn't
+                // immediately re-evaluated, then raise the alert.
+                self.disarm_checkin();
+                self.notify(
+                    NotifyKind::CheckinEscalated,
+                    "Check-in missed — alert sent".into(),
+                    "You didn't check in, so ntrack started sharing and raised an alert.".into(),
+                );
+                self.trigger_panic();
+            }
+        }
+    }
+
+    fn notify(&self, kind: NotifyKind, title: String, body: String) {
+        let _ = self.ui_tx.send(UiEvent::Notify { kind, title, body });
     }
 
     // ---- track path ----------------------------------------------------
@@ -720,6 +1068,13 @@ impl<P: EnginePool> Engine<P> {
             Status::Stop => prev.and_then(|p| p.last_name.clone()),
             _ => sanitize_name(inc.payload.name.as_deref()),
         };
+        // Escalate only on the no-alert → alert edge (per sender), so a sticky
+        // alert re-asserted on every heartbeat fires one loud notification, not
+        // one per broadcast. STOP carries no alert, so it never triggers.
+        let was_alerting = prev.map(|p| p.payload.alert.is_some()).unwrap_or(false);
+        let alert_edge = inc.payload.alert.is_some() && !was_alerting;
+        let alert_name =
+            alert_edge.then(|| self.incoming_display_name(&inc, last_name.as_deref()));
         self.tracks.insert(
             key,
             TrackState {
@@ -731,6 +1086,28 @@ impl<P: EnginePool> Engine<P> {
             },
         );
         self.emit_tracks();
+        if let Some(name) = alert_name {
+            self.notify(
+                NotifyKind::PeerAlert,
+                format!("⚠ Alert from {name}"),
+                "A group member raised an alert. Tap to see their live location.".into(),
+            );
+        }
+    }
+
+    /// Effective display name for an incoming sender, for a notification: the
+    /// receiver's own label, else the name they broadcast this session, else a
+    /// key-derived handle. Mirrors the Track-card title logic.
+    fn incoming_display_name(&self, inc: &protocol::Incoming, last_name: Option<&str>) -> String {
+        if let Some(l) = self.config.label_for(&inc.sender.to_hex()) {
+            if !l.is_empty() {
+                return l.to_string();
+            }
+        }
+        if let Some(name) = last_name {
+            return name.to_string();
+        }
+        keys::derive_name(&inc.sender)
     }
 
     // ---- track history & export -----------------------------------------
@@ -967,17 +1344,30 @@ impl<P: EnginePool> Engine<P> {
     }
 
     fn emit_share(&self) {
-        let snap = match &self.share {
+        let base = match &self.share {
             Some(s) => ShareSnapshot {
                 sharing: true,
                 last_publish: s.last_publish_ts,
                 publish_count: s.publish_count,
                 last_acked: s.last_acked,
                 waiting_for_fix: s.last_sample.is_none(),
+                alert: s.alert_since.is_some(),
+                ..Default::default()
             },
             None => ShareSnapshot::default(),
         };
-        let _ = self.ui_tx.send(UiEvent::Share(snap));
+        // The check-in is independent of an active share, so it's always folded
+        // into the snapshot.
+        let (checkin_deadline, checkin_grace) = match &self.checkin {
+            Some(CheckinState::Armed { deadline, .. }) => (Some(*deadline), false),
+            Some(CheckinState::StartupGrace { until }) => (Some(*until), true),
+            None => (None, false),
+        };
+        let _ = self.ui_tx.send(UiEvent::Share(ShareSnapshot {
+            checkin_deadline,
+            checkin_grace,
+            ..base
+        }));
     }
 
     fn emit_tracks(&self) {
@@ -1024,6 +1414,7 @@ impl<P: EnginePool> Engine<P> {
                 group_name,
                 status: t.payload.status,
                 live: t.payload.status == Status::Active,
+                alert: t.payload.alert.is_some(),
                 lat,
                 lng,
                 ts,
@@ -1032,8 +1423,8 @@ impl<P: EnginePool> Engine<P> {
                 group_hex: group_hex.clone(),
             });
         }
-        // Most recently updated first.
-        out.sort_by_key(|t| std::cmp::Reverse(t.created_at));
+        // Alerting senders pinned to the top, then most-recently-updated first.
+        out.sort_by_key(|t| (std::cmp::Reverse(t.alert), std::cmp::Reverse(t.created_at)));
         let _ = self.ui_tx.send(UiEvent::Tracks(out));
     }
 }
@@ -1043,6 +1434,17 @@ pub fn now_secs() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+/// Compact human duration for toasts/notifications: "45 s", "20 min", "2 h".
+fn fmt_duration(secs: u64) -> String {
+    if secs >= 3600 && secs.is_multiple_of(3600) {
+        format!("{} h", secs / 3600)
+    } else if secs >= 60 {
+        format!("{} min", secs / 60)
+    } else {
+        format!("{secs} s")
+    }
 }
 
 /// Clean a sender-declared display name for safe display: control characters
@@ -1857,6 +2259,373 @@ mod tests {
         assert!(
             !f.pool.relays.lock().unwrap().iter().any(|r| r == "wss://new.example"),
             "pruned relay must be removed from the pool"
+        );
+    }
+
+    // ---- alert (duress) & check-in (dead-man's switch) -----------------
+
+    fn last_share(evs: &[UiEvent]) -> Option<ShareSnapshot> {
+        evs.iter().rev().find_map(|e| match e {
+            UiEvent::Share(s) => Some(s.clone()),
+            _ => None,
+        })
+    }
+
+    fn notify_kinds(evs: &[UiEvent]) -> Vec<NotifyKind> {
+        evs.iter()
+            .filter_map(|e| match e {
+                UiEvent::Notify { kind, .. } => Some(*kind),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn last_set_interval(evs: &[UiEvent]) -> Option<u64> {
+        evs.iter().rev().find_map(|e| match e {
+            UiEvent::SetLocationInterval(ms) => Some(*ms),
+            _ => None,
+        })
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn raising_alert_publishes_immediately_marked_and_boosts_cadence() {
+        let mut f = fixture();
+        let group = add_member_group(&mut f, "G");
+        drain(&mut f);
+        f.engine.handle(EngineCmd::StartShare { msg: None });
+        f.engine.handle(EngineCmd::Location(sample(now_secs() * 1000)));
+        assert_eq!(f.pool.published.lock().unwrap().len(), 1);
+        let ev0 = f.pool.published.lock().unwrap()[0].clone();
+        assert_eq!(decrypt_for(&ev0, &group).payload.alert, None, "normal ACTIVE has no alert");
+        drain(&mut f);
+
+        // Raising the alert republishes at once (marked) and boosts the cadence.
+        f.engine.handle(EngineCmd::SetAlert(true));
+        let published = f.pool.published.lock().unwrap().clone();
+        assert_eq!(published.len(), 2, "raising the alert republishes immediately");
+        assert!(decrypt_for(&published[1], &group).payload.alert.is_some());
+        let evs = drain(&mut f);
+        assert_eq!(last_set_interval(&evs), Some(ALERT_INTERVAL_SECS * 1000));
+        assert!(last_share(&evs).unwrap().alert);
+        assert!(f.engine.config.alert_active, "alert persisted for resume");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn alert_heartbeat_rebroadcasts_a_stale_fix() {
+        let mut f = fixture();
+        add_member_group(&mut f, "G");
+        drain(&mut f);
+        f.engine.handle(EngineCmd::StartShare { msg: None });
+        f.engine.handle(EngineCmd::Location(sample(now_secs() * 1000)));
+        f.engine.handle(EngineCmd::SetAlert(true)); // republishes (#2)
+        assert_eq!(f.pool.published.lock().unwrap().len(), 2);
+
+        // No new fix arrives. While alerting, a tick past the alert interval
+        // re-sends the last-known position (unlike the normal quiet path).
+        tokio::time::advance(Duration::from_secs(ALERT_INTERVAL_SECS + 1)).await;
+        f.engine.handle(EngineCmd::Tick);
+        assert_eq!(
+            f.pool.published.lock().unwrap().len(),
+            3,
+            "an alert heartbeat re-broadcasts even an already-sent fix"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn clearing_alert_drops_the_marker_and_relaxes_cadence() {
+        let mut f = fixture();
+        let group = add_member_group(&mut f, "G");
+        drain(&mut f);
+        f.engine.handle(EngineCmd::StartShare { msg: None });
+        f.engine.handle(EngineCmd::Location(sample(now_secs() * 1000)));
+        f.engine.handle(EngineCmd::SetAlert(true));
+        drain(&mut f);
+
+        f.engine.handle(EngineCmd::SetAlert(false));
+        let published = f.pool.published.lock().unwrap().clone();
+        assert_eq!(
+            decrypt_for(published.last().unwrap(), &group).payload.alert,
+            None,
+            "clearing republishes without the marker"
+        );
+        let evs = drain(&mut f);
+        assert_eq!(last_set_interval(&evs), Some(30 * 1000), "cadence back to the default");
+        assert!(!last_share(&evs).unwrap().alert);
+        assert!(!f.engine.config.alert_active);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn panic_force_starts_share_and_alerts() {
+        let mut f = fixture();
+        let group = add_member_group(&mut f, "G");
+        drain(&mut f);
+        // Not sharing yet — panic starts a share already alerting.
+        f.engine.handle(EngineCmd::Panic);
+        let evs = drain(&mut f);
+        assert!(
+            evs.iter().any(|e| matches!(e, UiEvent::NeedLocation(true))),
+            "panic force-starts a share"
+        );
+        assert!(last_share(&evs).map(|s| s.sharing && s.alert).unwrap_or(false));
+
+        f.engine.handle(EngineCmd::Location(sample(now_secs() * 1000)));
+        let published = f.pool.published.lock().unwrap().clone();
+        assert_eq!(published.len(), 1);
+        assert!(decrypt_for(&published[0], &group).payload.alert.is_some());
+        assert!(f.engine.config.resume_share && f.engine.config.alert_active);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn panic_without_selection_shares_to_all_groups() {
+        let mut f = fixture();
+        let group = add_member_group(&mut f, "G");
+        let id = group.public.clone();
+        f.engine.handle(EngineCmd::Mutate(Box::new(move |c| {
+            for g in &mut c.groups {
+                if g.public == id {
+                    g.selected = false;
+                }
+            }
+        })));
+        drain(&mut f);
+
+        f.engine.handle(EngineCmd::Panic);
+        f.engine.handle(EngineCmd::Location(sample(now_secs() * 1000)));
+        let published = f.pool.published.lock().unwrap().clone();
+        assert_eq!(published.len(), 1, "panic shares even with nothing selected");
+        assert!(decrypt_for(&published[0], &group).payload.alert.is_some());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn panic_without_any_group_is_rejected() {
+        let mut f = fixture();
+        drain(&mut f);
+        f.engine.handle(EngineCmd::Panic);
+        let evs = drain(&mut f);
+        assert!(evs.iter().any(|e| matches!(e, UiEvent::Toast(_))));
+        assert!(f.pool.published.lock().unwrap().is_empty());
+        assert!(!evs.iter().any(|e| matches!(e, UiEvent::NeedLocation(true))));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn alert_resumes_with_the_share() {
+        let mut f = fixture();
+        let group = add_member_group(&mut f, "G");
+        drain(&mut f);
+        f.engine.handle(EngineCmd::Panic);
+        assert!(f.engine.config.alert_active);
+        // Simulate a process restart: drop the in-memory share, keep the
+        // persisted flags.
+        f.engine.share = None;
+        drain(&mut f);
+
+        f.engine.handle(EngineCmd::ResumeShareIfArmed);
+        f.engine.handle(EngineCmd::Location(sample(now_secs() * 1000)));
+        let published = f.pool.published.lock().unwrap().clone();
+        assert_eq!(published.len(), 1);
+        assert!(
+            decrypt_for(&published[0], &group).payload.alert.is_some(),
+            "a resumed emergency share is still alerting"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn incoming_alert_notifies_once_and_pins_the_track() {
+        let mut f = fixture();
+        let group = add_member_group(&mut f, "G");
+        drain(&mut f);
+        let sender = keys::generate();
+
+        // A normal ACTIVE: no alert, no notification.
+        feed(&mut f, event_with(&sender, &group, Payload::active(1.0, 2.0, 1000, None), 1000));
+        let evs = drain(&mut f);
+        assert!(notify_kinds(&evs).is_empty());
+        assert!(!last_tracks(evs).unwrap()[0].alert);
+
+        // It transitions to an alert: exactly one PeerAlert; track marked.
+        feed(
+            &mut f,
+            event_with(
+                &sender,
+                &group,
+                Payload::active(1.0, 2.0, 1100, None).with_alert(Some(1100)),
+                1100,
+            ),
+        );
+        let evs = drain(&mut f);
+        assert_eq!(notify_kinds(&evs), vec![NotifyKind::PeerAlert]);
+        assert!(last_tracks(evs).unwrap()[0].alert);
+
+        // A sticky-alert heartbeat does NOT re-notify (edge-triggered).
+        feed(
+            &mut f,
+            event_with(
+                &sender,
+                &group,
+                Payload::active(1.0, 2.0, 1200, None).with_alert(Some(1100)),
+                1200,
+            ),
+        );
+        assert!(notify_kinds(&drain(&mut f)).is_empty(), "no re-alert on a heartbeat");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn alerting_track_pins_above_a_newer_normal_track() {
+        let mut f = fixture();
+        let group = add_member_group(&mut f, "G");
+        drain(&mut f);
+        let alerter = keys::generate();
+        let normal = keys::generate();
+        // Alerter is older; the normal sender is newer.
+        feed(
+            &mut f,
+            event_with(
+                &alerter,
+                &group,
+                Payload::active(1.0, 2.0, 1000, None).with_alert(Some(1000)),
+                1000,
+            ),
+        );
+        feed(&mut f, event_with(&normal, &group, Payload::active(3.0, 4.0, 2000, None), 2000));
+        let tracks = last_tracks(drain(&mut f)).unwrap();
+        assert_eq!(tracks.len(), 2);
+        assert!(tracks[0].alert, "the alerting sender is pinned to the top despite being older");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn arm_checkin_persists_and_sets_sentinel() {
+        let mut f = fixture();
+        add_member_group(&mut f, "G");
+        drain(&mut f);
+        f.engine.handle(EngineCmd::ArmCheckin { secs: 600 });
+        assert_eq!(f.engine.config.checkin_period_secs, Some(600));
+        assert!(f.engine.config.checkin_deadline.is_some());
+        assert!(f.engine.store.checkin_flag_path().exists());
+        let snap = last_share(&drain(&mut f)).unwrap();
+        assert!(snap.checkin_deadline.is_some() && !snap.checkin_grace);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn checkin_safe_disarms_and_clears_sentinel() {
+        let mut f = fixture();
+        add_member_group(&mut f, "G");
+        drain(&mut f);
+        f.engine.handle(EngineCmd::ArmCheckin { secs: 600 });
+        f.engine.handle(EngineCmd::Checkin);
+        assert!(f.engine.checkin.is_none());
+        assert_eq!(f.engine.config.checkin_deadline, None);
+        assert!(!f.engine.store.checkin_flag_path().exists());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn checkin_escalates_to_panic_on_deadline() {
+        let mut f = fixture();
+        let group = add_member_group(&mut f, "G");
+        drain(&mut f);
+        f.engine.handle(EngineCmd::ArmCheckin { secs: 600 });
+        // Rewind the (wall-clock) deadline into the past; tokio's mock clock
+        // wouldn't move `now_secs`.
+        if let Some(CheckinState::Armed { deadline, .. }) = &mut f.engine.checkin {
+            *deadline = now_secs() - 1;
+        }
+        drain(&mut f);
+
+        f.engine.handle(EngineCmd::Tick);
+        let evs = drain(&mut f);
+        assert!(
+            evs.iter().any(|e| matches!(e, UiEvent::NeedLocation(true))),
+            "escalation starts a share"
+        );
+        assert!(notify_kinds(&evs).contains(&NotifyKind::CheckinEscalated));
+        assert!(f.engine.config.alert_active);
+        assert!(f.engine.checkin.is_none(), "the check-in is cleared once it fires");
+        assert!(!f.engine.store.checkin_flag_path().exists());
+
+        f.engine.handle(EngineCmd::Location(sample(now_secs() * 1000)));
+        assert!(decrypt_for(&f.pool.published.lock().unwrap()[0], &group).payload.alert.is_some());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn checkin_reminder_fires_once_before_the_deadline() {
+        let mut f = fixture();
+        add_member_group(&mut f, "G");
+        drain(&mut f);
+        f.engine.checkin =
+            Some(CheckinState::Armed { deadline: now_secs() + 10, period_secs: 600, reminded: false });
+        f.engine.handle(EngineCmd::Tick);
+        assert_eq!(notify_kinds(&drain(&mut f)), vec![NotifyKind::CheckinReminder]);
+        // No second reminder, and not yet escalated.
+        f.engine.handle(EngineCmd::Tick);
+        assert!(notify_kinds(&drain(&mut f)).is_empty());
+        assert!(f.pool.published.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn expired_checkin_on_start_enters_grace_without_escalating() {
+        let mut f = fixture();
+        add_member_group(&mut f, "G");
+        f.engine.handle(EngineCmd::Mutate(Box::new(|c| {
+            c.checkin_deadline = Some(now_secs() - 1);
+            c.checkin_period_secs = Some(600);
+        })));
+        drain(&mut f);
+
+        f.engine.handle(EngineCmd::EvaluateCheckinOnStart);
+        let evs = drain(&mut f);
+        // Grace, not immediate escalation: nothing published, location not started.
+        assert!(f.pool.published.lock().unwrap().is_empty());
+        assert!(!evs.iter().any(|e| matches!(e, UiEvent::NeedLocation(true))));
+        assert!(notify_kinds(&evs).contains(&NotifyKind::CheckinGrace));
+        let snap = last_share(&evs).unwrap();
+        assert!(snap.checkin_grace && snap.checkin_deadline.is_some());
+        assert!(matches!(f.engine.checkin, Some(CheckinState::StartupGrace { .. })));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unexpired_checkin_on_start_resumes_countdown() {
+        let mut f = fixture();
+        add_member_group(&mut f, "G");
+        f.engine.handle(EngineCmd::Mutate(Box::new(|c| {
+            c.checkin_deadline = Some(now_secs() + 600);
+            c.checkin_period_secs = Some(600);
+        })));
+        drain(&mut f);
+
+        f.engine.handle(EngineCmd::EvaluateCheckinOnStart);
+        let evs = drain(&mut f);
+        assert!(notify_kinds(&evs).is_empty(), "a future deadline resumes silently");
+        assert!(matches!(f.engine.checkin, Some(CheckinState::Armed { .. })));
+        assert!(!last_share(&evs).unwrap().checkin_grace);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn checkin_grace_escalates_after_its_window() {
+        let mut f = fixture();
+        add_member_group(&mut f, "G");
+        drain(&mut f);
+        // Enter grace with the window already elapsed.
+        f.engine.checkin = Some(CheckinState::StartupGrace { until: now_secs() });
+        f.engine.handle(EngineCmd::Tick);
+        let evs = drain(&mut f);
+        assert!(
+            evs.iter().any(|e| matches!(e, UiEvent::NeedLocation(true))),
+            "an unconfirmed grace window escalates to a share"
+        );
+        assert!(f.engine.config.alert_active);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn checkin_safe_during_grace_never_escalates() {
+        let mut f = fixture();
+        add_member_group(&mut f, "G");
+        drain(&mut f);
+        f.engine.checkin = Some(CheckinState::StartupGrace { until: now_secs() + 60 });
+        f.engine.handle(EngineCmd::Checkin);
+        assert!(f.engine.checkin.is_none());
+        f.engine.handle(EngineCmd::Tick);
+        assert!(
+            f.pool.published.lock().unwrap().is_empty(),
+            "confirming safe within the grace window cancels the alarm"
         );
     }
 

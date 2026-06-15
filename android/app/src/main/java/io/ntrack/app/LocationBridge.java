@@ -2,6 +2,10 @@ package io.ntrack.app;
 
 import android.Manifest;
 import android.app.Activity;
+import android.app.Notification;
+import android.app.NotificationChannel;
+import android.app.NotificationManager;
+import android.app.PendingIntent;
 import android.content.ActivityNotFoundException;
 import android.content.ClipData;
 import android.content.ClipboardManager;
@@ -43,6 +47,11 @@ public final class LocationBridge {
     private static final String TAG = "ntrack";
     private static final int REQ_LOCATION = 4242;
     private static final int REQ_BACKGROUND = 4243;
+    /** High-importance channel for duress alerts and check-in escalations,
+     * separate from the low-importance ongoing-sharing channel. */
+    private static final String ALERT_CHANNEL_ID = "ntrack.alert";
+    /** Rolling id so successive alerts stack rather than overwrite. */
+    private static int alertNotificationId = 100;
 
     private LocationBridge() {}
 
@@ -440,6 +449,62 @@ public final class LocationBridge {
                 Log.e(TAG, "shareFile failed", e);
             }
         });
+    }
+
+    // ---- alert / check-in notifications -----------------------------------
+
+    /**
+     * Raise a high-urgency notification (sound/vibration, Do-Not-Disturb bypass
+     * where the user has allowed it) for an incoming peer alert or a check-in
+     * grace/escalation — visible even when the app is backgrounded. Tapping it
+     * opens the app. Works from either the live activity or the boot foreground
+     * service, whichever {@link #locationContext} resolves.
+     */
+    public static void notifyAlert(final String title, final String body) {
+        final Context ctx = locationContext();
+        if (ctx == null) {
+            Log.w(TAG, "notifyAlert: no context");
+            return;
+        }
+        post(() -> {
+            try {
+                NotificationManager nm = ctx.getSystemService(NotificationManager.class);
+                if (nm == null) return;
+                NotificationChannel channel = new NotificationChannel(
+                        ALERT_CHANNEL_ID, "Alerts & check-ins",
+                        NotificationManager.IMPORTANCE_HIGH);
+                channel.setDescription(
+                        "Urgent location alerts from your groups and check-in reminders");
+                channel.enableVibration(true);
+                // Best-effort DnD bypass; only takes effect if the user grants
+                // notification-policy access, otherwise silently ignored.
+                channel.setBypassDnd(true);
+                nm.createNotificationChannel(channel);
+
+                Intent open = new Intent(ctx, MainActivity.class)
+                        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                PendingIntent tap = PendingIntent.getActivity(
+                        ctx, 0, open,
+                        PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT);
+
+                Notification n = new Notification.Builder(ctx, ALERT_CHANNEL_ID)
+                        .setContentTitle(title)
+                        .setContentText(body)
+                        .setStyle(new Notification.BigTextStyle().bigText(body))
+                        .setSmallIcon(android.R.drawable.ic_dialog_alert)
+                        .setCategory(Notification.CATEGORY_ALARM)
+                        .setAutoCancel(true)
+                        .setContentIntent(tap)
+                        .build();
+                nm.notify(nextAlertId(), n);
+            } catch (Exception e) {
+                Log.e(TAG, "notifyAlert failed", e);
+            }
+        });
+    }
+
+    private static synchronized int nextAlertId() {
+        return alertNotificationId++;
     }
 
     // ---- QR scanner -------------------------------------------------------

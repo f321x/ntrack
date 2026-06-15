@@ -20,10 +20,14 @@ import java.io.File;
  * "Allow all the time" background-location permission — without it the service
  * runs but gets no fixes (the user must grant it; there is no fallback path).
  *
- * Whether a share was active is read from a tiny non-secret sentinel file the
- * core maintains next to its config ({@code resume.flag} in {@code getFilesDir()},
- * which equals the NativeActivity {@code internalDataPath} the core uses). We
- * never parse the config file from Java — it holds group secrets.
+ * Whether a share was active — or a "check-in" dead-man's switch was armed — is
+ * read from tiny non-secret sentinel files the core maintains next to its config
+ * ({@code resume.flag} / {@code checkin.flag} in {@code getFilesDir()}, which
+ * equals the NativeActivity {@code internalDataPath} the core uses). A pending
+ * check-in must boot the engine too: it may have lapsed while the phone was off,
+ * and the engine evaluates that on startup (opening a grace window, then
+ * escalating if unconfirmed). We never parse the config file from Java — it
+ * holds group secrets.
  */
 public final class BootReceiver extends BroadcastReceiver {
     private static final String TAG = "ntrack";
@@ -35,14 +39,18 @@ public final class BootReceiver extends BroadcastReceiver {
                 && !"android.intent.action.QUICKBOOT_POWERON".equals(action)) {
             return;
         }
-        // Only resume if we were sharing when we went down.
-        if (!new File(context.getFilesDir(), "resume.flag").exists()) return;
+        // Start only if we were sharing, or a check-in is armed, when we went
+        // down — otherwise there's nothing for the boot engine to do.
+        File files = context.getFilesDir();
+        boolean armed = new File(files, "resume.flag").exists()
+                || new File(files, "checkin.flag").exists();
+        if (!armed) return;
 
         Intent svc = new Intent(context, LocationService.class)
                 .putExtra(LocationService.EXTRA_FROM_BOOT, true);
         try {
             context.startForegroundService(svc);
-            Log.i(TAG, "boot: resuming share via foreground service");
+            Log.i(TAG, "boot: starting engine via foreground service (share/check-in armed)");
         } catch (Exception e) {
             // Defensive: some OEMs are stricter than the documented exemption.
             Log.e(TAG, "boot: failed to start location service", e);

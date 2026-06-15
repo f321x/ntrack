@@ -27,6 +27,7 @@ export struct TrackItem {
     color: color,        // accent derived from the sender key
     live: bool,
     has-coords: bool,
+    alert: bool,         // sender is broadcasting a duress alert
 }
 
 export struct RelayItem {
@@ -167,12 +168,20 @@ component SharePage inherits ScrollView {
     in property <string> status-detail;
     in property <int> interval-index;
     in property <bool> location-permission;
+    in property <bool> alert;
+    in property <bool> checkin-armed;
+    in property <bool> checkin-grace;
+    in property <string> checkin-countdown;
 
     callback toggle-group(string, bool);
     callback start-share(string);
     callback stop-share();
     callback set-interval(int);
     callback message-edited(string);
+    callback panic();
+    callback clear-alert();
+    callback arm-checkin(int);
+    callback checkin-safe();
 
     VerticalLayout {
         padding: Theme.pad;
@@ -205,6 +214,98 @@ component SharePage inherits ScrollView {
                     color: Theme.muted;
                     font-size: 13px;
                     wrap: word-wrap;
+                }
+            }
+        }
+
+        // ---- duress alert ----
+        if root.alert : Card {
+            background: Theme.danger.darker(35%);
+            VerticalLayout {
+                padding: Theme.pad;
+                spacing: 8px;
+                Text {
+                    text: "🚨 Alert active";
+                    color: #ffffff;
+                    font-size: 17px;
+                    font-weight: 800;
+                }
+                Text {
+                    text: "Your group is being notified and your location is updating quickly. Clear it once you're safe.";
+                    color: #ffe8ea;
+                    font-size: 13px;
+                    wrap: word-wrap;
+                }
+                AppButton {
+                    text: "Clear alert — I'm safe";
+                    clicked => { root.clear-alert(); }
+                }
+            }
+        }
+        if !root.alert : AppButton {
+            text: "🆘 Raise alert";
+            danger: true;
+            clicked => { root.panic(); }
+        }
+
+        // ---- check-in (dead-man's switch) ----
+        SectionTitle { text: "CHECK-IN"; }
+        Card {
+            VerticalLayout {
+                padding: Theme.pad;
+                spacing: 10px;
+
+                if root.checkin-grace : Rectangle {
+                    border-radius: 10px;
+                    background: Theme.danger.darker(35%);
+                    VerticalLayout {
+                        padding: 10px;
+                        spacing: 6px;
+                        Text {
+                            text: "Check-in lapsed while you were away";
+                            color: #ffffff;
+                            font-size: 14px;
+                            font-weight: 700;
+                            wrap: word-wrap;
+                        }
+                        Text {
+                            text: "Confirm you're safe in " + root.checkin-countdown + ", or an alert is sent.";
+                            color: #ffe8ea;
+                            font-size: 12px;
+                            wrap: word-wrap;
+                        }
+                    }
+                }
+
+                if root.checkin-armed && !root.checkin-grace : Text {
+                    text: "Checking in — " + root.checkin-countdown + " left. Confirm before it runs out, or an alert is sent to your groups.";
+                    color: Theme.text;
+                    font-size: 13px;
+                    wrap: word-wrap;
+                }
+
+                if root.checkin-armed : AppButton {
+                    text: "✓ I'm safe";
+                    primary: true;
+                    clicked => { root.checkin-safe(); }
+                }
+
+                if !root.checkin-armed : Text {
+                    text: "Arm a timer: if you don't confirm you're safe before it runs out, ntrack starts sharing and raises an alert to your groups.";
+                    color: Theme.muted;
+                    font-size: 13px;
+                    wrap: word-wrap;
+                }
+                if !root.checkin-armed : HorizontalLayout {
+                    spacing: 10px;
+                    checkin-box := ComboBox {
+                        model: ["5 min", "15 min", "30 min", "1 h"];
+                        current-index: 1;
+                    }
+                    AppButton {
+                        text: "Arm";
+                        clicked => { root.arm-checkin(checkin-box.current-index); }
+                    }
                 }
             }
         }
@@ -290,10 +391,11 @@ component TrackRow inherits Card {
 
     HorizontalLayout {
         // Identity accent stripe: a colour derived from the sender key, the
-        // disambiguator when two senders happen to share a name.
+        // disambiguator when two senders happen to share a name. A duress alert
+        // overrides it with a wider danger-red stripe.
         Rectangle {
-            width: 6px;
-            background: item.color;
+            width: item.alert ? 9px : 6px;
+            background: item.alert ? Theme.danger : item.color;
         }
         VerticalLayout {
             padding: Theme.pad;
@@ -319,10 +421,11 @@ component TrackRow inherits Card {
                     width: badge.preferred-width + 16px;
                     height: 22px;
                     border-radius: 11px;
-                    background: item.live ? Theme.ok.darker(60%) : Theme.card-alt;
+                    background: item.alert ? Theme.danger.darker(20%)
+                        : item.live ? Theme.ok.darker(60%) : Theme.card-alt;
                     badge := Text {
-                        text: item.status;
-                        color: item.live ? Theme.ok : Theme.muted;
+                        text: item.alert ? "⚠ ALERT" : item.status;
+                        color: item.alert ? #ffffff : (item.live ? Theme.ok : Theme.muted);
                         font-size: 11px;
                         font-weight: 700;
                         horizontal-alignment: center;
@@ -909,6 +1012,10 @@ export component MainWindow inherits Window {
     in property <string> status-headline: "Not sharing";
     in property <string> status-detail: "";
     in property <int> interval-index: 1;
+    in property <bool> alert;
+    in property <bool> checkin-armed;
+    in property <bool> checkin-grace;
+    in property <string> checkin-countdown;
     in property <string> sender-npub;
     in property <string> display-name;
     in property <string> default-name;
@@ -951,6 +1058,10 @@ export component MainWindow inherits Window {
     callback stop-share();
     callback set-interval(int);
     callback message-edited(string);
+    callback panic();
+    callback clear-alert();
+    callback arm-checkin(int);
+    callback checkin-safe();
     callback open-map(int);
     callback open-map-view();
     callback map-close();
@@ -1049,11 +1160,19 @@ export component MainWindow inherits Window {
                 status-headline: root.status-headline;
                 status-detail: root.status-detail;
                 interval-index: root.interval-index;
+                alert: root.alert;
+                checkin-armed: root.checkin-armed;
+                checkin-grace: root.checkin-grace;
+                checkin-countdown: root.checkin-countdown;
                 toggle-group(id, v) => { root.toggle-group(id, v); }
                 start-share(msg) => { root.start-share(msg); }
                 stop-share => { root.stop-share(); }
                 set-interval(i) => { root.set-interval(i); }
                 message-edited(m) => { root.message-edited(m); }
+                panic => { root.panic(); }
+                clear-alert => { root.clear-alert(); }
+                arm-checkin(i) => { root.arm-checkin(i); }
+                checkin-safe => { root.checkin-safe(); }
             }
             if root.current-page == 1 : TrackPage {
                 tracks: root.tracks;

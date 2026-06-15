@@ -120,6 +120,20 @@ pub struct Config {
     /// Message attached to the share, restored on resume.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub resume_msg: Option<String>,
+    /// A duress alert is raised on the active share. Persisted alongside the
+    /// resume flag so a reboot/crash mid-emergency resumes the alert, not just a
+    /// plain share. Cleared on an explicit stop or a permission/GPS loss.
+    #[serde(default)]
+    pub alert_active: bool,
+    /// Unix-seconds deadline of an armed "check-in" (dead-man's switch), if any.
+    /// Persisted so it survives a reboot: when it elapsed while the app/device
+    /// was down, startup grants a brief grace window before escalating rather
+    /// than firing a false alarm (see the engine's startup evaluation).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub checkin_deadline: Option<u64>,
+    /// The check-in period (seconds) last armed, retained for the UI and re-arm.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub checkin_period_secs: Option<u64>,
 }
 
 /// Floor on the relay count for *automatic* removal. Auto-pruning never takes a
@@ -161,6 +175,9 @@ impl Default for Config {
             processed_ids: Vec::new(),
             resume_share: false,
             resume_msg: None,
+            alert_active: false,
+            checkin_deadline: None,
+            checkin_period_secs: None,
         }
     }
 }
@@ -358,14 +375,32 @@ impl ConfigStore {
     /// mirrors [`Config::resume_share`]. Best-effort: errors are ignored,
     /// since the flag is only an optimisation for the boot receiver.
     pub fn set_resume_flag(&self, on: bool) {
-        let path = self.resume_flag_path();
+        Self::set_flag(&self.resume_flag_path(), on);
+    }
+
+    /// Path of the non-secret "check-in armed" sentinel, a sibling of
+    /// `config.json`. Mirrors [`Config::checkin_deadline`] so the Android boot
+    /// receiver can start the engine to evaluate (and possibly grace/escalate) a
+    /// check-in even when no share was active — without parsing the secret
+    /// config.
+    pub fn checkin_flag_path(&self) -> PathBuf {
+        self.path.with_file_name("checkin.flag")
+    }
+
+    /// Create/remove the check-in sentinel so it mirrors an armed check-in.
+    pub fn set_checkin_flag(&self, on: bool) {
+        Self::set_flag(&self.checkin_flag_path(), on);
+    }
+
+    /// Shared best-effort sentinel write/remove for the boot-receiver flags.
+    fn set_flag(path: &Path, on: bool) {
         if on {
             if let Some(parent) = path.parent() {
                 let _ = std::fs::create_dir_all(parent);
             }
-            let _ = std::fs::write(&path, []);
+            let _ = std::fs::write(path, []);
         } else {
-            let _ = std::fs::remove_file(&path);
+            let _ = std::fs::remove_file(path);
         }
     }
 
@@ -505,6 +540,33 @@ mod tests {
         let dir = tmpdir();
         let store = ConfigStore::new(&dir);
         assert_eq!(store.resume_flag_path(), dir.join("resume.flag"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn alert_and_checkin_fields_default_off_for_old_config() {
+        // A config.json predating the alert/check-in fields must still load,
+        // defaulting to "no alert, no check-in".
+        let dir = tmpdir();
+        let store = ConfigStore::new(&dir);
+        std::fs::write(store.path(), br#"{"relays":[],"groups":[]}"#).unwrap();
+        let cfg = store.load().unwrap();
+        assert!(!cfg.alert_active);
+        assert_eq!(cfg.checkin_deadline, None);
+        assert_eq!(cfg.checkin_period_secs, None);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn set_checkin_flag_creates_and_removes_sentinel() {
+        let dir = tmpdir();
+        let store = ConfigStore::new(&dir);
+        assert_eq!(store.checkin_flag_path(), dir.join("checkin.flag"));
+        assert!(!store.checkin_flag_path().exists());
+        store.set_checkin_flag(true);
+        assert!(store.checkin_flag_path().exists());
+        store.set_checkin_flag(false);
+        assert!(!store.checkin_flag_path().exists());
         std::fs::remove_dir_all(&dir).ok();
     }
 

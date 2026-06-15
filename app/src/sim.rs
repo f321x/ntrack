@@ -82,6 +82,12 @@ impl Platform for SimPlatform {
         );
     }
 
+    fn notify_alert(&self, title: &str, body: &str) {
+        // The desktop build has no notification surface; log it loudly so the
+        // alert/check-in flows can still be exercised on a workstation.
+        log::warn!("sim: 🔔 ALERT NOTIFICATION — {title}: {body}");
+    }
+
     fn copy_text(&self, text: &str) {
         log::info!("sim: copy to clipboard ({} chars)", text.len());
     }

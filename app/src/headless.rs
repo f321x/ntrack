@@ -117,17 +117,32 @@ pub fn start(
         }
     });
 
-    // engine -> location control. The engine asks for fixes via NeedLocation;
-    // every other UiEvent (snapshots, toasts, dialogs) has no headless consumer.
+    // engine -> location control + alert notifications. The engine asks for
+    // fixes via NeedLocation, adjusts the GPS cadence via SetLocationInterval
+    // (e.g. when a check-in escalates to an alert headlessly), and surfaces
+    // emergency notifications via Notify. Every other UiEvent (snapshots,
+    // toasts, dialogs) has no headless consumer.
     let platform_loc = platform.clone();
     rt.spawn(async move {
         while let Some(ev) = ui_rx.recv().await {
-            if let UiEvent::NeedLocation(on) = ev {
-                if on {
-                    platform_loc.start_location(interval_ms);
-                } else {
-                    platform_loc.stop_location();
+            match ev {
+                UiEvent::NeedLocation(on) => {
+                    if on {
+                        platform_loc.start_location(interval_ms);
+                    } else {
+                        platform_loc.stop_location();
+                    }
                 }
+                UiEvent::SetLocationInterval(ms) => {
+                    // Only ever emitted while a share is active, so location is
+                    // already running; restart it at the new cadence.
+                    platform_loc.stop_location();
+                    platform_loc.start_location(ms);
+                }
+                UiEvent::Notify { title, body, .. } => {
+                    platform_loc.notify_alert(&title, &body);
+                }
+                _ => {}
             }
         }
     });

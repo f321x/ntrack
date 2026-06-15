@@ -80,15 +80,41 @@ pub struct Payload {
     /// compatibility) and fall back to a name derived from the sender key.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub name: Option<String>,
+    /// Duress-alert marker: the unix-seconds time the sender raised the alert.
+    /// Its mere presence means "this ACTIVE broadcast is an alert" — receivers
+    /// escalate (loud notification, pinned card); the timestamp lets them show
+    /// how long it has been up. Carried on ACTIVE only and re-sent on every
+    /// broadcast while the alert is up, so the flag is sticky/level-triggered:
+    /// any one received broadcast re-asserts it, surviving dropped relays.
+    /// Omitted from STOP. Receivers predating the field ignore it (forward
+    /// compatibility) and simply show a normal live track.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub alert: Option<u64>,
 }
 
 impl Payload {
     pub fn active(lat: f64, lng: f64, ts: u64, msg: Option<String>) -> Self {
-        Self { status: Status::Active, lat: Some(lat), lng: Some(lng), ts: Some(ts), msg, name: None }
+        Self {
+            status: Status::Active,
+            lat: Some(lat),
+            lng: Some(lng),
+            ts: Some(ts),
+            msg,
+            name: None,
+            alert: None,
+        }
     }
 
     pub fn stop() -> Self {
-        Self { status: Status::Stop, lat: None, lng: None, ts: None, msg: None, name: None }
+        Self {
+            status: Status::Stop,
+            lat: None,
+            lng: None,
+            ts: None,
+            msg: None,
+            name: None,
+            alert: None,
+        }
     }
 
     /// Attach the sender's self-declared display name to an ACTIVE payload.
@@ -96,6 +122,14 @@ impl Payload {
     /// configured name omits it from the wire entirely.
     pub fn with_name(mut self, name: Option<String>) -> Self {
         self.name = name.map(|n| n.trim().to_string()).filter(|n| !n.is_empty());
+        self
+    }
+
+    /// Mark an ACTIVE payload as a duress alert, stamping `since` (the unix
+    /// seconds the alert was raised). `None` leaves it an ordinary broadcast.
+    /// STOP payloads never carry it (see [`Payload::stop`] and `validate`).
+    pub fn with_alert(mut self, since: Option<u64>) -> Self {
+        self.alert = since;
         self
     }
 
@@ -112,8 +146,13 @@ impl Payload {
                 }
             }
             Status::Stop => {
-                if self.lat.is_some() || self.lng.is_some() || self.ts.is_some() || self.msg.is_some() {
-                    return invalid("lat, lng, ts and msg MUST be omitted for STOP");
+                if self.lat.is_some()
+                    || self.lng.is_some()
+                    || self.ts.is_some()
+                    || self.msg.is_some()
+                    || self.alert.is_some()
+                {
+                    return invalid("lat, lng, ts, msg and alert MUST be omitted for STOP");
                 }
                 // `name` describes the sender, not the broadcast, so it carries
                 // no per-status rule — we simply never emit it on STOP (see
@@ -689,6 +728,28 @@ mod tests {
         assert_eq!(p.name, None, "a blank name is omitted from the wire");
         // STOP stays minimal: name is never serialized.
         assert_eq!(serde_json::to_string(&Payload::stop()).unwrap(), r#"{"status":"STOP"}"#);
+    }
+
+    #[test]
+    fn alert_roundtrips_and_is_omitted_on_stop() {
+        let sender = generate();
+        let group = generate();
+        // An ACTIVE alert carries the since-timestamp end to end.
+        let payload = Payload::active(1.0, 2.0, 3, None).with_alert(Some(1_700_000_000));
+        assert_eq!(payload.alert, Some(1_700_000_000));
+        let event = build_event(&sender, &[group.public_key()], &payload, None).unwrap();
+        let mut s = seen();
+        let inc = process_incoming(&event, std::slice::from_ref(&group), &mut s).unwrap();
+        assert_eq!(inc.payload.alert, Some(1_700_000_000));
+
+        // STOP must reject an alert marker and still serialize minimally.
+        let mut bad = Payload::stop();
+        bad.alert = Some(1_700_000_000);
+        assert!(bad.validate().is_err(), "alert MUST be omitted from STOP");
+        assert_eq!(
+            serde_json::to_string(&Payload::stop()).unwrap(),
+            r#"{"status":"STOP"}"#
+        );
     }
 
     #[test]

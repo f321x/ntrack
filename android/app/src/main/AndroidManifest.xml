@@ -70,9 +70,10 @@
             android:exported="false"
             android:grantUriPermissions="true" />
 
-        <!-- On boot, automatically resumes a share that was active at shutdown
-             (gated by the core's resume.flag sentinel) by starting the
-             foreground location service headlessly. -->
+        <!-- On boot, automatically resumes a share that was active at shutdown,
+             or evaluates a pending check-in (gated by the core's resume.flag /
+             checkin.flag sentinels), by starting the foreground location
+             service headlessly. -->
         <receiver
             android:name=".BootReceiver"
             android:exported="true"
