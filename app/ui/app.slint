@@ -679,9 +679,12 @@ component ModalScrim inherits Rectangle {
 
 // --------------------------------------------------------------- map --
 
-// A round, translucent control overlaid on the map (close, zoom, fit).
+// A round, translucent control overlaid on the map (close, zoom, fit). Icons
+// are drawn as vector strokes rather than text glyphs so they never depend on
+// a font shipping the symbol (✕/⤢ rendered as tofu on Android).
 component MapCtlButton inherits Rectangle {
-    in property <string> text;
+    // "close" | "plus" | "minus" | "fit"
+    in property <string> icon;
     callback clicked;
     width: 40px;
     height: 40px;
@@ -689,13 +692,21 @@ component MapCtlButton inherits Rectangle {
     background: t.pressed ? Theme.card-alt.brighter(20%) : #1a1d27dd;
     border-width: 1px;
     border-color: Theme.line;
-    Text {
-        text: root.text;
-        color: Theme.text;
-        font-size: 20px;
-        font-weight: 700;
-        horizontal-alignment: center;
-        vertical-alignment: center;
+    Path {
+        width: 20px;
+        height: 20px;
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        viewbox-width: 24;
+        viewbox-height: 24;
+        commands: root.icon == "close" ? "M 5 5 L 19 19 M 19 5 L 5 19"
+            : root.icon == "plus" ? "M 12 4 L 12 20 M 4 12 L 20 12"
+            : root.icon == "minus" ? "M 4 12 L 20 12"
+            : "M 4 9 L 4 4 L 9 4 M 15 4 L 20 4 L 20 9 M 20 15 L 20 20 L 15 20 M 9 20 L 4 20 L 4 15";
+        stroke: Theme.text;
+        stroke-width: 2px;
+        stroke-line-cap: round;
+        stroke-line-join: round;
     }
     t := TouchArea { clicked => { root.clicked(); } }
 }
@@ -707,19 +718,47 @@ component MapOverlay inherits Rectangle {
     in property <[MapTile]> tiles;
     in property <[MapMarker]> markers;
     in property <bool> has-peers;
+    // Safe-area insets (logical px), forwarded from the Window so the controls
+    // and attribution clear the status bar / gesture-navigation bar under
+    // edge-to-edge enforcement. The map imagery itself still fills the screen.
+    in property <length> inset-top;
+    in property <length> inset-bottom;
+    in property <length> inset-left;
+    in property <length> inset-right;
     callback close();
     callback pan(length, length);
     callback zoom-in();
     callback zoom-out();
     callback fit();
+    // Pinch ended: the cumulative scale factor (>1 zoom in, <1 zoom out).
+    callback pinch-zoom(float);
     callback viewport(length, length);
 
     // Live drag offset, applied to tiles + markers together for a smooth pan;
     // committed (and reset) on release once Rust re-centres the view.
     private property <length> pan-x: 0;
     private property <length> pan-y: 0;
+    // Live pinch factor (1.0 = none): scales the tile layer about the centre
+    // for instant feedback; committed to an integer zoom on release.
+    private property <float> pinch-scale: 1.0;
 
     background: Theme.bg;
+
+    // Catch the Android Back gesture/button so it dismisses the map instead of
+    // bubbling up unhandled (which finishes the Activity and exits the app).
+    // Grabs focus on open; the map has no text inputs to compete for it.
+    init => { back-catcher.focus(); }
+    back-catcher := FocusScope {
+        width: 0px;
+        height: 0px;
+        key-pressed(event) => {
+            if (event.text == Key.Back || event.text == Key.Escape) {
+                root.close();
+                return EventResult.accept;
+            }
+            return EventResult.reject;
+        }
+    }
 
     map-area := Rectangle {
         width: 100%;
@@ -731,16 +770,16 @@ component MapOverlay inherits Rectangle {
         changed height => { root.viewport(self.width, self.height); }
 
         for t in root.tiles : Image {
-            x: parent.width / 2 + t.dx + root.pan-x;
-            y: parent.height / 2 + t.dy + root.pan-y;
-            width: 256px;
-            height: 256px;
+            x: parent.width / 2 + t.dx * root.pinch-scale + root.pan-x;
+            y: parent.height / 2 + t.dy * root.pinch-scale + root.pan-y;
+            width: 256px * root.pinch-scale;
+            height: 256px * root.pinch-scale;
             source: t.img;
         }
 
         for m in root.markers : Rectangle {
-            x: parent.width / 2 + m.dx + root.pan-x - self.width / 2;
-            y: parent.height / 2 + m.dy + root.pan-y - self.height / 2;
+            x: parent.width / 2 + m.dx * root.pinch-scale + root.pan-x - self.width / 2;
+            y: parent.height / 2 + m.dy * root.pinch-scale + root.pan-y - self.height / 2;
             width: 18px;
             height: 18px;
             border-radius: 9px;
@@ -783,12 +822,24 @@ component MapOverlay inherits Rectangle {
                 }
             }
         }
+
+        // Two-finger pinch → zoom. Slint's recogniser suspends the single-touch
+        // drag above for the duration, so the two don't fight. `scale` is the
+        // cumulative factor since the gesture began (1.0 at start).
+        pinch := ScaleRotateGestureHandler {
+            updated => { root.pinch-scale = Math.clamp(self.scale, 0.3, 3.0); }
+            ended => {
+                root.pinch-zoom(self.scale);
+                root.pinch-scale = 1.0;
+            }
+            cancelled => { root.pinch-scale = 1.0; }
+        }
     }
 
-    // Empty state.
+    // Empty state — sits below the top controls (inset + button height).
     if !root.has-peers : Rectangle {
         x: (parent.width - self.width) / 2;
-        y: 70px;
+        y: root.inset-top + 64px;
         width: min(parent.width - 32px, 320px);
         height: hint.preferred-height + 16px;
         border-radius: 10px;
@@ -803,29 +854,30 @@ component MapOverlay inherits Rectangle {
         }
     }
 
-    // Close (top-left).
+    // Close (top-left), clear of the status bar / cutout.
     MapCtlButton {
-        x: 12px;
-        y: 12px;
-        text: "✕";
+        x: root.inset-left + 12px;
+        y: root.inset-top + 12px;
+        icon: "close";
         clicked => { root.close(); }
     }
 
-    // Zoom + fit (right edge).
+    // Zoom + fit (right edge), clear of the status bar / cutout.
     VerticalLayout {
-        x: parent.width - self.width - 12px;
-        y: 12px;
+        x: parent.width - self.width - 12px - root.inset-right;
+        y: root.inset-top + 12px;
         width: 40px;
         spacing: 8px;
-        MapCtlButton { text: "+"; clicked => { root.zoom-in(); } }
-        MapCtlButton { text: "−"; clicked => { root.zoom-out(); } }
-        MapCtlButton { text: "⤢"; clicked => { root.fit(); } }
+        MapCtlButton { icon: "plus"; clicked => { root.zoom-in(); } }
+        MapCtlButton { icon: "minus"; clicked => { root.zoom-out(); } }
+        MapCtlButton { icon: "fit"; clicked => { root.fit(); } }
     }
 
-    // Attribution — required by the OSM/ODbL tile licence.
+    // Attribution — required by the OSM/ODbL tile licence; kept above the
+    // gesture-navigation bar so it stays fully readable.
     Rectangle {
-        x: parent.width - self.width - 6px;
-        y: parent.height - self.height - 6px;
+        x: parent.width - self.width - 6px - root.inset-right;
+        y: parent.height - self.height - 6px - root.inset-bottom;
         width: attribution.preferred-width + 12px;
         height: 18px;
         border-radius: 4px;
@@ -906,6 +958,7 @@ export component MainWindow inherits Window {
     callback map-zoom-in();
     callback map-zoom-out();
     callback map-fit();
+    callback map-pinch-zoom(float);
     callback map-viewport(length, length);
     callback export-track(int);
     callback rename-sender-confirmed(string, string);
@@ -1073,11 +1126,16 @@ export component MainWindow inherits Window {
         tiles: root.map-tiles;
         markers: root.map-markers;
         has-peers: root.map-has-peers;
+        inset-top: root.safe-area-insets.top;
+        inset-bottom: root.safe-area-insets.bottom;
+        inset-left: root.safe-area-insets.left;
+        inset-right: root.safe-area-insets.right;
         close => { root.map-close(); }
         pan(dx, dy) => { root.map-pan(dx, dy); }
         zoom-in => { root.map-zoom-in(); }
         zoom-out => { root.map-zoom-out(); }
         fit => { root.map-fit(); }
+        pinch-zoom(s) => { root.map-pinch-zoom(s); }
         viewport(w, h) => { root.map-viewport(w, h); }
     }
 

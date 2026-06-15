@@ -558,6 +558,21 @@ impl Controller {
         self.refresh_map();
     }
 
+    /// Commit a pinch: the cumulative scale factor maps to an integer zoom
+    /// change (a doubling of the finger spread ≈ one level). The UI scales the
+    /// tile layer live for feedback and resets once we refetch at the new
+    /// level; a sub-threshold pinch (`delta == 0`) just snaps back, handled
+    /// UI-side, so there's nothing to do here.
+    fn map_pinch_zoom(self: &Arc<Self>, scale: f64) {
+        if !(scale.is_finite() && scale > 0.0) {
+            return;
+        }
+        let delta = scale.log2().round() as i32;
+        if delta != 0 {
+            self.map_zoom(delta);
+        }
+    }
+
     fn map_viewport(self: &Arc<Self>, w: f64, h: f64) {
         if w <= 0.0 || h <= 0.0 {
             return;
@@ -701,6 +716,9 @@ impl Controller {
         });
         hook!(on_map_fit, |ctrl| {
             ctrl.map_fit();
+        });
+        hook!(on_map_pinch_zoom, |ctrl, scale: f32| {
+            ctrl.map_pinch_zoom(scale as f64);
         });
         hook!(on_map_viewport, |ctrl, w: f32, h: f32| {
             ctrl.map_viewport(w as f64, h as f64);
