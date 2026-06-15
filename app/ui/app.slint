@@ -475,20 +475,6 @@ component GroupsPage inherits ScrollView {
         spacing: 12px;
         alignment: start;
 
-        SectionTitle { text: "YOUR GROUPS"; }
-        if root.groups.length == 0 : Text {
-            text: "A group is a shared key: everyone holding the secret can see locations sent to it.";
-            color: Theme.muted;
-            font-size: 13px;
-            wrap: word-wrap;
-        }
-        for g[i] in root.groups : GroupRow {
-            item: g;
-            share-key => { root.share-group(g.id); }
-            rotate-key => { root.rotate-group(g.id); }
-            delete-group => { root.delete-group(g.id); }
-        }
-
         SectionTitle { text: "CREATE NEW GROUP"; }
         Card {
             VerticalLayout {
@@ -543,6 +529,20 @@ component GroupsPage inherits ScrollView {
                     }
                 }
             }
+        }
+
+        SectionTitle { text: "YOUR GROUPS"; }
+        if root.groups.length == 0 : Text {
+            text: "A group is a shared key: everyone holding the secret can see locations sent to it.";
+            color: Theme.muted;
+            font-size: 13px;
+            wrap: word-wrap;
+        }
+        for g[i] in root.groups : GroupRow {
+            item: g;
+            share-key => { root.share-group(g.id); }
+            rotate-key => { root.rotate-group(g.id); }
+            delete-group => { root.delete-group(g.id); }
         }
     }
 }
