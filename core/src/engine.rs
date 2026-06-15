@@ -25,10 +25,6 @@ pub const SINCE_LOOKBACK_SECS: u64 = 6 * 3600;
 pub const EXPIRATION_SECS: u64 = 24 * 3600;
 /// Capacity of the processed-event-id replay window.
 pub const SEEN_CAPACITY: usize = 4096;
-/// A location sample older than this is not good enough for a TEST.
-const FRESH_SAMPLE_SECS: u64 = 60;
-/// Give up on a pending TEST if no fix arrives in this time.
-const TEST_FIX_TIMEOUT: Duration = Duration::from_secs(45);
 /// Cap on a sender-declared display name once cleaned for display.
 const MAX_NAME_CHARS: usize = 48;
 
@@ -79,7 +75,6 @@ pub enum EngineCmd {
     /// Update the message attached to subsequent location publishes.
     SetMessage(Option<String>),
     StopShare,
-    SendTest,
     Location(LocationSample),
     /// Permission was denied or location turned off by the platform.
     LocationUnavailable(String),
@@ -127,7 +122,6 @@ pub struct ConfigSnapshot {
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct ShareSnapshot {
     pub sharing: bool,
-    pub test_pending: bool,
     /// Unix seconds of the last successful publish hand-off.
     pub last_publish: Option<u64>,
     pub publish_count: u64,
@@ -297,7 +291,6 @@ pub struct Engine<P: EnginePool> {
     seen: SeenIds,
     seen_dirty: bool,
     share: Option<ShareState>,
-    test_pending: Option<(tokio::time::Instant, Option<String>)>,
     /// keyed by (sender hex, group hex)
     tracks: BTreeMap<(String, String), TrackState>,
     /// Bounded per-session point history for export, keyed identically to
@@ -333,7 +326,6 @@ impl<P: EnginePool> Engine<P> {
             seen,
             seen_dirty: false,
             share: None,
-            test_pending: None,
             tracks: BTreeMap::new(),
             history: BTreeMap::new(),
             pending_exports: BTreeMap::new(),
@@ -402,14 +394,10 @@ impl<P: EnginePool> Engine<P> {
                 self.disarm_resume();
                 self.stop_share();
             }
-            EngineCmd::SendTest => self.send_test(),
             EngineCmd::Location(sample) => self.on_location(sample),
             EngineCmd::LocationUnavailable(reason) => {
-                if self.share.is_some() || self.test_pending.is_some() {
-                    self.toast(format!("Location unavailable: {reason}"));
-                }
-                self.test_pending = None;
                 if self.share.is_some() {
+                    self.toast(format!("Location unavailable: {reason}"));
                     // Permission revoked / GPS off is a real interruption the
                     // user caused; don't try to resume into a denied state.
                     self.disarm_resume();
@@ -536,49 +524,11 @@ impl<P: EnginePool> Engine<P> {
                 Err(e) => log::error!("failed to build STOP event: {e}"),
             }
         }
-        let _ = self
-            .ui_tx
-            .send(UiEvent::NeedLocation(self.test_pending.is_some()));
-        self.emit_share();
-    }
-
-    fn send_test(&mut self) {
-        let recipients = self.selected_recipients();
-        if recipients.is_empty() {
-            self.toast("Select at least one group first".into());
-            return;
-        }
-        // Fresh fix available (e.g. while sharing): send immediately.
-        let fresh = self.share.as_ref().and_then(|s| s.last_sample).filter(|s| {
-            now_secs().saturating_sub(s.ts_secs()) < FRESH_SAMPLE_SECS
-        });
-        if let Some(sample) = fresh {
-            let name = self.outgoing_name();
-            self.publish_payload(
-                GartPayload::test(sample.lat, sample.lng, sample.ts_secs(), None, None)
-                    .with_name(name),
-            );
-            self.toast("Test broadcast sent".into());
-            return;
-        }
-        self.test_pending = Some((tokio::time::Instant::now() + TEST_FIX_TIMEOUT, None));
-        let _ = self.ui_tx.send(UiEvent::NeedLocation(true));
-        self.toast("Waiting for a location fix…".into());
+        let _ = self.ui_tx.send(UiEvent::NeedLocation(false));
         self.emit_share();
     }
 
     fn on_location(&mut self, sample: LocationSample) {
-        if let Some((_, _msg)) = self.test_pending.take() {
-            let name = self.outgoing_name();
-            self.publish_payload(
-                GartPayload::test(sample.lat, sample.lng, sample.ts_secs(), None, None)
-                    .with_name(name),
-            );
-            self.toast("Test broadcast sent".into());
-            let _ = self
-                .ui_tx
-                .send(UiEvent::NeedLocation(self.share.is_some()));
-        }
         let interval = Duration::from_secs(self.config.interval_secs.max(5));
         let due = match &self.share {
             Some(s) => match s.last_publish_at {
@@ -599,16 +549,6 @@ impl<P: EnginePool> Engine<P> {
     }
 
     fn on_tick(&mut self) {
-        if let Some((deadline, _)) = &self.test_pending {
-            if tokio::time::Instant::now() >= *deadline {
-                self.test_pending = None;
-                self.toast("Test failed: no location fix".into());
-                let _ = self
-                    .ui_tx
-                    .send(UiEvent::NeedLocation(self.share.is_some()));
-                self.emit_share();
-            }
-        }
         let interval = Duration::from_secs(self.config.interval_secs.max(5));
         // The tick only catches up a fix that arrived off-cycle (before its
         // interval elapsed); fresh fixes are published on arrival in
@@ -652,7 +592,7 @@ impl<P: EnginePool> Engine<P> {
         );
     }
 
-    /// The display name to stamp on outgoing ACTIVE/TEST broadcasts: the user's
+    /// The display name to stamp on outgoing ACTIVE broadcasts: the user's
     /// configured name, trimmed. `None` → omit it so receivers derive the same
     /// default handle we would (keeping the wire payload minimal).
     fn outgoing_name(&self) -> Option<String> {
@@ -660,41 +600,26 @@ impl<P: EnginePool> Engine<P> {
         (!n.is_empty()).then(|| n.to_string())
     }
 
-    /// Build, sign and hand a payload to the relay pool, updating share
-    /// statistics. Uses the share sender key, or the configured sender key
-    /// for one-off TESTs outside a share session.
+    /// Build, sign and hand the active-share payload to the relay pool,
+    /// recording publish statistics on the live share.
     fn publish_payload(&mut self, payload: GartPayload) {
-        let (sender, recipients) = match &self.share {
-            Some(s) => (s.sender.clone(), s.recipients.clone()),
-            None => {
-                let sender = match self.config.sender_keys() {
-                    Ok(k) => k,
-                    Err(e) => {
-                        self.toast(format!("Sender key error: {e}"));
-                        return;
-                    }
-                };
-                self.persist();
-                (sender, self.selected_recipients())
-            }
-        };
+        let Some(state) = &self.share else { return };
+        let sender = state.sender.clone();
+        let recipients = state.recipients.clone();
         if recipients.is_empty() {
             return;
         }
-        let is_active = payload.status == Status::Active;
         match protocol::build_event(&sender, &recipients, &payload, self.expiration()) {
             Ok(event) => {
                 let id = event.id;
                 self.pool.publish(event);
                 if let Some(s) = &mut self.share {
-                    if is_active {
-                        s.last_publish_at = Some(tokio::time::Instant::now());
-                        s.last_publish_ts = Some(now_secs());
-                        s.publish_count += 1;
-                        s.last_event_id = Some(id);
-                        s.last_acked = false;
-                        s.last_sample_published = true;
-                    }
+                    s.last_publish_at = Some(tokio::time::Instant::now());
+                    s.last_publish_ts = Some(now_secs());
+                    s.publish_count += 1;
+                    s.last_event_id = Some(id);
+                    s.last_acked = false;
+                    s.last_sample_published = true;
                 }
                 self.emit_share();
             }
@@ -1044,16 +969,12 @@ impl<P: EnginePool> Engine<P> {
         let snap = match &self.share {
             Some(s) => ShareSnapshot {
                 sharing: true,
-                test_pending: self.test_pending.is_some(),
                 last_publish: s.last_publish_ts,
                 publish_count: s.publish_count,
                 last_acked: s.last_acked,
                 waiting_for_fix: s.last_sample.is_none(),
             },
-            None => ShareSnapshot {
-                test_pending: self.test_pending.is_some(),
-                ..Default::default()
-            },
+            None => ShareSnapshot::default(),
         };
         let _ = self.ui_tx.send(UiEvent::Share(snap));
     }
@@ -1479,37 +1400,6 @@ mod tests {
         assert!(evs.iter().any(|e| matches!(e, UiEvent::Toast(_))));
         assert!(f.pool.published.lock().unwrap().is_empty());
         assert!(!evs.iter().any(|e| matches!(e, UiEvent::NeedLocation(true))));
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn test_broadcast_waits_for_fix_and_times_out() {
-        let mut f = fixture();
-        add_member_group(&mut f, "G");
-        drain(&mut f);
-
-        f.engine.handle(EngineCmd::SendTest);
-        assert!(drain(&mut f)
-            .iter()
-            .any(|e| matches!(e, UiEvent::NeedLocation(true))));
-
-        // A fix arrives → TEST is published and location released.
-        f.engine.handle(EngineCmd::Location(sample(now_secs() * 1000)));
-        let published = f.pool.published.lock().unwrap().clone();
-        assert_eq!(published.len(), 1);
-        assert!(drain(&mut f)
-            .iter()
-            .any(|e| matches!(e, UiEvent::NeedLocation(false))));
-
-        // Timeout path: request again, never deliver a fix.
-        f.engine.handle(EngineCmd::SendTest);
-        drain(&mut f);
-        tokio::time::advance(Duration::from_secs(46)).await;
-        f.engine.handle(EngineCmd::Tick);
-        let evs = drain(&mut f);
-        assert!(evs.iter().any(
-            |e| matches!(e, UiEvent::Toast(t) if t.contains("no location fix"))
-        ));
-        assert_eq!(f.pool.published.lock().unwrap().len(), 1, "no extra publish");
     }
 
     #[tokio::test(start_paused = true)]

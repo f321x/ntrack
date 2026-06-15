@@ -146,7 +146,6 @@ component Toggle inherits Rectangle {
 component SharePage inherits ScrollView {
     in property <[GroupItem]> groups;
     in property <bool> sharing;
-    in property <bool> test-pending;
     in property <bool> waiting-fix;
     in property <string> status-headline;
     in property <string> status-detail;
@@ -156,7 +155,6 @@ component SharePage inherits ScrollView {
     callback toggle-group(string, bool);
     callback start-share(string);
     callback stop-share();
-    callback send-test();
     callback set-interval(int);
     callback message-edited(string);
 
@@ -264,17 +262,6 @@ component SharePage inherits ScrollView {
                     root.start-share(msg-input.text);
                 }
             }
-        }
-        AppButton {
-            text: root.test-pending ? "Sending test…" : "Send test broadcast";
-            enabled: !root.test-pending;
-            clicked => { root.send-test(); }
-        }
-        Text {
-            text: "A test broadcast verifies the whole pipeline — relays, encryption and your group members' apps — without starting a live share.";
-            color: Theme.muted;
-            font-size: 12px;
-            wrap: word-wrap;
         }
     }
 }
@@ -688,7 +675,6 @@ export component MainWindow inherits Window {
     in property <[TrackItem]> tracks;
     in property <[RelayItem]> relays;
     in property <bool> sharing;
-    in property <bool> test-pending;
     in property <bool> waiting-fix;
     in property <string> status-headline: "Not sharing";
     in property <string> status-detail: "";
@@ -727,7 +713,6 @@ export component MainWindow inherits Window {
     callback toggle-group(string, bool);
     callback start-share(string);
     callback stop-share();
-    callback send-test();
     callback set-interval(int);
     callback message-edited(string);
     callback open-map(int);
@@ -800,7 +785,6 @@ export component MainWindow inherits Window {
             if root.current-page == 0 : SharePage {
                 groups: root.groups;
                 sharing: root.sharing;
-                test-pending: root.test-pending;
                 waiting-fix: root.waiting-fix;
                 status-headline: root.status-headline;
                 status-detail: root.status-detail;
@@ -808,7 +792,6 @@ export component MainWindow inherits Window {
                 toggle-group(id, v) => { root.toggle-group(id, v); }
                 start-share(msg) => { root.start-share(msg); }
                 stop-share => { root.stop-share(); }
-                send-test => { root.send-test(); }
                 set-interval(i) => { root.set-interval(i); }
                 message-edited(m) => { root.message-edited(m); }
             }

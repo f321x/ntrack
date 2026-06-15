@@ -81,7 +81,7 @@ be dropped, as required (test: `unknown_status_is_dropped`).
 `name` is **not** part of the canonical NIP-GART payload; it is a
 non-normative ntrack extension carrying the sender's self-chosen display name.
 
-* Senders attach it to ACTIVE/TEST broadcasts (`GartPayload::with_name`) only
+* Senders attach it to ACTIVE broadcasts (`GartPayload::with_name`) only
   when the user has set a custom name; it is omitted from STOP (kept minimal)
   and omitted entirely otherwise.
 * When absent, the receiver derives a stable `Adjective Animal` handle from the
@@ -174,7 +174,8 @@ harmless. (Test: `subscription_filter_shape`.)
 * Stopping a share (including when location becomes unavailable, and on
   app shutdown, best effort) publishes a `STOP` so receivers don't show a
   stale live state.
-* "Send test broadcast" publishes a `TEST` with the current position and no
-  `tester` list (visible to every member), so the full pipeline can be
-  verified before relying on it — mirroring Gart's operational-safety
-  guidance.
+* ntrack only ever originates `ACTIVE` and `STOP` events; it never sends a
+  `TEST`. (The first `ACTIVE` goes out as soon as sharing starts, so a
+  separate "test broadcast" would be redundant.) `TEST` broadcasts are still
+  consumed and badged when received from other NIP-GART apps — see the
+  receiver pipeline above.
