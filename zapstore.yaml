@@ -58,3 +58,7 @@ description: |
   - Share — publish your encrypted location at a set interval.
   - Track — follow your groups on a live map; incoming locations are verified,
     deduplicated and decrypted on-device, each with an "open in maps" shortcut.
+  - Alert — in a dangerous situation, one tap raises a duress alert (starting a
+    share if needed): your updates speed up and a loud, pinned notification
+    reaches every group member. A check-in timer can auto-escalate to it if you
+    don't confirm you're safe in time.

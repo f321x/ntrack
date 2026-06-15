@@ -24,6 +24,10 @@ channel — exactly as you would the bare `nsec`.
   linked to a personal Nostr identity.
 - **Track** — subscribes to your groups, verifies + dedups + decrypts incoming events, and shows
   each sender live with an "open in maps" shortcut.
+- **Alert** — for dangerous situations: one tap raises a duress alert (starting a share if you
+  weren't already) that speeds up your updates and fires a loud, pinned notification on every group
+  member's phone. Arm a **check-in** timer and ntrack escalates to that alert automatically if you
+  don't confirm you're safe in time — even across a reboot.
 
 Full protocol ↔ implementation ↔ test mapping: [docs/PROTOCOL.md](docs/PROTOCOL.md).
 
