@@ -260,6 +260,30 @@ public final class LocationBridge {
         });
     }
 
+    /**
+     * Read the current clipboard text, or "" when empty/unreadable. Called
+     * synchronously from the UI thread (where Rust invokes it), so no looper
+     * hop is needed; coerceToText turns non-plain clips into their text form.
+     * Android 10+ only returns clipboard contents while the app has focus,
+     * which it does when the user taps the in-app Paste button.
+     */
+    public static String getClipboardText() {
+        final Activity activity = MainActivity.current();
+        if (activity == null) return "";
+        try {
+            ClipboardManager cm =
+                    (ClipboardManager) activity.getSystemService(Context.CLIPBOARD_SERVICE);
+            if (cm == null || !cm.hasPrimaryClip()) return "";
+            ClipData clip = cm.getPrimaryClip();
+            if (clip == null || clip.getItemCount() == 0) return "";
+            CharSequence text = clip.getItemAt(0).coerceToText(activity);
+            return text == null ? "" : text.toString();
+        } catch (Exception e) {
+            Log.e(TAG, "getClipboardText failed", e);
+            return "";
+        }
+    }
+
     public static void shareText(final String text) {
         final Activity activity = MainActivity.current();
         if (activity == null) return;

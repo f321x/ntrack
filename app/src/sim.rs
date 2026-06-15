@@ -90,6 +90,17 @@ impl Platform for SimPlatform {
         log::info!("sim: copy to clipboard ({} chars)", text.len());
     }
 
+    fn paste_text(&self) -> String {
+        // Desktop has no clipboard wiring; synthesize an invite so the Paste →
+        // import pre-fill flow can be exercised on the workstation, mirroring
+        // the synthetic [`scan_qr`].
+        let k = ntrack_core::keys::generate();
+        let nsec = ntrack_core::keys::nsec(&k);
+        let invite = ntrack_core::invite::build_invite("Pasted Demo", nsec.expose(), &[]);
+        log::info!("sim: paste_text -> synthetic invite");
+        invite
+    }
+
     fn share_text(&self, text: &str) {
         log::info!("sim: share sheet ({} chars)", text.len());
     }

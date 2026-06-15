@@ -33,6 +33,10 @@ pub trait Platform: Send + Sync + 'static {
     fn stop_location(&self);
     fn open_map(&self, lat: f64, lng: f64, label: &str);
     fn copy_text(&self, text: &str);
+    /// Read the current clipboard text (empty string if the clipboard is empty
+    /// or unreadable). Called synchronously from the UI thread to fill the
+    /// import form from a copied invite/key.
+    fn paste_text(&self) -> String;
     fn share_text(&self, text: &str);
     /// Open the camera QR scanner. The decoded string arrives asynchronously
     /// as [`PlatformEvent::IncomingInvite`].

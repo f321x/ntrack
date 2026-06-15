@@ -210,6 +210,40 @@ impl Controller {
         self.toast("Invite scanned — review and tap Import");
     }
 
+    /// The user tapped "Paste" on the Groups tab. Read the clipboard and fill
+    /// the import form: a full `ntrack://join` invite pre-fills the name and
+    /// stashes its relays (exactly like a scan), while a bare key drops into the
+    /// key field without disturbing a name the user may already have typed.
+    /// Unrecognized text is still shown in the key field so the user can see
+    /// what was pasted and gets a precise error when they tap Import.
+    fn paste_invite(self: &Arc<Self>) {
+        let raw = self.platform.paste_text();
+        let raw = raw.trim().to_string();
+        if raw.is_empty() {
+            self.toast("Clipboard is empty");
+            return;
+        }
+        match ntrack_core::invite::parse_shared(&raw) {
+            Some(invite) => {
+                self.view.lock().unwrap().pending_invite = Some(invite.clone());
+                let name = invite.name.filter(|n| !n.trim().is_empty());
+                let key = invite.key;
+                let _ = self.ui.upgrade_in_event_loop(move |ui| {
+                    if let Some(name) = name {
+                        ui.set_import_name_text(name.into());
+                    }
+                    ui.set_import_key_text(key.into());
+                });
+            }
+            None => {
+                let _ = self.ui.upgrade_in_event_loop(move |ui| {
+                    ui.set_import_key_text(raw.into());
+                });
+            }
+        }
+        self.toast("Pasted — review and tap Import");
+    }
+
     fn spawn_ui_event_loop(self: Arc<Self>, mut ui_rx: mpsc::UnboundedReceiver<UiEvent>) {
         let ctrl = self.clone();
         self.rt.spawn(async move {
@@ -497,6 +531,10 @@ impl Controller {
 
         hook!(on_scan_qr, |ctrl| {
             ctrl.platform.scan_qr();
+        });
+
+        hook!(on_paste, |ctrl| {
+            ctrl.paste_invite();
         });
 
         hook!(on_share_group, |ctrl, id: slint::SharedString| {

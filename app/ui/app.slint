@@ -446,6 +446,7 @@ component GroupsPage inherits ScrollView {
     callback rotate-group(string);
     callback delete-group(string);
     callback scan-qr();
+    callback paste();
 
     VerticalLayout {
         padding: Theme.pad;
@@ -477,6 +478,9 @@ component GroupsPage inherits ScrollView {
                     primary: true;
                     clicked => {
                         root.create-group(new-name.text);
+                        // Drop focus before the QR dialog opens so the input
+                        // caret doesn't blink through it.
+                        new-name.clear-focus();
                         new-name.text = "";
                     }
                 }
@@ -488,9 +492,16 @@ component GroupsPage inherits ScrollView {
             VerticalLayout {
                 padding: Theme.pad;
                 spacing: 10px;
-                AppButton {
-                    text: "Scan QR code";
-                    clicked => { root.scan-qr(); }
+                HorizontalLayout {
+                    spacing: 10px;
+                    AppButton {
+                        text: "Scan QR 📷";
+                        clicked => { root.scan-qr(); }
+                    }
+                    AppButton {
+                        text: "Paste 📋";
+                        clicked => { root.paste(); }
+                    }
                 }
                 import-name := LineEdit {
                     placeholder-text: "Group name";
@@ -600,6 +611,12 @@ component SettingsPage inherits ScrollView {
 component ModalScrim inherits Rectangle {
     callback dismiss();
     background: #000000cc;
+    // Pull keyboard focus off the page when a dialog opens, so a text caret
+    // left behind in an input (e.g. the group-name field after "Create group")
+    // stops blinking through the overlay. Inputs inside the dialog still take
+    // focus when tapped.
+    init => { focus-sink.focus(); }
+    focus-sink := FocusScope { width: 0px; height: 0px; }
     TouchArea { clicked => { root.dismiss(); } }
 }
 
@@ -664,6 +681,7 @@ export component MainWindow inherits Window {
     callback rotate-group(string);
     callback delete-group(string);
     callback scan-qr();
+    callback paste();
     callback confirm-accepted();
     callback add-relay(string);
     callback remove-relay(string);
@@ -755,6 +773,7 @@ export component MainWindow inherits Window {
                 rotate-group(id) => { root.rotate-group(id); }
                 delete-group(id) => { root.delete-group(id); }
                 scan-qr => { root.scan-qr(); }
+                paste => { root.paste(); }
             }
             if root.current-page == 3 : SettingsPage {
                 relays: root.relays;

@@ -234,6 +234,19 @@ impl Platform for AndroidPlatform {
         });
     }
 
+    fn paste_text(&self) -> String {
+        self.with_env("getClipboardText", |env, class| {
+            let obj = env
+                .call_static_method(class, "getClipboardText", "()Ljava/lang/String;", &[])
+                .and_then(|v| v.l())?;
+            // Java always returns a (possibly empty) String, never null.
+            let jstr = JString::from(obj);
+            let java_str = env.get_string(&jstr)?;
+            Ok(String::from(java_str))
+        })
+        .unwrap_or_default()
+    }
+
     fn share_text(&self, text: &str) {
         self.with_env("shareText", |env, class| {
             let jtext = env.new_string(text)?;
