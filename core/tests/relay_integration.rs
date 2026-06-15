@@ -130,7 +130,7 @@ async fn publish_reaches_relay_and_ok_is_reported() {
 
     let frame = recv_frame(&mut relay).await;
     assert_eq!(frame[0], "EVENT");
-    assert_eq!(frame[1]["kind"], 694);
+    assert_eq!(frame[1]["kind"], 3434);
     assert_eq!(frame[1]["id"], event.id.to_hex());
 
     // pool surfaces the OK as a PublishAck
@@ -161,7 +161,7 @@ async fn subscription_is_sent_and_incoming_event_is_decryptable() {
     // REQ arrives with our filter
     let frame = recv_frame(&mut relay).await;
     assert_eq!(frame[0], "REQ");
-    assert_eq!(frame[2]["kinds"][0], 694);
+    assert_eq!(frame[2]["kinds"][0], 3434);
     assert_eq!(frame[2]["#p"][0], group.public_key().to_hex());
     let subid = frame[1].as_str().unwrap().to_string();
 
@@ -285,7 +285,7 @@ async fn fetch_backfill_reqs_streams_events_then_closes_on_eose() {
     assert_eq!(frame[0], "REQ");
     let subid = frame[1].as_str().unwrap().to_string();
     assert_eq!(subid, "ntrack-fetch-7");
-    assert_eq!(frame[2]["kinds"][0], 694);
+    assert_eq!(frame[2]["kinds"][0], 3434);
     assert_eq!(frame[2]["authors"][0], event.pubkey.to_hex());
 
     // The relay streams one stored event, then EOSE on that subid.

@@ -1,4 +1,4 @@
-//! Minimal Nostr relay pool: publish kind:694 events to every configured
+//! Minimal Nostr relay pool: publish kind:3434 events to every configured
 //! relay and maintain one logical subscription, with automatic reconnect
 //! and offline publish queueing.
 //!
@@ -610,10 +610,10 @@ mod tests {
     use super::*;
     use nostr::{EventBuilder, Keys, Kind};
 
-    /// A real signed kind:694 event, for the EVENT-routing cases.
+    /// A real signed kind:3434 event, for the EVENT-routing cases.
     fn signed_event() -> Event {
         let keys = Keys::generate();
-        EventBuilder::new(Kind::Custom(694), "ciphertext")
+        EventBuilder::new(Kind::Custom(3434), "ciphertext")
             .sign_with_keys(&keys)
             .unwrap()
     }

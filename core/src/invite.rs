@@ -19,7 +19,7 @@
 //!   readable); on parse they are normalized, deduped and capped.
 //!
 //! This is purely an app convenience layer; it is **not** part of the wire
-//! protocol and never appears in a kind:694 event. Importing also accepts a
+//! protocol and never appears in a kind:3434 event. Importing also accepts a
 //! bare `nsec1…`/`npub1…`/hex string (see [`parse_shared`]).
 
 use percent_encoding::{percent_decode_str, utf8_percent_encode, AsciiSet, NON_ALPHANUMERIC};

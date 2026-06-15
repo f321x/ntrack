@@ -1,16 +1,16 @@
 # The ntrack protocol
 
-ntrack shares live location over Nostr as end-to-end-encrypted **kind:694**
+ntrack shares live location over Nostr as end-to-end-encrypted **kind:3434**
 events. This document specifies the wire format ntrack implements and maps each
 rule to its implementation and test in `core/src/protocol.rs`.
 
 ## Event
 
-ntrack publishes and consumes Nostr **kind:694** events:
+ntrack publishes and consumes Nostr **kind:3434** events:
 
 ```json
 {
-  "kind": 694,
+  "kind": 3434,
   "pubkey": "<sender-key pubkey, hex>",
   "created_at": 1722173222,
   "tags": [["p", "<recipient pseudonym pubkey, hex>"]],
@@ -102,7 +102,7 @@ Tests: `name_roundtrips_through_the_payload`, `with_name_trims_and_drops_blank`
 Implemented in `protocol::process_incoming`, exercised end-to-end in
 `core/tests/relay_integration.rs`:
 
-1. kind check (≠694 → drop)
+1. kind check (≠3434 → drop)
 2. **NIP-01 id + signature verification** — the receiver MUST verify the event
    id and signature per NIP-01 before any further processing (test:
    `tampered_event_fails_verification`)
@@ -118,19 +118,19 @@ Implemented in `protocol::process_incoming`, exercised end-to-end in
 `process_for_export` runs the same verify → decrypt → validate body as
 `process_incoming` (steps 1, 2, 4–6) but deliberately **omits the replay
 dedup** (step 3) and never reads or writes `SeenIds`. It exists because
-exporting a track re-fetches `kind:694` events the live path has already
+exporting a track re-fetches `kind:3434` events the live path has already
 seen; routing those through `process_incoming` would drop nearly all of them
 as `Duplicate` and churn the bounded replay window. The shared body is
 factored into a private `decrypt_and_validate`, so the live receiver's
 behaviour is unchanged (tests: `process_for_export_decrypts_without_touching_seen`,
 `process_for_export_still_verifies_and_validates`). The one-shot backfill
-filter is `backfill_filter` — `{"kinds":[694], "authors":[<sender>],
+filter is `backfill_filter` — `{"kinds":[3434], "authors":[<sender>],
 "#p":[<group>], "since":…, "limit":…}`.
 
 ## Subscription
 
 ```json
-{"kinds": [694], "#p": ["<recipient pubkey hex>", …], "since": <now - 6h>}
+{"kinds": [3434], "#p": ["<recipient pubkey hex>", …], "since": <now - 6h>}
 ```
 
 `since` bounds startup traffic; the replay window makes the overlap

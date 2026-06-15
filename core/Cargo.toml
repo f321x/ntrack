@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "ntrack live location sharing protocol core (Nostr kind:694): events, crypto, relays, engines"
+description = "ntrack live location sharing protocol core (Nostr kind:3434): events, crypto, relays, engines"
 
 [dependencies]
 nostr.workspace = true

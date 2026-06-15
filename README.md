@@ -5,7 +5,7 @@
 An Android app (Rust + [Slint](https://slint.dev) UI) that shares your live location with a
 chosen group of people. Locations are NIP-44 encrypted, so relays only ever see ciphertext from a
 throwaway sender key — no accounts, no central server, any Nostr relay works. The wire protocol is
-a small Nostr convention built on `kind:694` events — see [docs/PROTOCOL.md](docs/PROTOCOL.md).
+a small Nostr convention built on `kind:3434` events — see [docs/PROTOCOL.md](docs/PROTOCOL.md).
 
 ## How it works
 
@@ -72,7 +72,7 @@ docs/      PROTOCOL.md — protocol ↔ implementation ↔ tests
 
 ## Security & privacy
 
-- Locations are end-to-end encrypted (NIP-44 v2); relays see only `kind:694` ciphertext and
+- Locations are end-to-end encrypted (NIP-44 v2); relays see only `kind:3434` ciphertext and
   pubkeys.
 - Anyone with a group's `nsec` can decrypt its past *and* future locations — **rotate the key when
   membership changes** (Groups → Rotate). The sender key is rotatable too (Settings).

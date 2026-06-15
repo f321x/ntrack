@@ -1,11 +1,11 @@
-//! kind:694 event construction, parsing and validation — the ntrack wire
+//! kind:3434 event construction, parsing and validation — the ntrack wire
 //! protocol.
 //!
 //! Wire format recap (see docs/PROTOCOL.md):
 //!
 //! ```json
 //! {
-//!   "kind": 694,
+//!   "kind": 3434,
 //!   "pubkey": "<sender-key pubkey, hex>",
 //!   "created_at": 1722173222,
 //!   "tags": [["p", "<recipient pseudonym pubkey, hex>"]],
@@ -38,7 +38,7 @@ use crate::dedup::SeenIds;
 use crate::error::{Error, Result};
 
 /// Nostr event kind ntrack uses for encrypted live-location broadcasts.
-pub const EVENT_KIND: u16 = 694;
+pub const EVENT_KIND: u16 = 3434;
 
 /// Broadcast status carried in the encrypted payload.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -58,7 +58,7 @@ impl std::fmt::Display for Status {
     }
 }
 
-/// Decrypted kind:694 payload.
+/// Decrypted kind:3434 payload.
 ///
 /// Unknown *additional* fields from future protocol revisions are tolerated
 /// on receive; unknown `status` values cause the event to be dropped (the
@@ -134,7 +134,7 @@ struct MultiPayload {
 
 const MULTI_PAYLOAD_VERSION: u32 = 1;
 
-/// Build and sign a kind:694 event for the given recipients.
+/// Build and sign a kind:3434 event for the given recipients.
 ///
 /// * `sender` MUST be a dedicated sender key (the caller guarantees it is
 ///   never the user's main identity — ntrack only ever generates such keys).
@@ -319,7 +319,7 @@ fn decrypt_and_validate(
 }
 
 /// Subscription filter for all groups we can receive for:
-/// `{"kinds":[694], "#p":[<recipient pubkeys>]}` plus a `since` bound to
+/// `{"kinds":[3434], "#p":[<recipient pubkeys>]}` plus a `since` bound to
 /// keep startup traffic sane (dedup handles overlap).
 pub fn subscription_filter(group_pubkeys: &[PublicKey], since_secs_ago: u64) -> nostr::Filter {
     nostr::Filter::new()
@@ -329,7 +329,7 @@ pub fn subscription_filter(group_pubkeys: &[PublicKey], since_secs_ago: u64) -> 
 }
 
 /// One-shot backfill filter for exporting a single sender's track within one
-/// group: `{"kinds":[694], "authors":[<sender>], "#p":[<group>], "since":…,
+/// group: `{"kinds":[3434], "authors":[<sender>], "#p":[<group>], "since":…,
 /// "limit":…}`. Pinning both the `author` (the sender's signing key) and the
 /// single recipient `#p` (the group) keeps the relay result set tight.
 pub fn backfill_filter(
@@ -362,7 +362,7 @@ mod tests {
         let payload = Payload::active(48.137, 11.575, 1722173222, Some("hi".into()));
         let event = build_event(&sender, &[group.public_key()], &payload, None).unwrap();
 
-        assert_eq!(event.kind, Kind::Custom(694));
+        assert_eq!(event.kind, Kind::Custom(3434));
         // single recipient → bare ciphertext, not a JSON envelope
         assert!(!event.content.starts_with('{'));
         let ptags: Vec<_> = event.tags.public_keys().collect();
@@ -588,7 +588,7 @@ mod tests {
         let g2 = generate().public_key();
         let f = subscription_filter(&[g1, g2], 3600);
         let json = serde_json::to_value(&f).unwrap();
-        assert_eq!(json["kinds"], serde_json::json!([694]));
+        assert_eq!(json["kinds"], serde_json::json!([3434]));
         let pks: BTreeSet<String> = json["#p"]
             .as_array()
             .unwrap()
@@ -605,7 +605,7 @@ mod tests {
         let sender = generate().public_key();
         let f = backfill_filter(group, sender, 3600, 5000);
         let json = serde_json::to_value(&f).unwrap();
-        assert_eq!(json["kinds"], serde_json::json!([694]));
+        assert_eq!(json["kinds"], serde_json::json!([3434]));
         // exactly one author (the sender) and one #p (the group)
         assert_eq!(json["authors"], serde_json::json!([sender.to_hex()]));
         assert_eq!(json["#p"], serde_json::json!([group.to_hex()]));

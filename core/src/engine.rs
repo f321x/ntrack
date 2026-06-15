@@ -1595,7 +1595,7 @@ mod tests {
         let g = add_member_group(&mut f, "A");
         let filter = f.pool.subscription.lock().unwrap().clone().unwrap();
         let json = serde_json::to_value(&filter).unwrap();
-        assert_eq!(json["kinds"], serde_json::json!([694]));
+        assert_eq!(json["kinds"], serde_json::json!([3434]));
         assert_eq!(json["#p"][0], g.public);
 
         // Removing the group clears the subscription.
@@ -1857,7 +1857,7 @@ mod tests {
 
     // ---- track history & GPX export ------------------------------------
 
-    /// Build a signed kind:694 event from `sender` to `group` with explicit
+    /// Build a signed kind:3434 event from `sender` to `group` with explicit
     /// `created_at` (event/publish time); `payload` carries the capture `ts`.
     fn event_with(sender: &Keys, group: &Group, payload: Payload, created_at: u64) -> Event {
         let plaintext = serde_json::to_string(&payload).unwrap();
@@ -2143,7 +2143,7 @@ mod tests {
         export(&mut f, &sender, &group);
         let filter = f.pool.last_fetch_filter().expect("fetch dispatched");
         let json = serde_json::to_value(&filter).unwrap();
-        assert_eq!(json["kinds"], serde_json::json!([694]));
+        assert_eq!(json["kinds"], serde_json::json!([3434]));
         assert_eq!(json["authors"], serde_json::json!([sender.public_key().to_hex()]));
         assert_eq!(json["#p"], serde_json::json!([group.public]));
         assert!(json["since"].as_u64().unwrap() > 0);

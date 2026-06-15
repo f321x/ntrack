@@ -3,7 +3,7 @@
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
 ntrack is an Android app (Rust + [Slint](https://slint.dev) UI) for live location sharing over
-Nostr (`kind:694` events, NIP-44 v2 end-to-end encryption). The wire protocol is specified in
+Nostr (`kind:3434` events, NIP-44 v2 end-to-end encryption). The wire protocol is specified in
 `docs/PROTOCOL.md`, which maps each normative requirement to its implementation and test — read it
 before touching `core/src/protocol.rs`.
 
@@ -99,9 +99,9 @@ but can only be *constructed* on Android.
 ### Relay & protocol layer
 
 `relay::RelayPool` is a minimal Nostr relay pool (publish / subscribe / reconnect) over
-tokio-tungstenite + rustls. `protocol.rs` builds, signs, parses, and validates `kind:694` events;
+tokio-tungstenite + rustls. `protocol.rs` builds, signs, parses, and validates `kind:3434` events;
 `process_incoming` verifies the NIP-01 id + signature, dedups via `SeenIds`, and decrypts. Group
-subscriptions filter on `kinds:[694]` + `#p` (recipient pseudonym pubkeys).
+subscriptions filter on `kinds:[3434]` + `#p` (recipient pseudonym pubkeys).
 
 ## Conventions & gotchas that span files
 

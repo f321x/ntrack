@@ -2,7 +2,7 @@
 //!
 //! ntrack uses two key roles:
 //!
-//! * **sender key** — a dedicated keypair used only to sign kind:694 events.
+//! * **sender key** — a dedicated keypair used only to sign kind:3434 events.
 //!   It MUST be distinct from the user's main Nostr identity (we never even
 //!   ask for a main identity, every key in ntrack is app-generated).
 //! * **recipient pseudonym key** — a keypair shared by all members of a
