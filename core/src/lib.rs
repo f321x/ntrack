@@ -1,9 +1,7 @@
-//! ntrack-core — implementation of the NIP-GART protocol (Nostr kind:694)
-//! for live location sharing, plus the relay plumbing and engines used by
-//! the ntrack app.
+//! ntrack-core — the ntrack live-location-sharing protocol (Nostr kind:694),
+//! plus the relay plumbing and engines used by the ntrack app.
 //!
-//! Protocol reference:
-//! <https://gitea.gart.io/gart/gart-app-releases/src/branch/main/NIP-GART.md>
+//! The wire protocol is specified in `docs/PROTOCOL.md`.
 //!
 //! Layering (everything here is UI-free and runs on any host, which keeps
 //! the protocol fully unit-testable off-device):

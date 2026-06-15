@@ -15,7 +15,7 @@ use tokio::sync::mpsc;
 use crate::config::{Config, ConfigStore};
 use crate::dedup::SeenIds;
 use crate::keys;
-use crate::protocol::{self, GartPayload, Status};
+use crate::protocol::{self, Payload, Status};
 use crate::relay::{PoolEvent, Publisher};
 
 /// How far back the tracking subscription looks on (re)start. Replay
@@ -80,7 +80,7 @@ pub enum EngineCmd {
     LocationUnavailable(String),
     /// Ask the engine to emit the share dialog data for a group.
     RequestGroupShare { group_hex: String },
-    /// Rotate a group's recipient pseudonym key (NIP-GART MUST-provide).
+    /// Rotate a group's recipient pseudonym key.
     /// Emits the refreshed config plus a [`UiEvent::GroupShare`] carrying the
     /// new secret for redistribution to members.
     RotateGroup { group_hex: String },
@@ -144,7 +144,6 @@ pub struct TrackSnapshot {
     pub group_name: String,
     pub status: Status,
     pub live: bool,
-    pub is_test: bool,
     pub lat: f64,
     pub lng: f64,
     /// Location capture time (unix seconds); 0 when unknown (bare STOP).
@@ -202,11 +201,11 @@ struct ShareState {
 #[derive(Clone)]
 struct TrackState {
     group: PublicKey,
-    payload: GartPayload,
+    payload: Payload,
     created_at: u64,
-    /// Coordinates retained from the last ACTIVE/TEST when a STOP arrives.
+    /// Coordinates retained from the last ACTIVE when a STOP arrives.
     last_coords: Option<(f64, f64, u64)>,
-    /// Sanitized display name from the last ACTIVE/TEST, retained across a STOP
+    /// Sanitized display name from the last ACTIVE, retained across a STOP
     /// (which carries none) so a sender's chosen name survives going offline.
     last_name: Option<String>,
 }
@@ -221,11 +220,11 @@ struct HistPoint {
 }
 
 impl HistPoint {
-    /// The point an ACTIVE/TEST broadcast contributes to a track, or `None` for
+    /// The point an ACTIVE broadcast contributes to a track, or `None` for
     /// a STOP (a boundary, not a point) or a payload missing coordinates.
     fn from_incoming(inc: &protocol::Incoming) -> Option<Self> {
         match (inc.payload.status, inc.payload.lat, inc.payload.lng, inc.payload.ts) {
-            (Status::Active | Status::Test, Some(lat), Some(lng), Some(ts)) => {
+            (Status::Active, Some(lat), Some(lng), Some(ts)) => {
                 Some(Self { lat, lng, ts, created_at: inc.created_at })
             }
             _ => None,
@@ -517,7 +516,7 @@ impl<P: EnginePool> Engine<P> {
             match protocol::build_event(
                 &state.sender,
                 &state.recipients,
-                &GartPayload::stop(),
+                &Payload::stop(),
                 self.expiration(),
             ) {
                 Ok(event) => self.pool.publish(event),
@@ -588,7 +587,7 @@ impl<P: EnginePool> Engine<P> {
         let msg = self.share.as_ref().and_then(|s| s.msg.clone());
         let name = self.outgoing_name();
         self.publish_payload(
-            GartPayload::active(sample.lat, sample.lng, sample.ts_secs(), msg).with_name(name),
+            Payload::active(sample.lat, sample.lng, sample.ts_secs(), msg).with_name(name),
         );
     }
 
@@ -602,7 +601,7 @@ impl<P: EnginePool> Engine<P> {
 
     /// Build, sign and hand the active-share payload to the relay pool,
     /// recording publish statistics on the live share.
-    fn publish_payload(&mut self, payload: GartPayload) {
+    fn publish_payload(&mut self, payload: Payload) {
         let Some(state) = &self.share else { return };
         let sender = state.sender.clone();
         let recipients = state.recipients.clone();
@@ -655,9 +654,6 @@ impl<P: EnginePool> Engine<P> {
                     }
                     Err(drop) => {
                         log::debug!("dropped incoming event: {drop:?}");
-                        if drop == protocol::DropReason::TestNotForUs {
-                            self.seen_dirty = true;
-                        }
                     }
                 }
             }
@@ -1023,7 +1019,6 @@ impl<P: EnginePool> Engine<P> {
                 group_name,
                 status: t.payload.status,
                 live: t.payload.status == Status::Active,
-                is_test: t.payload.status == Status::Test,
                 lat,
                 lng,
                 ts,
@@ -1412,7 +1407,7 @@ mod tests {
         let ev1 = protocol::build_event(
             &sender,
             &[group.public_key().unwrap()],
-            &GartPayload::active(10.0, 20.0, 1000, Some("hi".into())),
+            &Payload::active(10.0, 20.0, 1000, Some("hi".into())),
             None,
         )
         .unwrap();
@@ -1438,7 +1433,7 @@ mod tests {
         let stop = protocol::build_event(
             &sender,
             &[group.public_key().unwrap()],
-            &GartPayload::stop(),
+            &Payload::stop(),
             None,
         )
         .unwrap();
@@ -1472,7 +1467,7 @@ mod tests {
         let ev = protocol::build_event(
             &sender,
             &[group.public_key().unwrap()],
-            &GartPayload::active(10.0, 20.0, 1000, None),
+            &Payload::active(10.0, 20.0, 1000, None),
             None,
         )
         .unwrap();
@@ -1536,7 +1531,7 @@ mod tests {
         let ev = protocol::build_event(
             &sender,
             &[group.public_key().unwrap()],
-            &GartPayload::active(1.0, 2.0, 1000, None).with_name(Some("Bea".into())),
+            &Payload::active(1.0, 2.0, 1000, None).with_name(Some("Bea".into())),
             None,
         )
         .unwrap();
@@ -1571,11 +1566,11 @@ mod tests {
             event_with(
                 &sender,
                 &group,
-                GartPayload::active(1.0, 2.0, 1000, None).with_name(Some("Cleo".into())),
+                Payload::active(1.0, 2.0, 1000, None).with_name(Some("Cleo".into())),
                 1000,
             ),
         );
-        feed(&mut f, event_with(&sender, &group, GartPayload::stop(), 1100));
+        feed(&mut f, event_with(&sender, &group, Payload::stop(), 1100));
         let tracks = last_tracks(drain(&mut f)).unwrap();
         assert_eq!(tracks[0].status, Status::Stop);
         assert_eq!(tracks[0].name, "Cleo", "the name survives a STOP that carries none");
@@ -1864,12 +1859,12 @@ mod tests {
 
     /// Build a signed kind:694 event from `sender` to `group` with explicit
     /// `created_at` (event/publish time); `payload` carries the capture `ts`.
-    fn event_with(sender: &Keys, group: &Group, payload: GartPayload, created_at: u64) -> Event {
+    fn event_with(sender: &Keys, group: &Group, payload: Payload, created_at: u64) -> Event {
         let plaintext = serde_json::to_string(&payload).unwrap();
         let gpk = group.public_key().unwrap();
         let content =
             nip44::encrypt(sender.secret_key(), &gpk, &plaintext, nip44::Version::V2).unwrap();
-        EventBuilder::new(Kind::Custom(protocol::GART_KIND), content)
+        EventBuilder::new(Kind::Custom(protocol::EVENT_KIND), content)
             .tags([Tag::public_key(gpk)])
             .custom_created_at(Timestamp::from(created_at))
             .sign_with_keys(sender)
@@ -1884,7 +1879,7 @@ mod tests {
         ts: u64,
         created_at: u64,
     ) -> Event {
-        event_with(sender, group, GartPayload::active(lat, lng, ts, None), created_at)
+        event_with(sender, group, Payload::active(lat, lng, ts, None), created_at)
     }
 
     fn feed(f: &mut Fixture, ev: Event) {
@@ -1974,16 +1969,16 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn test_recorded_stop_not() {
+    async fn active_recorded_stop_not() {
         let mut f = fixture();
         let group = add_member_group(&mut f, "G");
         let sender = keys::generate();
         let key = (sender.public_key().to_hex(), group.public.clone());
 
-        feed(&mut f, event_with(&sender, &group, GartPayload::test(1.0, 2.0, 500, None, None), 500));
-        feed(&mut f, event_with(&sender, &group, GartPayload::stop(), 600));
+        feed(&mut f, event_with(&sender, &group, Payload::active(1.0, 2.0, 500, None), 500));
+        feed(&mut f, event_with(&sender, &group, Payload::stop(), 600));
         let pts = &f.engine.history[&key].points;
-        assert_eq!(pts.len(), 1, "TEST recorded, STOP is a boundary not a point");
+        assert_eq!(pts.len(), 1, "ACTIVE recorded, STOP is a boundary not a point");
         assert_eq!(pts[0].ts, 500);
     }
 

@@ -1,6 +1,6 @@
 //! Key handling helpers.
 //!
-//! NIP-GART distinguishes two key roles:
+//! ntrack uses two key roles:
 //!
 //! * **sender key** — a dedicated keypair used only to sign kind:694 events.
 //!   It MUST be distinct from the user's main Nostr identity (we never even
@@ -9,9 +9,9 @@
 //!   group. Knowing the public key is enough to *send* to the group;
 //!   the secret key is required to *receive* (decrypt).
 //!
-//! The spec requires that implementations never log `nsec` values, even in
-//! debug builds. All secrets in this crate are wrapped in [`SecretString`],
-//! whose `Debug`/`Display` implementations redact the value.
+//! ntrack never logs `nsec` values, even in debug builds. All secrets in this
+//! crate are wrapped in [`SecretString`], whose `Debug`/`Display`
+//! implementations redact the value.
 
 use nostr::hashes::{sha256, Hash};
 use nostr::nips::nip19::{FromBech32, ToBech32};
@@ -163,8 +163,8 @@ pub fn derive_name(pk: &PublicKey) -> String {
 
 /// Deterministic accent colour (R, G, B) derived from a public key, for the
 /// swatch beside each sender in the Track tab. The hue is taken from the last
-/// three bytes of the key-hex SHA-256 (the scheme NIP-GART-adjacent apps use);
-/// near-black results are lifted so they stay visible on the dark theme.
+/// three bytes of the key-hex SHA-256; near-black results are lifted so they
+/// stay visible on the dark theme.
 pub fn display_color(pk: &PublicKey) -> (u8, u8, u8) {
     let seed = identity_seed(pk);
     ensure_visible(seed[29], seed[30], seed[31])

@@ -427,7 +427,6 @@ impl Controller {
                     msg: t.msg.clone().into(),
                     color: slint::Color::from_rgb_u8(r, g, b),
                     live,
-                    is_test: t.is_test,
                     has_coords,
                 }
             })
@@ -822,7 +821,6 @@ fn share_timed_out(created_at: u64) -> bool {
 /// shows where the sender was last seen, exactly like a real STOP.
 fn track_liveness(t: &TrackSnapshot) -> (&'static str, bool) {
     match t.status {
-        Status::Test => ("TEST", false),
         Status::Active if !share_timed_out(t.created_at) => ("LIVE", true),
         _ => ("ENDED", false),
     }
@@ -925,7 +923,6 @@ mod tests {
             group_name: "G".into(),
             status,
             live: status == Status::Active,
-            is_test: status == Status::Test,
             lat: 1.0,
             lng: 2.0,
             ts: created_at,
@@ -954,12 +951,8 @@ mod tests {
             track_liveness(&track(Status::Active, now - SHARE_TIMEOUT_SECS - 1)),
             ("ENDED", false)
         );
-        // A real STOP is always ended, and an old TEST keeps its TEST badge.
+        // A real STOP is always ended.
         assert_eq!(track_liveness(&track(Status::Stop, now)), ("ENDED", false));
-        assert_eq!(
-            track_liveness(&track(Status::Test, now - SHARE_TIMEOUT_SECS - 1)),
-            ("TEST", false)
-        );
     }
 
     #[test]

@@ -1,6 +1,7 @@
-//! NIP-GART (kind:694) event construction, parsing and validation.
+//! kind:694 event construction, parsing and validation — the ntrack wire
+//! protocol.
 //!
-//! Wire format recap (see docs/PROTOCOL.md and the canonical spec):
+//! Wire format recap (see docs/PROTOCOL.md):
 //!
 //! ```json
 //! {
@@ -21,12 +22,11 @@
 //!
 //! Decrypted plaintext payload:
 //!
-//! * `status` (required): `"ACTIVE" | "TEST" | "STOP"`
-//! * `lat`, `lng`, `ts`: required for ACTIVE/TEST, MUST be omitted for STOP
+//! * `status` (required): `"ACTIVE" | "STOP"`
+//! * `lat`, `lng`, `ts`: required for ACTIVE, MUST be omitted for STOP
 //! * `msg`: optional, MUST be omitted for STOP
-//! * `tester`: optional array of bech32 npubs, only allowed for TEST
-//! * `name`: optional sender-chosen display name (ntrack extension; absent →
-//!   the receiver derives a default handle from the sender key)
+//! * `name`: optional sender-chosen display name (absent → the receiver
+//!   derives a default handle from the sender key)
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -37,16 +37,14 @@ use serde::{Deserialize, Serialize};
 use crate::dedup::SeenIds;
 use crate::error::{Error, Result};
 
-/// Nostr event kind allocated by NIP-GART for alert / location broadcasts.
-pub const GART_KIND: u16 = 694;
+/// Nostr event kind ntrack uses for encrypted live-location broadcasts.
+pub const EVENT_KIND: u16 = 694;
 
 /// Broadcast status carried in the encrypted payload.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Status {
     #[serde(rename = "ACTIVE")]
     Active,
-    #[serde(rename = "TEST")]
-    Test,
     #[serde(rename = "STOP")]
     Stop,
 }
@@ -55,7 +53,6 @@ impl std::fmt::Display for Status {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
             Status::Active => "ACTIVE",
-            Status::Test => "TEST",
             Status::Stop => "STOP",
         })
     }
@@ -67,7 +64,7 @@ impl std::fmt::Display for Status {
 /// on receive; unknown `status` values cause the event to be dropped (the
 /// `status` enum fails to deserialize, which callers treat as a drop).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct GartPayload {
+pub struct Payload {
     pub status: Status,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub lat: Option<f64>,
@@ -78,63 +75,49 @@ pub struct GartPayload {
     pub ts: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub msg: Option<String>,
-    /// TEST only: bech32 npubs of the members that should surface the test.
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub tester: Option<Vec<String>>,
-    /// Sender-chosen display name (ntrack extension, non-normative). Carried on
-    /// ACTIVE/TEST; omitted from STOP to keep it minimal. Receivers that don't
-    /// understand it ignore it (forward compatibility) and fall back to a name
-    /// derived from the sender key.
+    /// Sender-chosen display name. Carried on ACTIVE; omitted from STOP to keep
+    /// it minimal. Receivers that don't understand it ignore it (forward
+    /// compatibility) and fall back to a name derived from the sender key.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub name: Option<String>,
 }
 
-impl GartPayload {
+impl Payload {
     pub fn active(lat: f64, lng: f64, ts: u64, msg: Option<String>) -> Self {
-        Self { status: Status::Active, lat: Some(lat), lng: Some(lng), ts: Some(ts), msg, tester: None, name: None }
-    }
-
-    pub fn test(lat: f64, lng: f64, ts: u64, msg: Option<String>, tester: Option<Vec<String>>) -> Self {
-        Self { status: Status::Test, lat: Some(lat), lng: Some(lng), ts: Some(ts), msg, tester, name: None }
+        Self { status: Status::Active, lat: Some(lat), lng: Some(lng), ts: Some(ts), msg, name: None }
     }
 
     pub fn stop() -> Self {
-        Self { status: Status::Stop, lat: None, lng: None, ts: None, msg: None, tester: None, name: None }
+        Self { status: Status::Stop, lat: None, lng: None, ts: None, msg: None, name: None }
     }
 
-    /// Attach the sender's self-declared display name to an ACTIVE/TEST
-    /// payload. Whitespace is trimmed and an empty name clears the field, so a
-    /// blank configured name omits it from the wire entirely.
+    /// Attach the sender's self-declared display name to an ACTIVE payload.
+    /// Whitespace is trimmed and an empty name clears the field, so a blank
+    /// configured name omits it from the wire entirely.
     pub fn with_name(mut self, name: Option<String>) -> Self {
         self.name = name.map(|n| n.trim().to_string()).filter(|n| !n.is_empty());
         self
     }
 
-    /// Enforce the normative payload rules of NIP-GART.
+    /// Enforce the payload field rules for each status.
     pub fn validate(&self) -> Result<()> {
         let invalid = |m: &str| Err(Error::InvalidPayload(m.into()));
         match self.status {
-            Status::Active | Status::Test => {
+            Status::Active => {
                 let (Some(lat), Some(lng), Some(_)) = (self.lat, self.lng, self.ts) else {
-                    return invalid("lat, lng and ts MUST be present for ACTIVE/TEST");
+                    return invalid("lat, lng and ts MUST be present for ACTIVE");
                 };
                 if !(-90.0..=90.0).contains(&lat) || !(-180.0..=180.0).contains(&lng) {
                     return invalid("lat/lng out of WGS-84 range");
-                }
-                if self.status == Status::Active && self.tester.is_some() {
-                    return invalid("tester MUST NOT be present for ACTIVE");
                 }
             }
             Status::Stop => {
                 if self.lat.is_some() || self.lng.is_some() || self.ts.is_some() || self.msg.is_some() {
                     return invalid("lat, lng, ts and msg MUST be omitted for STOP");
                 }
-                if self.tester.is_some() {
-                    return invalid("tester is only allowed for TEST");
-                }
-                // `name` is a non-normative extension describing the sender, not
-                // the broadcast, so it carries no per-status rule — we simply
-                // never emit it on STOP (see `stop`) and tolerate it on receive.
+                // `name` describes the sender, not the broadcast, so it carries
+                // no per-status rule — we simply never emit it on STOP (see
+                // `stop`) and tolerate it on receive.
             }
         }
         Ok(())
@@ -161,7 +144,7 @@ const MULTI_PAYLOAD_VERSION: u32 = 1;
 pub fn build_event(
     sender: &Keys,
     recipients: &[PublicKey],
-    payload: &GartPayload,
+    payload: &Payload,
     expiration_secs: Option<u64>,
 ) -> Result<Event> {
     payload.validate()?;
@@ -191,7 +174,7 @@ pub fn build_event(
         tags.push(Tag::expiration(Timestamp::now() + secs));
     }
 
-    EventBuilder::new(Kind::Custom(GART_KIND), content)
+    EventBuilder::new(Kind::Custom(EVENT_KIND), content)
         .tags(tags)
         .sign_with_keys(sender)
         .map_err(|e| Error::Crypto(format!("sign: {e}")))
@@ -210,10 +193,8 @@ pub enum DropReason {
     DecryptFailed,
     /// Unknown status value or malformed payload JSON.
     BadPayload,
-    /// Payload violates the normative field rules for its status.
+    /// Payload violates the field rules for its status.
     InvalidPayload,
-    /// Targeted TEST that does not include any identity of ours.
-    TestNotForUs,
 }
 
 /// A verified, decrypted, validated incoming broadcast.
@@ -226,12 +207,12 @@ pub struct Incoming {
     pub group: PublicKey,
     /// Event timestamp (`created_at`, seconds).
     pub created_at: u64,
-    pub payload: GartPayload,
+    pub payload: Payload,
 }
 
-/// Process a raw event received from a relay, per the NIP-GART receiver
-/// rules: kind check → NIP-01 id+sig verification → replay dedup →
-/// ciphertext lookup → NIP-44 decrypt → payload validation.
+/// Process a raw event received from a relay: kind check → NIP-01 id+sig
+/// verification → replay dedup → ciphertext lookup → NIP-44 decrypt → payload
+/// validation.
 ///
 /// `group_keys` are the recipient pseudonym keypairs we hold (one per group
 /// we can receive for). On success the matching event id is recorded in
@@ -241,36 +222,24 @@ pub fn process_incoming(
     group_keys: &[Keys],
     seen: &mut SeenIds,
 ) -> std::result::Result<Incoming, DropReason> {
-    if event.kind != Kind::Custom(GART_KIND) {
+    if event.kind != Kind::Custom(EVENT_KIND) {
         return Err(DropReason::WrongKind);
     }
-    // "Receiver MUST verify the event id and signature per NIP-01 before any
-    // further processing; drop on failure."
+    // Verify the event id and signature per NIP-01 before any further
+    // processing; drop on failure.
     if event.verify().is_err() {
         return Err(DropReason::BadSignature);
     }
-    // "Receivers MUST track processed event ids to prevent
-    // relay-replay-driven duplicate alarms."
+    // Track processed event ids to prevent relay-replay-driven duplicates.
     if seen.contains(&event.id) {
         return Err(DropReason::Duplicate);
     }
 
     // Everything past dedup is shared with the export path; only this live
     // path records into `seen`.
-    match decrypt_and_validate(event, group_keys) {
-        Ok(incoming) => {
-            seen.insert(event.id);
-            Ok(incoming)
-        }
-        // A targeted TEST aimed at someone else was still fully processed, so
-        // record it to keep replay protection honest (matches the historical
-        // behaviour where the seen-insert lived inside the targeting check).
-        Err(DropReason::TestNotForUs) => {
-            seen.insert(event.id);
-            Err(DropReason::TestNotForUs)
-        }
-        Err(other) => Err(other),
-    }
+    let incoming = decrypt_and_validate(event, group_keys)?;
+    seen.insert(event.id);
+    Ok(incoming)
 }
 
 /// Verify and decrypt an event for *export* (track backfill), WITHOUT the
@@ -284,7 +253,7 @@ pub fn process_for_export(
     event: &Event,
     group_keys: &[Keys],
 ) -> std::result::Result<Incoming, DropReason> {
-    if event.kind != Kind::Custom(GART_KIND) {
+    if event.kind != Kind::Custom(EVENT_KIND) {
         return Err(DropReason::WrongKind);
     }
     if event.verify().is_err() {
@@ -294,10 +263,9 @@ pub fn process_for_export(
 }
 
 /// Shared receiver body: ciphertext lookup → NIP-44 decrypt → payload
-/// validation → targeted-TEST filtering. Assumes the kind and signature have
-/// already been checked and performs no replay dedup, so both the live
-/// ([`process_incoming`]) and export ([`process_for_export`]) paths can layer
-/// their own policy around it.
+/// validation. Assumes the kind and signature have already been checked and
+/// performs no replay dedup, so both the live ([`process_incoming`]) and
+/// export ([`process_for_export`]) paths can layer their own policy around it.
 fn decrypt_and_validate(
     event: &Event,
     group_keys: &[Keys],
@@ -338,19 +306,8 @@ fn decrypt_and_validate(
     };
 
     // Unknown status values fail Status deserialization → drop, as required.
-    let payload: GartPayload = serde_json::from_str(&plaintext).map_err(|_| DropReason::BadPayload)?;
+    let payload: Payload = serde_json::from_str(&plaintext).map_err(|_| DropReason::BadPayload)?;
     payload.validate().map_err(|_| DropReason::InvalidPayload)?;
-
-    // Targeted TEST: only surface if we are (or represent) a listed tester.
-    // ntrack holds no per-member identity, so any non-empty tester list that
-    // we cannot match means the test is meant for someone else.
-    if payload.status == Status::Test {
-        if let Some(tester) = &payload.tester {
-            if !tester.is_empty() {
-                return Err(DropReason::TestNotForUs);
-            }
-        }
-    }
 
     Ok(Incoming {
         event_id: event.id,
@@ -361,12 +318,12 @@ fn decrypt_and_validate(
     })
 }
 
-/// Subscription filter for all groups we can receive for, per the spec:
+/// Subscription filter for all groups we can receive for:
 /// `{"kinds":[694], "#p":[<recipient pubkeys>]}` plus a `since` bound to
 /// keep startup traffic sane (dedup handles overlap).
 pub fn subscription_filter(group_pubkeys: &[PublicKey], since_secs_ago: u64) -> nostr::Filter {
     nostr::Filter::new()
-        .kind(Kind::Custom(GART_KIND))
+        .kind(Kind::Custom(EVENT_KIND))
         .pubkeys(group_pubkeys.iter().copied())
         .since(Timestamp::now() - since_secs_ago)
 }
@@ -382,7 +339,7 @@ pub fn backfill_filter(
     limit: usize,
 ) -> nostr::Filter {
     nostr::Filter::new()
-        .kind(Kind::Custom(GART_KIND))
+        .kind(Kind::Custom(EVENT_KIND))
         .author(sender)
         .pubkey(group)
         .since(Timestamp::now() - since_secs_ago)
@@ -402,7 +359,7 @@ mod tests {
     fn active_payload_roundtrip_single_recipient() {
         let sender = generate();
         let group = generate();
-        let payload = GartPayload::active(48.137, 11.575, 1722173222, Some("hi".into()));
+        let payload = Payload::active(48.137, 11.575, 1722173222, Some("hi".into()));
         let event = build_event(&sender, &[group.public_key()], &payload, None).unwrap();
 
         assert_eq!(event.kind, Kind::Custom(694));
@@ -424,7 +381,7 @@ mod tests {
         let g1 = generate();
         let g2 = generate();
         let g3 = generate();
-        let payload = GartPayload::active(1.0, 2.0, 3, None);
+        let payload = Payload::active(1.0, 2.0, 3, None);
         let event = build_event(
             &sender,
             &[g1.public_key(), g2.public_key(), g3.public_key()],
@@ -458,7 +415,7 @@ mod tests {
         let event = build_event(
             &sender,
             &[g.public_key(), g.public_key()],
-            &GartPayload::stop(),
+            &Payload::stop(),
             None,
         )
         .unwrap();
@@ -469,31 +426,27 @@ mod tests {
     #[test]
     fn validation_rules() {
         // ACTIVE missing fields
-        let mut p = GartPayload::active(0.0, 0.0, 1, None);
+        let mut p = Payload::active(0.0, 0.0, 1, None);
         p.ts = None;
         assert!(p.validate().is_err());
-        // ACTIVE with tester forbidden
-        let mut p = GartPayload::active(0.0, 0.0, 1, None);
-        p.tester = Some(vec![]);
-        assert!(p.validate().is_err());
         // out-of-range coordinates
-        assert!(GartPayload::active(91.0, 0.0, 1, None).validate().is_err());
-        assert!(GartPayload::active(0.0, -180.5, 1, None).validate().is_err());
+        assert!(Payload::active(91.0, 0.0, 1, None).validate().is_err());
+        assert!(Payload::active(0.0, -180.5, 1, None).validate().is_err());
         // STOP must omit everything
-        let mut p = GartPayload::stop();
+        let mut p = Payload::stop();
         p.msg = Some("x".into());
         assert!(p.validate().is_err());
-        let mut p = GartPayload::stop();
+        let mut p = Payload::stop();
         p.lat = Some(1.0);
         assert!(p.validate().is_err());
-        // valid TEST with tester
-        let p = GartPayload::test(1.0, 2.0, 3, None, Some(vec!["npub1xyz".into()]));
-        assert!(p.validate().is_ok());
+        // minimal ACTIVE/STOP validate cleanly
+        assert!(Payload::active(1.0, 2.0, 3, None).validate().is_ok());
+        assert!(Payload::stop().validate().is_ok());
     }
 
     #[test]
     fn stop_payload_serializes_minimal() {
-        let json = serde_json::to_string(&GartPayload::stop()).unwrap();
+        let json = serde_json::to_string(&Payload::stop()).unwrap();
         assert_eq!(json, r#"{"status":"STOP"}"#);
     }
 
@@ -510,7 +463,7 @@ mod tests {
             nip44::Version::V2,
         )
         .unwrap();
-        let event = EventBuilder::new(Kind::Custom(GART_KIND), content)
+        let event = EventBuilder::new(Kind::Custom(EVENT_KIND), content)
             .tags([Tag::public_key(group.public_key())])
             .sign_with_keys(&sender)
             .unwrap();
@@ -529,7 +482,7 @@ mod tests {
         let event = build_event(
             &sender,
             &[group.public_key()],
-            &GartPayload::active(1.0, 2.0, 3, None),
+            &Payload::active(1.0, 2.0, 3, None),
             None,
         )
         .unwrap();
@@ -548,7 +501,7 @@ mod tests {
         let event = build_event(
             &sender,
             &[group.public_key()],
-            &GartPayload::active(1.0, 2.0, 3, None),
+            &Payload::active(1.0, 2.0, 3, None),
             None,
         )
         .unwrap();
@@ -571,7 +524,7 @@ mod tests {
         let event = build_event(
             &sender,
             &[group.public_key()],
-            &GartPayload::active(1.0, 2.0, 3, None),
+            &Payload::active(1.0, 2.0, 3, None),
             None,
         )
         .unwrap();
@@ -589,7 +542,7 @@ mod tests {
         let event = build_event(
             &sender,
             &[group.public_key()],
-            &GartPayload::active(1.0, 2.0, 3, None),
+            &Payload::active(1.0, 2.0, 3, None),
             None,
         )
         .unwrap();
@@ -597,7 +550,7 @@ mod tests {
         // simulate by reusing the event but giving the processor keys whose
         // pubkey we forcibly "tag" via a crafted event.
         let imposter = generate();
-        let crafted = EventBuilder::new(Kind::Custom(GART_KIND), event.content.clone())
+        let crafted = EventBuilder::new(Kind::Custom(EVENT_KIND), event.content.clone())
             .tags([Tag::public_key(imposter.public_key())])
             .sign_with_keys(&sender)
             .unwrap();
@@ -609,41 +562,13 @@ mod tests {
     }
 
     #[test]
-    fn targeted_test_is_suppressed_untargeted_test_is_shown() {
-        let sender = generate();
-        let group = generate();
-        let targeted = build_event(
-            &sender,
-            &[group.public_key()],
-            &GartPayload::test(1.0, 2.0, 3, None, Some(vec!["npub1someoneelse".into()])),
-            None,
-        )
-        .unwrap();
-        let mut s = seen();
-        assert_eq!(
-            process_incoming(&targeted, std::slice::from_ref(&group), &mut s).unwrap_err(),
-            DropReason::TestNotForUs
-        );
-
-        let broadcast = build_event(
-            &sender,
-            &[group.public_key()],
-            &GartPayload::test(1.0, 2.0, 3, Some("drill".into()), None),
-            None,
-        )
-        .unwrap();
-        let inc = process_incoming(&broadcast, std::slice::from_ref(&group), &mut s).unwrap();
-        assert_eq!(inc.payload.status, Status::Test);
-    }
-
-    #[test]
     fn expiration_tag_is_added_when_requested() {
         let sender = generate();
         let group = generate();
         let event = build_event(
             &sender,
             &[group.public_key()],
-            &GartPayload::stop(),
+            &Payload::stop(),
             Some(3600),
         )
         .unwrap();
@@ -695,7 +620,7 @@ mod tests {
         let event = build_event(
             &sender,
             &[group.public_key()],
-            &GartPayload::active(48.2, 11.6, 1000, None),
+            &Payload::active(48.2, 11.6, 1000, None),
             None,
         )
         .unwrap();
@@ -725,7 +650,7 @@ mod tests {
         let good = build_event(
             &sender,
             &[group.public_key()],
-            &GartPayload::active(1.0, 2.0, 3, None),
+            &Payload::active(1.0, 2.0, 3, None),
             None,
         )
         .unwrap();
@@ -748,7 +673,7 @@ mod tests {
     fn name_roundtrips_through_the_payload() {
         let sender = generate();
         let group = generate();
-        let payload = GartPayload::active(1.0, 2.0, 3, None).with_name(Some("Anna".into()));
+        let payload = Payload::active(1.0, 2.0, 3, None).with_name(Some("Anna".into()));
         assert_eq!(payload.name.as_deref(), Some("Anna"));
         let event = build_event(&sender, &[group.public_key()], &payload, None).unwrap();
         let mut s = seen();
@@ -758,18 +683,18 @@ mod tests {
 
     #[test]
     fn with_name_trims_and_drops_blank() {
-        let p = GartPayload::active(1.0, 2.0, 3, None).with_name(Some("  Bob ".into()));
+        let p = Payload::active(1.0, 2.0, 3, None).with_name(Some("  Bob ".into()));
         assert_eq!(p.name.as_deref(), Some("Bob"));
-        let p = GartPayload::active(1.0, 2.0, 3, None).with_name(Some("   ".into()));
+        let p = Payload::active(1.0, 2.0, 3, None).with_name(Some("   ".into()));
         assert_eq!(p.name, None, "a blank name is omitted from the wire");
         // STOP stays minimal: name is never serialized.
-        assert_eq!(serde_json::to_string(&GartPayload::stop()).unwrap(), r#"{"status":"STOP"}"#);
+        assert_eq!(serde_json::to_string(&Payload::stop()).unwrap(), r#"{"status":"STOP"}"#);
     }
 
     #[test]
     fn payload_tolerates_unknown_extra_fields() {
         let json = r#"{"status":"ACTIVE","lat":1.0,"lng":2.0,"ts":3,"battery":42}"#;
-        let p: GartPayload = serde_json::from_str(json).unwrap();
+        let p: Payload = serde_json::from_str(json).unwrap();
         assert_eq!(p.status, Status::Active);
     }
 }

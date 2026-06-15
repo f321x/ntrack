@@ -7,7 +7,7 @@ use std::time::Duration;
 use futures_util::{SinkExt, StreamExt};
 use nostr::{Event, Keys};
 use ntrack_core::dedup::SeenIds;
-use ntrack_core::protocol::{self, GartPayload};
+use ntrack_core::protocol::{self, Payload};
 use ntrack_core::relay::{PoolEvent, Publisher, RelayPool};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
@@ -104,7 +104,7 @@ fn test_event() -> (Event, Keys, Keys) {
     let event = protocol::build_event(
         &sender,
         &[group.public_key()],
-        &GartPayload::active(48.2, 11.6, 1722173222, None),
+        &Payload::active(48.2, 11.6, 1722173222, None),
         None,
     )
     .unwrap();

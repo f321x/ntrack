@@ -4,10 +4,8 @@
 
 An Android app (Rust + [Slint](https://slint.dev) UI) that shares your live location with a
 chosen group of people. Locations are NIP-44 encrypted, so relays only ever see ciphertext from a
-throwaway sender key — no accounts, no central server, any Nostr relay works. Interoperates with
-the [Gart app](https://gitea.gart.io/gart/gart-app-releases) via the
-[NIP-GART protocol](https://gitea.gart.io/gart/gart-app-releases/src/branch/main/NIP-GART.md)
-(Nostr `kind:694`).
+throwaway sender key — no accounts, no central server, any Nostr relay works. The wire protocol is
+a small Nostr convention built on `kind:694` events — see [docs/PROTOCOL.md](docs/PROTOCOL.md).
 
 ## How it works
 
@@ -62,14 +60,14 @@ cargo run -p ntrack-app --features desktop  # run the app on desktop (simulated 
 ```
 
 The desktop build is the fastest way to iterate — it talks to real relays and is fully
-interoperable with the Android build and Gart.
+interoperable with the Android build.
 
 ```
-core/      ntrack-core — NIP-GART protocol, keys, relay pool, engine (no UI)
+core/      ntrack-core — protocol, keys, relay pool, engine (no UI)
 app/       ntrack-app  — Slint UI, controller, Android JNI glue, desktop sim
 android/   Gradle project — NativeActivity shell + foreground location service (plain Java)
 docker/    builder image (SDK 34, NDK r27, Gradle 8.11)
-docs/      PROTOCOL.md — spec ↔ implementation ↔ tests
+docs/      PROTOCOL.md — protocol ↔ implementation ↔ tests
 ```
 
 ## Security & privacy

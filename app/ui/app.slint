@@ -1,4 +1,4 @@
-// ntrack — live location sharing over Nostr (NIP-GART, kind:694)
+// ntrack — live location sharing over Nostr (kind:694)
 //
 // Single-window phone UI with four pages and a bottom tab bar.
 // All data shown here is pushed from Rust as ready-to-render strings/models;
@@ -20,13 +20,12 @@ export struct TrackItem {
     label: string,       // raw user label ("" when unset)
     npub: string,        // shortened npub (identity, shown under the title)
     group: string,
-    status: string,      // "LIVE" | "TEST" | "ENDED"
+    status: string,      // "LIVE" | "ENDED"
     coords: string,
     ago: string,
     msg: string,
     color: color,        // accent derived from the sender key
     live: bool,
-    is-test: bool,
     has-coords: bool,
 }
 
@@ -287,8 +286,8 @@ component TrackRow inherits Card {
                 VerticalLayout {
                     alignment: center;
                     StatusDot {
-                        on: item.live || item.is-test;
-                        on-color: item.is-test ? Theme.warn : Theme.ok;
+                        on: item.live;
+                        on-color: Theme.ok;
                     }
                 }
                 Text {
@@ -303,11 +302,10 @@ component TrackRow inherits Card {
                     width: badge.preferred-width + 16px;
                     height: 22px;
                     border-radius: 11px;
-                    background: item.is-test ? Theme.warn.darker(60%)
-                        : item.live ? Theme.ok.darker(60%) : Theme.card-alt;
+                    background: item.live ? Theme.ok.darker(60%) : Theme.card-alt;
                     badge := Text {
                         text: item.status;
-                        color: item.is-test ? Theme.warn : item.live ? Theme.ok : Theme.muted;
+                        color: item.live ? Theme.ok : Theme.muted;
                         font-size: 11px;
                         font-weight: 700;
                         horizontal-alignment: center;
@@ -640,7 +638,7 @@ component SettingsPage inherits ScrollView {
 
         SectionTitle { text: "ABOUT"; }
         Text {
-            text: "ntrack shares your location end-to-end encrypted over Nostr using the NIP-GART protocol (kind 694), compatible with the Gart app. Locations are encrypted with NIP-44 to your groups' keys; relays only see ciphertext from a pseudonymous sender.";
+            text: "ntrack shares your location end-to-end encrypted over Nostr (kind 694). Locations are encrypted with NIP-44 to your groups' keys; relays only see ciphertext from a pseudonymous sender.";
             color: Theme.muted;
             font-size: 12px;
             wrap: word-wrap;

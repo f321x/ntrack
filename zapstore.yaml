@@ -58,8 +58,3 @@ description: |
   - Share — publish your encrypted location at a set interval.
   - Track — follow your groups on a live map; incoming locations are verified,
     deduplicated and decrypted on-device, each with an "open in maps" shortcut.
-  - Test — send a TEST event to exercise the whole pipeline (relays, encryption,
-    members' devices) without starting a real share.
-
-  ntrack interoperates with the Gart app through the NIP-GART protocol
-  (Nostr kind:694).

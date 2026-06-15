@@ -3,9 +3,9 @@
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
 ntrack is an Android app (Rust + [Slint](https://slint.dev) UI) for live location sharing over
-Nostr, implementing the **NIP-GART** protocol (`kind:694` events, NIP-44 v2 end-to-end
-encryption). The protocol is documented in `docs/PROTOCOL.md`, which maps each normative spec
-requirement to its implementation and test — read it before touching `core/src/protocol.rs`.
+Nostr (`kind:694` events, NIP-44 v2 end-to-end encryption). The wire protocol is specified in
+`docs/PROTOCOL.md`, which maps each normative requirement to its implementation and test — read it
+before touching `core/src/protocol.rs`.
 
 ## Commands
 

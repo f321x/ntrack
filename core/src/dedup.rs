@@ -1,8 +1,8 @@
 //! Replay protection: bounded set of processed event ids.
 //!
-//! NIP-GART: "Receivers MUST track processed event ids to prevent
-//! relay-replay-driven duplicate alarms." The set is bounded (FIFO eviction)
-//! and serializable so it can be persisted across app restarts.
+//! Receivers track processed event ids to prevent relay-replay-driven
+//! duplicate alarms. The set is bounded (FIFO eviction) and serializable so it
+//! can be persisted across app restarts.
 
 use std::collections::{HashSet, VecDeque};
 

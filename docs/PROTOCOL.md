@@ -1,10 +1,8 @@
-# NIP-GART as implemented by ntrack
+# The ntrack protocol
 
-Canonical specification:
-<https://gitea.gart.io/gart/gart-app-releases/src/branch/main/NIP-GART.md>
-
-This document summarizes the protocol as implemented in `core/src/protocol.rs`
-and maps each normative requirement to its implementation and test.
+ntrack shares live location over Nostr as end-to-end-encrypted **kind:694**
+events. This document specifies the wire format ntrack implements and maps each
+rule to its implementation and test in `core/src/protocol.rs`.
 
 ## Event
 
@@ -26,13 +24,13 @@ Roles:
 
 * **Sender key** — a dedicated keypair that signs broadcasts. ntrack
   generates it on first use and never asks for (or supports) a personal
-  Nostr identity, satisfying *"the event MUST be signed by a sender key,
-  never by the user's main Nostr identity"*. It can be rotated in Settings.
+  Nostr identity: an event MUST be signed by a throwaway sender key, never by
+  the user's main Nostr identity. It can be rotated in Settings.
 * **Recipient pseudonym key** — a keypair shared by all members of a group.
   The public key is enough to *send* to the group; holding the secret
-  (`nsec`) is required to *receive*. Key distribution is application-defined
-  by the spec; ntrack shows the `nsec` as text + QR code and accepts pasted
-  keys (treat the channel you use to share it as security-critical).
+  (`nsec`) is required to *receive*. Key distribution is out of band; ntrack
+  shows the `nsec` as text + QR code and accepts pasted keys (treat the
+  channel you use to share it as security-critical).
 
 ## Content encryption
 
@@ -63,31 +61,29 @@ start with) and only requires that *its own* entry decrypts.
 
 | field    | type            | rules                                              |
 |----------|-----------------|----------------------------------------------------|
-| `status` | string, REQUIRED| `"ACTIVE"` \| `"TEST"` \| `"STOP"`                 |
-| `lat`    | number (WGS-84) | REQUIRED for ACTIVE/TEST, MUST be omitted for STOP |
-| `lng`    | number (WGS-84) | REQUIRED for ACTIVE/TEST, MUST be omitted for STOP |
+| `status` | string, REQUIRED| `"ACTIVE"` \| `"STOP"`                             |
+| `lat`    | number (WGS-84) | REQUIRED for ACTIVE, MUST be omitted for STOP      |
+| `lng`    | number (WGS-84) | REQUIRED for ACTIVE, MUST be omitted for STOP      |
 | `ts`     | unix seconds    | location capture time; same rules as `lat`/`lng`   |
 | `msg`    | string, optional| MUST be omitted for STOP                           |
-| `tester` | [npub], optional| TEST only; MUST NOT be present for ACTIVE          |
-| `name`   | string, optional| ntrack extension: sender display name (see below)  |
+| `name`   | string, optional| sender display name (see below)                    |
 
 A minimal STOP payload is exactly `{"status":"STOP"}` (test:
 `stop_payload_serializes_minimal`). Unknown *fields* are tolerated on
 receive (forward compatibility); unknown `status` values cause the event to
-be dropped, as required (test: `unknown_status_is_dropped`).
+be dropped (test: `unknown_status_is_dropped`).
 
-### Display name (`name`) — ntrack extension
+### Display name (`name`)
 
-`name` is **not** part of the canonical NIP-GART payload; it is a
-non-normative ntrack extension carrying the sender's self-chosen display name.
+`name` carries the sender's self-chosen display name.
 
-* Senders attach it to ACTIVE broadcasts (`GartPayload::with_name`) only
-  when the user has set a custom name; it is omitted from STOP (kept minimal)
-  and omitted entirely otherwise.
+* Senders attach it to ACTIVE broadcasts (`Payload::with_name`) only when the
+  user has set a custom name; it is omitted from STOP (kept minimal) and
+  omitted entirely otherwise.
 * When absent, the receiver derives a stable `Adjective Animal` handle from the
   sender key (`keys::derive_name`), so both ends agree on the default without
-  it ever crossing the wire. Strict NIP-GART receivers (e.g. Gart) ignore the
-  unknown field per the forward-compatibility rule above.
+  it ever crossing the wire. Receivers that don't recognise the field ignore
+  it per the forward-compatibility rule above.
 * On receive the name is sanitized and length-capped before display, retained
   across a STOP, and overridden by any local label the user set. A per-key
   colour (`keys::display_color`) shown beside each card disambiguates the
@@ -107,27 +103,20 @@ Implemented in `protocol::process_incoming`, exercised end-to-end in
 `core/tests/relay_integration.rs`:
 
 1. kind check (≠694 → drop)
-2. **NIP-01 id + signature verification** — *"Receiver MUST verify the event
-   id and signature per NIP-01 before any further processing"* (test:
+2. **NIP-01 id + signature verification** — the receiver MUST verify the event
+   id and signature per NIP-01 before any further processing (test:
    `tampered_event_fails_verification`)
-3. **replay protection** — *"Receivers MUST track processed event ids"*;
-   ntrack keeps a bounded (4096) id window, persisted across restarts
-   (tests: `replay_is_dropped_by_event_id`, `dedup_and_eviction`)
+3. **replay protection** — receivers MUST track processed event ids; ntrack
+   keeps a bounded (4096) id window, persisted across restarts (tests:
+   `replay_is_dropped_by_event_id`, `dedup_and_eviction`)
 4. ciphertext lookup for each held group key tagged in `p`
 5. NIP-44 decrypt with the recipient pseudonym secret + event `pubkey`
 6. payload validation per the table above (invalid → drop)
-7. targeted `TEST` events (`tester` non-empty) are processed but not
-   surfaced: ntrack holds no per-member identity, so a targeted test is by
-   definition meant for someone else (test:
-   `targeted_test_is_suppressed_untargeted_test_is_shown`)
-
-`TEST` broadcasts are always rendered with a distinct **TEST** badge and are
-never displayed like a live share (*"receivers MUST render this as a test"*).
 
 ### Export path (track backfill)
 
 `process_for_export` runs the same verify → decrypt → validate body as
-`process_incoming` (steps 1, 2, 4–7) but deliberately **omits the replay
+`process_incoming` (steps 1, 2, 4–6) but deliberately **omits the replay
 dedup** (step 3) and never reads or writes `SeenIds`. It exists because
 exporting a track re-fetches `kind:694` events the live path has already
 seen; routing those through `process_incoming` would drop nearly all of them
@@ -152,15 +141,13 @@ harmless. (Test: `subscription_filter_shape`.)
 * **NIP-40 expiration** — senders MAY attach one; ntrack does by default
   (24 h) so location ciphertexts age out of relays (test:
   `expiration_tag_is_added_when_requested`).
-* **Key rotation** — *"Implementations MUST provide a means to rotate the
-  recipient pseudonym key"*: Groups → Rotate generates a fresh keypair,
-  re-subscribes, and immediately offers the new key for redistribution
-  (test: `rotate_group_changes_subscription_and_offers_new_key`). The UI
-  prompts rotation when membership changes, per the spec's SHOULD.
-* **No nsec logging** — *"Implementations MUST NOT log nsec values, even in
-  debug builds"*: every secret is wrapped in `SecretString`, whose
-  `Debug`/`Display` are redacted (tests:
-  `secret_string_redacts_debug_and_display`,
+* **Key rotation** — Groups → Rotate generates a fresh keypair, re-subscribes,
+  and immediately offers the new key for redistribution (test:
+  `rotate_group_changes_subscription_and_offers_new_key`). The UI prompts
+  rotation when membership changes.
+* **No nsec logging** — secrets are never logged, even in debug builds: every
+  secret is wrapped in `SecretString`, whose `Debug`/`Display` are redacted
+  (tests: `secret_string_redacts_debug_and_display`,
   `config_json_never_contains_plain_marker_but_keeps_secret`).
 
 ## ntrack's sending behaviour
@@ -174,8 +161,5 @@ harmless. (Test: `subscription_filter_shape`.)
 * Stopping a share (including when location becomes unavailable, and on
   app shutdown, best effort) publishes a `STOP` so receivers don't show a
   stale live state.
-* ntrack only ever originates `ACTIVE` and `STOP` events; it never sends a
-  `TEST`. (The first `ACTIVE` goes out as soon as sharing starts, so a
-  separate "test broadcast" would be redundant.) `TEST` broadcasts are still
-  consumed and badged when received from other NIP-GART apps — see the
-  receiver pipeline above.
+* ntrack originates only `ACTIVE` and `STOP` events. The first `ACTIVE` goes
+  out as soon as sharing starts.

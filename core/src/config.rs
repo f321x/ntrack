@@ -61,9 +61,9 @@ impl Group {
         Some(Keys::new(sk))
     }
 
-    /// Rotate the recipient pseudonym key in place (NIP-GART requires that
-    /// implementations provide a rotation mechanism). The new secret must be
-    /// redistributed to members out of band.
+    /// Rotate the recipient pseudonym key in place (ntrack provides key
+    /// rotation so a membership change can invalidate the old key). The new
+    /// secret must be redistributed to members out of band.
     pub fn rotate(&mut self) {
         let k = keys::generate();
         self.public = k.public_key().to_hex();
