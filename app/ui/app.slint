@@ -836,10 +836,10 @@ component MapOverlay inherits Rectangle {
         }
     }
 
-    // Empty state — sits below the top controls (inset + button height).
+    // Empty state — centred on the map so it stays clear of the edge controls.
     if !root.has-peers : Rectangle {
         x: (parent.width - self.width) / 2;
-        y: root.inset-top + 64px;
+        y: (parent.height - self.height) / 2;
         width: min(parent.width - 32px, 320px);
         height: hint.preferred-height + 16px;
         border-radius: 10px;
@@ -876,7 +876,7 @@ component MapOverlay inherits Rectangle {
     // Attribution — required by the OSM/ODbL tile licence; kept above the
     // gesture-navigation bar so it stays fully readable.
     Rectangle {
-        x: parent.width - self.width - 6px - root.inset-right;
+        x: (parent.width - self.width) / 2;
         y: parent.height - self.height - 6px - root.inset-bottom;
         width: attribution.preferred-width + 12px;
         height: 18px;
