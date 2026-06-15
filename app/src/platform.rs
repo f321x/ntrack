@@ -16,10 +16,6 @@ pub enum PlatformEvent {
     /// payload is the raw string; the controller parses it with
     /// [`ntrack_core::invite::parse_shared`] and pre-fills the import form.
     IncomingInvite(String),
-    /// The user tapped the post-reboot "resume sharing" notification. The
-    /// controller asks the engine to resume only if the persisted resume flag
-    /// is still armed (see [`ntrack_core::engine::EngineCmd::ResumeShareIfArmed`]).
-    ResumeShareRequest,
 }
 
 pub trait Platform: Send + Sync + 'static {

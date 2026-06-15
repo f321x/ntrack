@@ -8,6 +8,7 @@ slint::include_modules!();
 
 pub mod controller;
 pub mod glue;
+pub mod headless;
 pub mod map;
 pub mod platform;
 pub mod sim;
@@ -33,6 +34,10 @@ pub fn run_app(
     let controller = Controller::new(data_dir, platform, ui.as_weak());
     controller.attach(&ui);
     controller.spawn_platform_forwarder(platform_rx);
+    // Continue a share that was still active when the process last died. On
+    // Android the boot foreground service already resumed it headlessly; this
+    // hands it over to the now-live UI engine. A normal launch no-ops.
+    controller.resume_if_armed();
 
     // Re-render once per second: relative timestamps, live-share timeouts,
     // toast expiry, relay status. Cheap (small models) and keeps render logic
@@ -77,6 +82,13 @@ fn android_main(app: slint::android::AndroidApp) {
     log::info!("ntrack starting");
 
     slint::android::init(app.clone()).expect("slint android init failed");
+
+    // Claim the engine for this UI process and tear down any headless boot
+    // engine running inside the foreground service: there must be exactly one
+    // engine writing the config and publishing. The headless engine leaves the
+    // resume flag armed on shutdown, so `run_app`'s `resume_if_armed` below
+    // seamlessly continues the share under the UI engine.
+    headless::claim_for_ui();
 
     let data_dir = app
         .internal_data_path()

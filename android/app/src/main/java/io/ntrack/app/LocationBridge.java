@@ -14,6 +14,7 @@ import android.location.LocationManager;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.Handler;
 import android.os.Looper;
 import android.util.Log;
 
@@ -41,6 +42,7 @@ import java.util.List;
 public final class LocationBridge {
     private static final String TAG = "ntrack";
     private static final int REQ_LOCATION = 4242;
+    private static final int REQ_BACKGROUND = 4243;
 
     private LocationBridge() {}
 
@@ -52,8 +54,6 @@ public final class LocationBridge {
     static native void nativeOnQrResult(String text);
     /** An {@code ntrack://join} deep link launched or resumed the app. */
     static native void nativeOnDeepLink(String uri);
-    /** The user tapped the post-reboot "resume sharing" notification. */
-    static native void nativeOnResume();
 
     private static LocationListener listener;
 
@@ -61,31 +61,78 @@ public final class LocationBridge {
     // registered its native callbacks, so buffer the latest one until Rust is
     // ready and flushes it.
     private static String pendingDeepLink;
-    // Same race for the post-reboot resume notification tap.
-    private static boolean pendingResume;
     private static boolean nativeReady;
+
+    // ---- context resolution ----------------------------------------------
+
+    /**
+     * The Context used to drive location and check permission: the live
+     * activity while the app is open, else the boot foreground service. Both are
+     * Contexts; only an activity can host a permission dialog (see
+     * {@link #requestLocationPermission}).
+     */
+    private static Context locationContext() {
+        Activity activity = MainActivity.current();
+        if (activity != null) return activity;
+        return LocationService.current();
+    }
+
+    /** Post onto the main looper — works from any context, unlike an activity's
+     * runOnUiThread. */
+    private static void post(Runnable r) {
+        new Handler(Looper.getMainLooper()).post(r);
+    }
 
     // ---- permissions -----------------------------------------------------
 
-    public static boolean hasLocationPermission() {
-        Activity activity = MainActivity.current();
-        if (activity == null) return false;
-        // Android 12+ lets users grant approximate location only; coarse
-        // fixes are still useful for live sharing.
-        return activity.checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION)
-                == PackageManager.PERMISSION_GRANTED
-                || activity.checkSelfPermission(Manifest.permission.ACCESS_COARSE_LOCATION)
+    private static boolean hasForeground(Context ctx) {
+        // Android 12+ lets users grant approximate location only; coarse fixes
+        // are still useful for live sharing.
+        return ctx.checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION)
+                        == PackageManager.PERMISSION_GRANTED
+                || ctx.checkSelfPermission(Manifest.permission.ACCESS_COARSE_LOCATION)
+                        == PackageManager.PERMISSION_GRANTED;
+    }
+
+    private static boolean hasBackground(Context ctx) {
+        // Before Android 10 there is no separate background-location permission;
+        // a granted foreground permission already works in the background.
+        if (Build.VERSION.SDK_INT < 29) return true;
+        return ctx.checkSelfPermission(Manifest.permission.ACCESS_BACKGROUND_LOCATION)
                 == PackageManager.PERMISSION_GRANTED;
     }
 
+    /**
+     * Whether we may share. Sharing keeps publishing with the app backgrounded
+     * and resumes after a reboot, both of which require "Allow all the time" —
+     * so background location is mandatory, not optional. There is deliberately
+     * no degraded foreground-only mode.
+     */
+    public static boolean hasLocationPermission() {
+        Context ctx = locationContext();
+        return ctx != null && hasForeground(ctx) && hasBackground(ctx);
+    }
+
+    /**
+     * Request the permissions sharing needs. Foreground (fine/coarse, plus
+     * notifications so the service is visible) comes first; once granted,
+     * {@link #handlePermissionResult} escalates to background location, which
+     * Android 11+ requires as a separate step (it opens Settings to pick
+     * "Allow all the time"). Only an activity can show these prompts.
+     */
     public static void requestLocationPermission() {
         final Activity activity = MainActivity.current();
         if (activity == null) {
             Log.w(TAG, "requestLocationPermission: no live activity");
-            nativeOnPermission(false);
+            reportPermission(false);
             return;
         }
         activity.runOnUiThread(() -> {
+            if (hasForeground(activity)) {
+                // Foreground already held: go straight to background.
+                requestBackground(activity);
+                return;
+            }
             List<String> perms = new ArrayList<>();
             perms.add(Manifest.permission.ACCESS_FINE_LOCATION);
             perms.add(Manifest.permission.ACCESS_COARSE_LOCATION);
@@ -97,18 +144,34 @@ public final class LocationBridge {
         });
     }
 
-    /** Called by MainActivity with the system permission dialog outcome. */
-    public static void handlePermissionResult(int requestCode, String[] permissions, int[] results) {
-        if (requestCode != REQ_LOCATION) return;
-        boolean granted = false;
-        for (int i = 0; i < permissions.length && i < results.length; i++) {
-            boolean isLocation =
-                    Manifest.permission.ACCESS_FINE_LOCATION.equals(permissions[i])
-                            || Manifest.permission.ACCESS_COARSE_LOCATION.equals(permissions[i]);
-            if (isLocation && results[i] == PackageManager.PERMISSION_GRANTED) {
-                granted = true;
-            }
+    /** Ask for background location, or report success when already held / N/A. */
+    private static void requestBackground(Activity activity) {
+        if (hasBackground(activity)) {
+            reportPermission(true);
+        } else {
+            activity.requestPermissions(
+                    new String[]{Manifest.permission.ACCESS_BACKGROUND_LOCATION}, REQ_BACKGROUND);
         }
+    }
+
+    /** Called by MainActivity with a permission dialog outcome. */
+    public static void handlePermissionResult(int requestCode, String[] permissions, int[] results) {
+        Activity activity = MainActivity.current();
+        if (requestCode == REQ_LOCATION) {
+            if (activity != null && hasForeground(activity)) {
+                // Foreground granted; now require "Allow all the time".
+                requestBackground(activity);
+            } else {
+                reportPermission(false);
+            }
+        } else if (requestCode == REQ_BACKGROUND) {
+            // Re-check rather than trust the results array: on Android 11+ the
+            // grant happens on the Settings screen, not in this dialog.
+            reportPermission(hasLocationPermission());
+        }
+    }
+
+    private static void reportPermission(boolean granted) {
         try {
             nativeOnPermission(granted);
         } catch (UnsatisfiedLinkError e) {
@@ -119,33 +182,39 @@ public final class LocationBridge {
     // ---- location updates -------------------------------------------------
 
     /**
-     * Start the foreground service (keeps the process and GPS alive while
-     * the app is backgrounded) and subscribe to location updates.
+     * Subscribe to location updates (and, from the UI, start the foreground
+     * service that keeps the process and GPS alive while backgrounded). Driven
+     * either by the activity or, on the boot path, by the foreground service
+     * itself — whichever {@link #locationContext} resolves.
      */
     public static void startLocation(final long intervalMs) {
-        final Activity activity = MainActivity.current();
-        if (activity == null) {
-            Log.w(TAG, "startLocation: no live activity");
-            nativeOnPermission(false);
+        final Context ctx = locationContext();
+        if (ctx == null) {
+            Log.w(TAG, "startLocation: no context");
+            reportPermission(false);
             return;
         }
-        activity.runOnUiThread(() -> {
+        final boolean fromActivity = ctx instanceof Activity;
+        post(() -> {
             if (!hasLocationPermission()) {
                 Log.w(TAG, "startLocation without permission");
-                nativeOnPermission(false);
+                reportPermission(false);
                 return;
             }
-            try {
-                Intent svc = new Intent(activity, LocationService.class);
-                activity.startForegroundService(svc);
-            } catch (Exception e) {
-                // The app can still share while in the foreground.
-                Log.e(TAG, "failed to start foreground service", e);
+            // The UI path brings the keep-alive service up; the boot path is
+            // already running inside it.
+            if (fromActivity) {
+                try {
+                    ctx.startForegroundService(new Intent(ctx, LocationService.class));
+                } catch (Exception e) {
+                    // The app can still share while in the foreground.
+                    Log.e(TAG, "failed to start foreground service", e);
+                }
             }
             try {
                 LocationManager lm =
-                        (LocationManager) activity.getSystemService(Context.LOCATION_SERVICE);
-                stopListening(activity);
+                        (LocationManager) ctx.getSystemService(Context.LOCATION_SERVICE);
+                stopListening(ctx);
                 listener = new LocationListener() {
                     @Override
                     public void onLocationChanged(Location location) {
@@ -183,7 +252,7 @@ public final class LocationBridge {
                 }
             } catch (SecurityException e) {
                 Log.e(TAG, "location permission lost", e);
-                nativeOnPermission(false);
+                reportPermission(false);
             }
         });
     }
@@ -201,18 +270,18 @@ public final class LocationBridge {
     }
 
     public static void stopLocation() {
-        final Activity activity = MainActivity.current();
-        if (activity == null) return;
-        activity.runOnUiThread(() -> {
-            stopListening(activity);
-            activity.stopService(new Intent(activity, LocationService.class));
+        final Context ctx = locationContext();
+        if (ctx == null) return;
+        post(() -> {
+            stopListening(ctx);
+            ctx.stopService(new Intent(ctx, LocationService.class));
         });
     }
 
-    private static void stopListening(Activity activity) {
+    private static void stopListening(Context ctx) {
         if (listener != null) {
             LocationManager lm =
-                    (LocationManager) activity.getSystemService(Context.LOCATION_SERVICE);
+                    (LocationManager) ctx.getSystemService(Context.LOCATION_SERVICE);
             try {
                 lm.removeUpdates(listener);
             } catch (Exception e) {
@@ -435,33 +504,6 @@ public final class LocationBridge {
         } catch (UnsatisfiedLinkError e) {
             Log.e(TAG, "native not ready for deep link", e);
             pendingDeepLink = uri; // try again on a later flush
-        }
-    }
-
-    // ---- resume-after-reboot ---------------------------------------------
-
-    /**
-     * Called by {@link MainActivity} when launched from the post-reboot resume
-     * notification (its {@code resume_sharing} intent extra). Like deep links,
-     * the tap can land before Rust is ready, so buffer until a flush.
-     */
-    public static synchronized void onResumeIntent() {
-        pendingResume = true;
-        if (nativeReady) {
-            flushPendingResume();
-        }
-    }
-
-    /** Deliver a buffered resume request; called by Rust once ready. */
-    public static synchronized void flushPendingResume() {
-        nativeReady = true;
-        if (!pendingResume) return;
-        pendingResume = false;
-        try {
-            nativeOnResume();
-        } catch (UnsatisfiedLinkError e) {
-            Log.e(TAG, "native not ready for resume", e);
-            pendingResume = true; // try again on a later flush
         }
     }
 }

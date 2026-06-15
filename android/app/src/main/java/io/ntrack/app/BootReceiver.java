@@ -1,31 +1,24 @@
 package io.ntrack.app;
 
-import android.Manifest;
-import android.app.Notification;
-import android.app.NotificationChannel;
-import android.app.NotificationManager;
-import android.app.PendingIntent;
 import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
-import android.content.pm.PackageManager;
-import android.os.Build;
 import android.util.Log;
 
 import java.io.File;
 
 /**
  * After a reboot (or a low-battery shutdown), if a share was still active when
- * the device went down, offer to resume it.
+ * the device went down, resume it automatically — no user interaction.
  *
- * Android forbids a background broadcast receiver from launching an Activity,
- * and a boot-started {@code location} foreground service would only receive
- * GPS with the intrusive "Allow all the time" background-location permission.
- * So instead of resuming silently we post a notification; tapping it launches
- * {@link MainActivity} (an allowed activity start) with a {@code resume_sharing}
- * extra, and the Rust core continues the previous share through the normal,
- * foreground path. The tap is also the user's explicit consent to start
- * broadcasting their location again.
+ * {@code ACTION_BOOT_COMPLETED} is an exemption to the
+ * "no foreground service from the background" rule, and a {@code location}
+ * foreground service may still be started from a boot receiver (Android 14 only
+ * blocks {@code microphone} and {@code camera} there). So we start
+ * {@link LocationService} directly; it brings up a UI-less engine that keeps
+ * publishing. Actually receiving GPS with no visible UI requires the
+ * "Allow all the time" background-location permission — without it the service
+ * runs but gets no fixes (the user must grant it; there is no fallback path).
  *
  * Whether a share was active is read from a tiny non-secret sentinel file the
  * core maintains next to its config ({@code resume.flag} in {@code getFilesDir()},
@@ -34,9 +27,6 @@ import java.io.File;
  */
 public final class BootReceiver extends BroadcastReceiver {
     private static final String TAG = "ntrack";
-    private static final String CHANNEL_ID = "ntrack.resume";
-    // Distinct from LocationService's ongoing notification (id 1).
-    private static final int NOTIFICATION_ID = 2;
 
     @Override
     public void onReceive(Context context, Intent intent) {
@@ -45,38 +35,17 @@ public final class BootReceiver extends BroadcastReceiver {
                 && !"android.intent.action.QUICKBOOT_POWERON".equals(action)) {
             return;
         }
-        // Only offer to resume if we were sharing when we went down.
+        // Only resume if we were sharing when we went down.
         if (!new File(context.getFilesDir(), "resume.flag").exists()) return;
 
-        // Posting requires the runtime notification permission on Android 13+.
-        if (Build.VERSION.SDK_INT >= 33
-                && context.checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS)
-                        != PackageManager.PERMISSION_GRANTED) {
-            Log.i(TAG, "boot: share was active but POST_NOTIFICATIONS not granted");
-            return;
+        Intent svc = new Intent(context, LocationService.class)
+                .putExtra(LocationService.EXTRA_FROM_BOOT, true);
+        try {
+            context.startForegroundService(svc);
+            Log.i(TAG, "boot: resuming share via foreground service");
+        } catch (Exception e) {
+            // Defensive: some OEMs are stricter than the documented exemption.
+            Log.e(TAG, "boot: failed to start location service", e);
         }
-
-        NotificationManager nm = context.getSystemService(NotificationManager.class);
-        if (nm == null) return;
-        NotificationChannel channel = new NotificationChannel(
-                CHANNEL_ID, "Resume sharing", NotificationManager.IMPORTANCE_HIGH);
-        channel.setDescription("Offers to resume location sharing after a restart");
-        nm.createNotificationChannel(channel);
-
-        Intent open = new Intent(context, MainActivity.class)
-                .putExtra("resume_sharing", true)
-                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP);
-        PendingIntent tap = PendingIntent.getActivity(
-                context, 0, open,
-                PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT);
-
-        Notification notification = new Notification.Builder(context, CHANNEL_ID)
-                .setContentTitle("Resume location sharing?")
-                .setContentText("You were sharing your location before the restart. Tap to continue.")
-                .setSmallIcon(android.R.drawable.ic_menu_mylocation)
-                .setAutoCancel(true)
-                .setContentIntent(tap)
-                .build();
-        nm.notify(NOTIFICATION_ID, notification);
     }
 }

@@ -5,6 +5,10 @@
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+    <!-- Required so sharing keeps publishing (and auto-resumes after a reboot)
+         while the app has no visible UI: the boot foreground service only
+         receives GPS with "Allow all the time" background location. -->
+    <uses-permission android:name="android.permission.ACCESS_BACKGROUND_LOCATION" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_LOCATION" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
@@ -66,8 +70,9 @@
             android:exported="false"
             android:grantUriPermissions="true" />
 
-        <!-- Posts a "resume sharing?" notification on boot when a share was
-             active at shutdown (gated by the core's resume.flag sentinel). -->
+        <!-- On boot, automatically resumes a share that was active at shutdown
+             (gated by the core's resume.flag sentinel) by starting the
+             foreground location service headlessly. -->
         <receiver
             android:name=".BootReceiver"
             android:exported="true"

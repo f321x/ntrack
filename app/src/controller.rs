@@ -48,7 +48,6 @@ enum Confirm {
 #[derive(Clone)]
 enum AfterPermission {
     StartShare { msg: String },
-    ResumeShare,
 }
 
 #[derive(Default)]
@@ -154,9 +153,6 @@ impl Controller {
                                 msg: Some(msg).filter(|m| !m.trim().is_empty()),
                             });
                         }
-                        Some(AfterPermission::ResumeShare) => {
-                            let _ = self.cmd_tx.send(EngineCmd::ResumeShareIfArmed);
-                        }
                         None => {}
                     }
                 } else {
@@ -177,21 +173,21 @@ impl Controller {
                 }
             }
             PlatformEvent::IncomingInvite(raw) => self.on_incoming_invite(raw),
-            PlatformEvent::ResumeShareRequest => self.resume_share_requested(),
         }
     }
 
-    /// The user tapped the post-reboot resume notification. Ensure location
-    /// permission, then ask the engine to resume if its persisted flag is
-    /// still armed (the engine no-ops otherwise, e.g. a stale notification
-    /// tapped after the share was already stopped).
-    fn resume_share_requested(self: &Arc<Self>) {
-        if self.platform.has_location_permission() {
-            let _ = self.cmd_tx.send(EngineCmd::ResumeShareIfArmed);
-        } else {
-            self.view.lock().unwrap().after_permission = Some(AfterPermission::ResumeShare);
-            self.platform.request_location_permission();
-        }
+    /// Resume a share that was still active when the process last died (reboot,
+    /// crash, swipe-away). Called once at startup; the engine no-ops unless its
+    /// persisted resume flag is armed, so a normal launch does nothing.
+    ///
+    /// On Android the boot path already resumes headlessly inside the
+    /// foreground service before the UI exists (see `headless`/`LocationService`);
+    /// this is the hand-off that lets the freshly launched UI engine pick the
+    /// share back up. We deliberately do not prompt for permission here — if the
+    /// permission was lost the engine's normal location-unavailable path stops
+    /// and disarms the share rather than nagging on every launch.
+    pub fn resume_if_armed(self: &Arc<Self>) {
+        let _ = self.cmd_tx.send(EngineCmd::ResumeShareIfArmed);
     }
 
     /// A scanned QR code or tapped `ntrack://join` link arrived. Pre-fill the

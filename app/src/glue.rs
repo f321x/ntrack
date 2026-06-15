@@ -18,7 +18,8 @@
 //! is initialized by the android-activity glue.
 
 use std::ffi::c_void;
-use std::sync::OnceLock;
+use std::path::PathBuf;
+use std::sync::{Arc, RwLock};
 
 use jni::objects::{GlobalRef, JByteArray, JClass, JObject, JString, JValue};
 use jni::sys::{jboolean, jdouble, jfloat, jint, jlong, jstring};
@@ -29,9 +30,61 @@ use tokio::sync::mpsc;
 use crate::platform::{Platform, PlatformEvent};
 
 const BRIDGE_CLASS: &str = "io.ntrack.app.LocationBridge";
+const BRIDGE_CLASS_PATH: &str = "io/ntrack/app/LocationBridge";
 
-/// Sink for events arriving from Java callbacks. One per process.
-static PLATFORM_TX: OnceLock<mpsc::UnboundedSender<PlatformEvent>> = OnceLock::new();
+/// Sink for events arriving from Java callbacks. One per process, but
+/// swappable: the boot foreground service installs a headless engine's sink,
+/// and when the user later opens the app the UI engine takes over (see
+/// [`crate::headless`]). Guarded so a Java callback can't read it mid-swap.
+static PLATFORM_TX: RwLock<Option<mpsc::UnboundedSender<PlatformEvent>>> = RwLock::new(None);
+
+/// Install `tx` as the destination for Java→Rust events, replacing any previous
+/// one (the engine that owns the platform owns the sink).
+fn set_platform_tx(tx: mpsc::UnboundedSender<PlatformEvent>) {
+    *PLATFORM_TX.write().unwrap() = Some(tx);
+}
+
+/// Clone the current event sink, if any.
+fn platform_tx() -> Option<mpsc::UnboundedSender<PlatformEvent>> {
+    PLATFORM_TX.read().unwrap().clone()
+}
+
+/// The native methods Java's `LocationBridge` calls back into. Registered on
+/// the bridge class by whichever engine (UI or headless) constructs the
+/// platform; re-registering simply overwrites, which is fine.
+fn register_bridge_natives(env: &mut JNIEnv, bridge_class: &JClass) -> Result<(), String> {
+    env.register_native_methods(
+        bridge_class,
+        &[
+            NativeMethod {
+                name: "nativeOnLocation".into(),
+                sig: "(DDFJ)V".into(),
+                fn_ptr: native_on_location as *mut c_void,
+            },
+            NativeMethod {
+                name: "nativeOnPermission".into(),
+                sig: "(Z)V".into(),
+                fn_ptr: native_on_permission as *mut c_void,
+            },
+            NativeMethod {
+                name: "nativeDecodeQr".into(),
+                sig: "([BIII)Ljava/lang/String;".into(),
+                fn_ptr: native_decode_qr as *mut c_void,
+            },
+            NativeMethod {
+                name: "nativeOnQrResult".into(),
+                sig: "(Ljava/lang/String;)V".into(),
+                fn_ptr: native_on_qr_result as *mut c_void,
+            },
+            NativeMethod {
+                name: "nativeOnDeepLink".into(),
+                sig: "(Ljava/lang/String;)V".into(),
+                fn_ptr: native_on_deep_link as *mut c_void,
+            },
+        ],
+    )
+    .map_err(|e| format!("register natives: {e}"))
+}
 
 pub struct AndroidPlatform {
     vm: JavaVM,
@@ -82,59 +135,43 @@ impl AndroidPlatform {
                 .map_err(|e| format!("global ref class: {e}"))?;
 
             let bridge_class: &JClass = (&bridge_obj).into();
-            env.register_native_methods(
-                bridge_class,
-                &[
-                    NativeMethod {
-                        name: "nativeOnLocation".into(),
-                        sig: "(DDFJ)V".into(),
-                        fn_ptr: native_on_location as *mut c_void,
-                    },
-                    NativeMethod {
-                        name: "nativeOnPermission".into(),
-                        sig: "(Z)V".into(),
-                        fn_ptr: native_on_permission as *mut c_void,
-                    },
-                    NativeMethod {
-                        name: "nativeDecodeQr".into(),
-                        sig: "([BIII)Ljava/lang/String;".into(),
-                        fn_ptr: native_decode_qr as *mut c_void,
-                    },
-                    NativeMethod {
-                        name: "nativeOnQrResult".into(),
-                        sig: "(Ljava/lang/String;)V".into(),
-                        fn_ptr: native_on_qr_result as *mut c_void,
-                    },
-                    NativeMethod {
-                        name: "nativeOnDeepLink".into(),
-                        sig: "(Ljava/lang/String;)V".into(),
-                        fn_ptr: native_on_deep_link as *mut c_void,
-                    },
-                    NativeMethod {
-                        name: "nativeOnResume".into(),
-                        sig: "()V".into(),
-                        fn_ptr: native_on_resume as *mut c_void,
-                    },
-                ],
-            )
-            .map_err(|e| format!("register natives: {e}"))?;
+            register_bridge_natives(&mut env, bridge_class)?;
             bridge
         };
 
-        let _ = PLATFORM_TX.set(tx);
+        set_platform_tx(tx);
         let me = Self { vm, bridge };
-        // Native callbacks are now registered, so any deep link or resume
-        // request that arrived before this Rust side was ready (e.g. a boot
-        // notification tap during cold start) can be flushed through.
+        // Native callbacks are now registered, so any deep link that arrived
+        // before this Rust side was ready (e.g. a cold-start invite tap) can be
+        // flushed through.
         me.with_env("flushPendingDeepLink", |env, class| {
             env.call_static_method(class, "flushPendingDeepLink", "()V", &[])
                 .map(|_| ())
         });
-        me.with_env("flushPendingResume", |env, class| {
-            env.call_static_method(class, "flushPendingResume", "()V", &[])
-                .map(|_| ())
-        });
         Ok(me)
+    }
+
+    /// Build the platform from inside the boot foreground service, where the
+    /// android-activity glue's ambient context does not exist. We take the
+    /// `JavaVM` from the live `env` and locate `LocationBridge` directly: the
+    /// service callback runs on a Java thread, so `FindClass` resolves app
+    /// classes (unlike the tokio worker threads used afterwards). Used only by
+    /// the headless engine; no deep-link flush, as there is no UI to receive
+    /// invites.
+    pub fn new_for_service(
+        env: &mut JNIEnv,
+        tx: mpsc::UnboundedSender<PlatformEvent>,
+    ) -> Result<Self, String> {
+        let vm = env.get_java_vm().map_err(|e| format!("get_java_vm: {e}"))?;
+        let bridge_class = env
+            .find_class(BRIDGE_CLASS_PATH)
+            .map_err(|e| format!("find {BRIDGE_CLASS_PATH}: {e}"))?;
+        register_bridge_natives(env, &bridge_class)?;
+        let bridge = env
+            .new_global_ref(&bridge_class)
+            .map_err(|e| format!("global ref class: {e}"))?;
+        set_platform_tx(tx);
+        Ok(Self { vm, bridge })
     }
 
     /// Attach (if needed) and run `f` with the env and the bridge class.
@@ -297,9 +334,24 @@ fn deliver_invite(env: &mut JNIEnv, s: &JString) {
     if raw.is_empty() {
         return;
     }
-    if let Some(tx) = PLATFORM_TX.get() {
+    if let Some(tx) = platform_tx() {
         let _ = tx.send(PlatformEvent::IncomingInvite(raw));
     }
+}
+
+/// Start a UI-less engine inside the boot `LocationService`. Builds the
+/// platform from the live JNI env (the activity context is absent at boot) and
+/// hands it to [`crate::headless::start`], which resumes any armed share.
+fn start_headless_engine(env: &mut JNIEnv, data_dir: String) {
+    let (tx, rx) = mpsc::unbounded_channel();
+    let platform = match AndroidPlatform::new_for_service(env, tx) {
+        Ok(p) => p,
+        Err(e) => {
+            log::error!("headless platform init failed: {e}");
+            return;
+        }
+    };
+    crate::headless::start(PathBuf::from(data_dir), Arc::new(platform), rx);
 }
 
 /// `static native void nativeOnLocation(double, double, float, long)` —
@@ -312,7 +364,7 @@ extern "system" fn native_on_location(
     accuracy: jfloat,
     ts_millis: jlong,
 ) {
-    if let Some(tx) = PLATFORM_TX.get() {
+    if let Some(tx) = platform_tx() {
         let _ = tx.send(PlatformEvent::Location(LocationSample {
             lat,
             lng,
@@ -325,7 +377,7 @@ extern "system" fn native_on_location(
 /// `static native void nativeOnPermission(boolean)` — result of the runtime
 /// permission request.
 extern "system" fn native_on_permission(_env: JNIEnv, _class: JClass, granted: jboolean) {
-    if let Some(tx) = PLATFORM_TX.get() {
+    if let Some(tx) = platform_tx() {
         let _ = tx.send(PlatformEvent::PermissionResult(granted != 0));
     }
 }
@@ -379,10 +431,36 @@ extern "system" fn native_on_deep_link(mut env: JNIEnv, _class: JClass, uri: JSt
     deliver_invite(&mut env, &uri);
 }
 
-/// `static native void nativeOnResume()` — the user tapped the post-reboot
-/// "resume sharing" notification (delivered via `MainActivity`).
-extern "system" fn native_on_resume(_env: JNIEnv, _class: JClass) {
-    if let Some(tx) = PLATFORM_TX.get() {
-        let _ = tx.send(PlatformEvent::ResumeShareRequest);
-    }
+// ---- boot foreground-service entry points -------------------------------
+//
+// These are bound by JNI name (no RegisterNatives) so `LocationService` can
+// call them after `System.loadLibrary` without the android-activity glue ever
+// running. They start/stop the headless engine that resumes sharing on boot.
+
+/// `static native void nativeServiceStart(String dataDir)` — the boot
+/// `LocationService` asks us to resume sharing headlessly.
+#[no_mangle]
+pub extern "system" fn Java_io_ntrack_app_LocationService_nativeServiceStart(
+    mut env: JNIEnv,
+    _class: JClass,
+    data_dir: JString,
+) {
+    let dir = match env.get_string(&data_dir) {
+        Ok(s) => String::from(s),
+        Err(e) => {
+            log::error!("nativeServiceStart: bad data_dir: {e}");
+            return;
+        }
+    };
+    start_headless_engine(&mut env, dir);
+}
+
+/// `static native void nativeServiceStop()` — the boot `LocationService` is
+/// going away; tear the headless engine down.
+#[no_mangle]
+pub extern "system" fn Java_io_ntrack_app_LocationService_nativeServiceStop(
+    _env: JNIEnv,
+    _class: JClass,
+) {
+    crate::headless::stop();
 }

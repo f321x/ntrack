@@ -20,15 +20,10 @@ pub struct SimPlatform {
 
 impl SimPlatform {
     pub fn new(tx: mpsc::UnboundedSender<PlatformEvent>) -> Self {
-        // Mimic the Android boot "resume" notification tap on desktop so the
-        // resume path can be exercised end-to-end: set NTRACK_SIM_RESUME=1 and
-        // run with a config that was left mid-share (resume_share armed). The
-        // unbounded channel buffers this until the controller's forwarder
-        // starts consuming.
-        if std::env::var_os("NTRACK_SIM_RESUME").is_some() {
-            log::info!("sim: emitting resume-share request (NTRACK_SIM_RESUME)");
-            let _ = tx.send(PlatformEvent::ResumeShareRequest);
-        }
+        // A share left armed in the persisted config resumes automatically at
+        // startup (see `Controller::resume_if_armed`), exactly like Android:
+        // launch the desktop build against a config that was left mid-share to
+        // exercise the resume path — no special signalling needed here.
         Self {
             tx,
             running: Arc::new(AtomicBool::new(false)),
@@ -142,32 +137,5 @@ impl Platform for SimPlatform {
         );
         log::info!("sim: scan_qr -> synthetic invite");
         let _ = self.tx.send(PlatformEvent::IncomingInvite(invite));
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    // One test (not two) so the shared-process env var can't race a sibling.
-    #[test]
-    fn resume_request_emitted_only_with_env() {
-        // Absent the opt-in env var, construction emits nothing — the desktop
-        // app starts idle, exactly like a normal launch.
-        std::env::remove_var("NTRACK_SIM_RESUME");
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        let _idle = SimPlatform::new(tx);
-        assert!(rx.try_recv().is_err(), "no resume request without the env var");
-
-        // With it set, construction buffers a resume request — the desktop
-        // stand-in for the post-reboot notification tap.
-        std::env::set_var("NTRACK_SIM_RESUME", "1");
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        let _resuming = SimPlatform::new(tx);
-        std::env::remove_var("NTRACK_SIM_RESUME");
-        assert!(
-            matches!(rx.try_recv(), Ok(PlatformEvent::ResumeShareRequest)),
-            "resume request emitted when NTRACK_SIM_RESUME is set"
-        );
     }
 }
