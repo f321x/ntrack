@@ -130,11 +130,14 @@ filter is `backfill_filter` — `{"kinds":[3434], "authors":[<sender>],
 ## Subscription
 
 ```json
-{"kinds": [3434], "#p": ["<recipient pubkey hex>", …], "since": <now - 6h>}
+{"kinds": [3434], "#p": ["<recipient pubkey hex>", …], "since": <now - 24h>}
 ```
 
-`since` bounds startup traffic; the replay window makes the overlap
-harmless. (Test: `subscription_filter_shape`.)
+`since` bounds startup traffic while still recovering each peer's last-known
+location: it matches the 24 h NIP-40 expiration below, so any event still alive
+on a relay (a peer's most recent fix, even if they haven't published in hours)
+is fetched, and anything older has aged out anyway. The replay window makes the
+overlap harmless. (Test: `subscription_filter_shape`.)
 
 ## Other requirements
 

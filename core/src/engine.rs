@@ -18,11 +18,16 @@ use crate::keys;
 use crate::protocol::{self, Payload, Status};
 use crate::relay::{PoolEvent, Publisher};
 
-/// How far back the tracking subscription looks on (re)start. Replay
-/// protection makes overlap harmless.
-pub const SINCE_LOOKBACK_SECS: u64 = 6 * 3600;
 /// NIP-40 expiration attached to outgoing events when enabled.
 pub const EXPIRATION_SECS: u64 = 24 * 3600;
+/// How far back the tracking subscription looks on (re)start. Matched to the
+/// NIP-40 expiration window: events older than that have aged out of relays
+/// anyway, while everything still alive is a peer's most recent fix. Looking
+/// back the full window means a peer who last published a while ago (but within
+/// the expiry) still surfaces their last-known location on startup, rather than
+/// only peers broadcasting right now. Replay protection makes the overlap
+/// harmless.
+pub const SINCE_LOOKBACK_SECS: u64 = EXPIRATION_SECS;
 /// Capacity of the processed-event-id replay window.
 pub const SEEN_CAPACITY: usize = 4096;
 /// Cap on a sender-declared display name once cleaned for display.
