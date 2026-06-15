@@ -17,10 +17,12 @@ log = "0.4"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "time", "net", "macros"] }
 
 # Native libraries shipped in the APK are built with the release profile.
-# Thin LTO + debuginfo stripping keeps libntrack_app.so reasonably small.
+# Fat LTO + a single codegen unit + full symbol stripping keep libntrack_app.so
+# small and well-optimized (at the cost of slower builds).
 [profile.release]
-lto = "thin"
-strip = "debuginfo"
+lto = "fat"
+codegen-units = 1
+strip = true
 panic = "abort"
 
 [profile.release.package.ntrack-core]
