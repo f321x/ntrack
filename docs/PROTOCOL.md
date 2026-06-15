@@ -69,11 +69,37 @@ start with) and only requires that *its own* entry decrypts.
 | `ts`     | unix seconds    | location capture time; same rules as `lat`/`lng`   |
 | `msg`    | string, optional| MUST be omitted for STOP                           |
 | `tester` | [npub], optional| TEST only; MUST NOT be present for ACTIVE          |
+| `name`   | string, optional| ntrack extension: sender display name (see below)  |
 
 A minimal STOP payload is exactly `{"status":"STOP"}` (test:
 `stop_payload_serializes_minimal`). Unknown *fields* are tolerated on
 receive (forward compatibility); unknown `status` values cause the event to
 be dropped, as required (test: `unknown_status_is_dropped`).
+
+### Display name (`name`) — ntrack extension
+
+`name` is **not** part of the canonical NIP-GART payload; it is a
+non-normative ntrack extension carrying the sender's self-chosen display name.
+
+* Senders attach it to ACTIVE/TEST broadcasts (`GartPayload::with_name`) only
+  when the user has set a custom name; it is omitted from STOP (kept minimal)
+  and omitted entirely otherwise.
+* When absent, the receiver derives a stable `Adjective Animal` handle from the
+  sender key (`keys::derive_name`), so both ends agree on the default without
+  it ever crossing the wire. Strict NIP-GART receivers (e.g. Gart) ignore the
+  unknown field per the forward-compatibility rule above.
+* On receive the name is sanitized and length-capped before display, retained
+  across a STOP, and overridden by any local label the user set. A per-key
+  colour (`keys::display_color`) shown beside each card disambiguates the
+  collisions that duplicate names can produce.
+
+Tests: `name_roundtrips_through_the_payload`, `with_name_trims_and_drops_blank`
+(protocol); `incoming_declared_name_and_color_surface_in_snapshot`,
+`incoming_without_name_falls_back_to_derived_handle`,
+`stop_retains_last_declared_name`, `outgoing_active_carries_configured_name_trimmed`,
+`outgoing_active_omits_blank_name` (engine);
+`derived_name_is_deterministic_and_well_formed`,
+`display_color_is_deterministic_and_visible` (keys).
 
 ## Receiver pipeline
 

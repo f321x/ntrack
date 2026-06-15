@@ -13,6 +13,7 @@
 //! debug builds. All secrets in this crate are wrapped in [`SecretString`],
 //! whose `Debug`/`Display` implementations redact the value.
 
+use nostr::hashes::{sha256, Hash};
 use nostr::nips::nip19::{FromBech32, ToBech32};
 use nostr::{Keys, PublicKey, SecretKey};
 use serde::{Deserialize, Serialize};
@@ -116,6 +117,74 @@ pub fn short_npub(pk: &PublicKey) -> String {
     }
 }
 
+// ---- identity name & color derived from a public key --------------------
+//
+// Senders are pseudonymous keys, so a raw npub makes a poor display name. To
+// give every key a stable, human-readable identity we derive an
+// "Adjective Animal" handle and an accent colour from a hash of the key. Both
+// are deterministic, so two clients independently agree on the default for the
+// same key; collisions are possible and acceptable (the colour disambiguates).
+
+/// SHA-256 of a public key's lowercase hex — the per-identity seed shared by
+/// the derived name and colour.
+fn identity_seed(pk: &PublicKey) -> [u8; 32] {
+    sha256::Hash::hash(pk.to_hex().as_bytes()).to_byte_array()
+}
+
+const NAME_ADJECTIVES: [&str; 64] = [
+    "Amber", "Azure", "Bold", "Brave", "Bright", "Brisk", "Calm", "Clever", "Cobalt", "Cosmic",
+    "Crimson", "Daring", "Dawn", "Deft", "Eager", "Electric", "Ember", "Fancy", "Fleet", "Fluffy",
+    "Gentle", "Giddy", "Golden", "Grand", "Happy", "Hazel", "Honest", "Indigo", "Ivory", "Jade",
+    "Jolly", "Keen", "Kind", "Lively", "Lucky", "Lunar", "Merry", "Mighty", "Mint", "Misty",
+    "Noble", "Nimble", "Olive", "Plucky", "Proud", "Quick", "Quiet", "Royal", "Ruby", "Rustic",
+    "Sandy", "Scarlet", "Sharp", "Shiny", "Silver", "Sleek", "Snowy", "Solar", "Spry", "Sunny",
+    "Swift", "Teal", "Vivid", "Witty",
+];
+
+const NAME_ANIMALS: [&str; 64] = [
+    "Otter", "Fox", "Falcon", "Heron", "Lynx", "Panda", "Tiger", "Eagle", "Wolf", "Bear",
+    "Hawk", "Owl", "Raven", "Robin", "Sparrow", "Finch", "Crane", "Stork", "Swan", "Goose",
+    "Duck", "Seal", "Whale", "Dolphin", "Orca", "Shark", "Ray", "Koi", "Carp", "Pike",
+    "Bass", "Trout", "Newt", "Toad", "Frog", "Gecko", "Skink", "Viper", "Cobra", "Python",
+    "Bison", "Moose", "Elk", "Deer", "Stag", "Hare", "Rabbit", "Mouse", "Vole", "Shrew",
+    "Badger", "Marten", "Stoat", "Weasel", "Ferret", "Mink", "Beaver", "Marmot", "Lemur", "Macaw",
+    "Parrot", "Toucan", "Magpie", "Jay",
+];
+
+/// Deterministic "Adjective Animal" display name derived from a public key,
+/// used as the default identity for a (pseudonymous) sender until they pick a
+/// name of their own.
+pub fn derive_name(pk: &PublicKey) -> String {
+    let seed = identity_seed(pk);
+    let adjective = NAME_ADJECTIVES[seed[0] as usize % NAME_ADJECTIVES.len()];
+    let animal = NAME_ANIMALS[seed[1] as usize % NAME_ANIMALS.len()];
+    format!("{adjective} {animal}")
+}
+
+/// Deterministic accent colour (R, G, B) derived from a public key, for the
+/// swatch beside each sender in the Track tab. The hue is taken from the last
+/// three bytes of the key-hex SHA-256 (the scheme NIP-GART-adjacent apps use);
+/// near-black results are lifted so they stay visible on the dark theme.
+pub fn display_color(pk: &PublicKey) -> (u8, u8, u8) {
+    let seed = identity_seed(pk);
+    ensure_visible(seed[29], seed[30], seed[31])
+}
+
+/// Lift a colour whose brightest channel falls below a floor (so it does not
+/// vanish against the dark UI), preserving hue by scaling all channels equally.
+fn ensure_visible(r: u8, g: u8, b: u8) -> (u8, u8, u8) {
+    const FLOOR: u16 = 140;
+    let max = r.max(g).max(b) as u16;
+    if max == 0 {
+        return (FLOOR as u8, FLOOR as u8, FLOOR as u8);
+    }
+    if max >= FLOOR {
+        return (r, g, b);
+    }
+    let lift = |c: u8| ((c as u16 * FLOOR) / max).min(255) as u8;
+    (lift(r), lift(g), lift(b))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -145,6 +214,41 @@ mod tests {
             parse_public(&keys.public_key().to_hex()).unwrap(),
             keys.public_key()
         );
+    }
+
+    #[test]
+    fn derived_name_is_deterministic_and_well_formed() {
+        let k = generate();
+        let a = derive_name(&k.public_key());
+        let b = derive_name(&k.public_key());
+        assert_eq!(a, b, "same key → same name");
+        // "Adjective Animal": exactly two non-empty, known words.
+        let words: Vec<&str> = a.split(' ').collect();
+        assert_eq!(words.len(), 2, "name is two words: {a}");
+        assert!(NAME_ADJECTIVES.contains(&words[0]));
+        assert!(NAME_ANIMALS.contains(&words[1]));
+    }
+
+    #[test]
+    fn display_color_is_deterministic_and_visible() {
+        let k = generate();
+        let c1 = display_color(&k.public_key());
+        let c2 = display_color(&k.public_key());
+        assert_eq!(c1, c2, "same key → same colour");
+        // The brightest channel always clears the visibility floor.
+        assert!(c1.0.max(c1.1).max(c1.2) >= 140, "colour stays visible: {c1:?}");
+    }
+
+    #[test]
+    fn ensure_visible_lifts_dark_colors_only() {
+        // Already bright → untouched.
+        assert_eq!(ensure_visible(200, 10, 30), (200, 10, 30));
+        // Pure black → neutral grey at the floor.
+        assert_eq!(ensure_visible(0, 0, 0), (140, 140, 140));
+        // Dark hue → scaled up to the floor, hue (zero channels) preserved.
+        let (r, g, b) = ensure_visible(10, 0, 5);
+        assert_eq!(r.max(g).max(b), 140);
+        assert_eq!(g, 0, "a zero channel stays zero so the hue is kept");
     }
 
     #[test]

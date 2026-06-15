@@ -29,6 +29,8 @@ pub const SEEN_CAPACITY: usize = 4096;
 const FRESH_SAMPLE_SECS: u64 = 60;
 /// Give up on a pending TEST if no fix arrives in this time.
 const TEST_FIX_TIMEOUT: Duration = Duration::from_secs(45);
+/// Cap on a sender-declared display name once cleaned for display.
+const MAX_NAME_CHARS: usize = 48;
 
 // ---- track-history retention (for GPX export) --------------------------
 //
@@ -115,6 +117,11 @@ pub struct ConfigSnapshot {
     pub relays: Vec<String>,
     pub interval_secs: u64,
     pub sender_npub: String,
+    /// The user's configured display name (empty when unset).
+    pub display_name: String,
+    /// Handle derived from the sender key, shown as the placeholder/fallback
+    /// while `display_name` is empty. Empty until the sender key exists.
+    pub default_name: String,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -134,6 +141,12 @@ pub struct TrackSnapshot {
     pub sender_hex: String,
     pub sender_short: String,
     pub label: String,
+    /// Effective display name for the sender: the name they broadcast, else a
+    /// handle derived from their key. The receiver's own `label` still wins.
+    pub name: String,
+    /// Accent colour (R, G, B) derived from the sender key — the disambiguator
+    /// when two senders happen to share a name.
+    pub color: (u8, u8, u8),
     pub group_name: String,
     pub status: Status,
     pub live: bool,
@@ -199,6 +212,9 @@ struct TrackState {
     created_at: u64,
     /// Coordinates retained from the last ACTIVE/TEST when a STOP arrives.
     last_coords: Option<(f64, f64, u64)>,
+    /// Sanitized display name from the last ACTIVE/TEST, retained across a STOP
+    /// (which carries none) so a sender's chosen name survives going offline.
+    last_name: Option<String>,
 }
 
 /// One retained location fix for a (sender, group) session.
@@ -524,13 +540,11 @@ impl<P: EnginePool> Engine<P> {
             now_secs().saturating_sub(s.ts_secs()) < FRESH_SAMPLE_SECS
         });
         if let Some(sample) = fresh {
-            self.publish_payload(GartPayload::test(
-                sample.lat,
-                sample.lng,
-                sample.ts_secs(),
-                None,
-                None,
-            ));
+            let name = self.outgoing_name();
+            self.publish_payload(
+                GartPayload::test(sample.lat, sample.lng, sample.ts_secs(), None, None)
+                    .with_name(name),
+            );
             self.toast("Test broadcast sent".into());
             return;
         }
@@ -542,13 +556,11 @@ impl<P: EnginePool> Engine<P> {
 
     fn on_location(&mut self, sample: LocationSample) {
         if let Some((_, _msg)) = self.test_pending.take() {
-            self.publish_payload(GartPayload::test(
-                sample.lat,
-                sample.lng,
-                sample.ts_secs(),
-                None,
-                None,
-            ));
+            let name = self.outgoing_name();
+            self.publish_payload(
+                GartPayload::test(sample.lat, sample.lng, sample.ts_secs(), None, None)
+                    .with_name(name),
+            );
             self.toast("Test broadcast sent".into());
             let _ = self
                 .ui_tx
@@ -621,12 +633,18 @@ impl<P: EnginePool> Engine<P> {
 
     fn publish_active(&mut self, sample: LocationSample) {
         let msg = self.share.as_ref().and_then(|s| s.msg.clone());
-        self.publish_payload(GartPayload::active(
-            sample.lat,
-            sample.lng,
-            sample.ts_secs(),
-            msg,
-        ));
+        let name = self.outgoing_name();
+        self.publish_payload(
+            GartPayload::active(sample.lat, sample.lng, sample.ts_secs(), msg).with_name(name),
+        );
+    }
+
+    /// The display name to stamp on outgoing ACTIVE/TEST broadcasts: the user's
+    /// configured name, trimmed. `None` → omit it so receivers derive the same
+    /// default handle we would (keeping the wire payload minimal).
+    fn outgoing_name(&self) -> Option<String> {
+        let n = self.config.display_name.trim();
+        (!n.is_empty()).then(|| n.to_string())
     }
 
     /// Build, sign and hand a payload to the relay pool, updating share
@@ -758,6 +776,11 @@ impl<P: EnginePool> Engine<P> {
             }),
             _ => None,
         };
+        // A STOP carries no name, so keep the last one the sender broadcast.
+        let last_name = match inc.payload.status {
+            Status::Stop => prev.and_then(|p| p.last_name.clone()),
+            _ => sanitize_name(inc.payload.name.as_deref()),
+        };
         self.tracks.insert(
             key,
             TrackState {
@@ -765,6 +788,7 @@ impl<P: EnginePool> Engine<P> {
                 payload: inc.payload,
                 created_at: inc.created_at,
                 last_coords,
+                last_name,
             },
         );
         self.emit_tracks();
@@ -817,7 +841,7 @@ impl<P: EnginePool> Engine<P> {
             self.toast("Cannot export this track".into());
             return;
         };
-        let label = self.export_label(&sender_hex);
+        let label = self.export_label(&sender_hex, &group_hex);
         let suggested_filename = export_filename(&label);
 
         // Seed from the in-memory history for this session.
@@ -918,15 +942,25 @@ impl<P: EnginePool> Engine<P> {
         });
     }
 
-    /// Human label for a track export: the user's sender label, else the
-    /// sender's short npub.
-    fn export_label(&self, sender_hex: &str) -> String {
-        match self.config.label_for(sender_hex) {
-            Some(l) if !l.is_empty() => l.to_string(),
-            _ => keys::parse_public(sender_hex)
-                .map(|pk| keys::short_npub(&pk))
-                .unwrap_or_else(|_| sender_hex.to_string()),
+    /// Human label for a track export: the receiver's own label, else the name
+    /// the sender broadcast for this session, else a key-derived handle. Mirrors
+    /// the Track tab title so the GPX name matches what the user saw.
+    fn export_label(&self, sender_hex: &str, group_hex: &str) -> String {
+        if let Some(l) = self.config.label_for(sender_hex) {
+            if !l.is_empty() {
+                return l.to_string();
+            }
         }
+        if let Some(name) = self
+            .tracks
+            .get(&(sender_hex.to_string(), group_hex.to_string()))
+            .and_then(|t| t.last_name.clone())
+        {
+            return name;
+        }
+        keys::parse_public(sender_hex)
+            .map(|pk| keys::derive_name(&pk))
+            .unwrap_or_else(|_| sender_hex.to_string())
     }
 
     // ---- snapshots & plumbing -------------------------------------------
@@ -971,13 +1005,16 @@ impl<P: EnginePool> Engine<P> {
     }
 
     fn emit_config(&mut self) {
-        let sender_npub = self
+        let sender_pk = self
             .config
             .sender_secret
             .as_ref()
             .and_then(|s| keys::parse_secret(s.expose()).ok())
-            .map(|sk| keys::npub(&Keys::new(sk).public_key()))
-            .unwrap_or_default();
+            .map(|sk| Keys::new(sk).public_key());
+        let sender_npub = sender_pk.map(|pk| keys::npub(&pk)).unwrap_or_default();
+        // The handle a receiver derives from our sender key — shown as the
+        // settings placeholder/fallback while no custom name is set.
+        let default_name = sender_pk.map(|pk| keys::derive_name(&pk)).unwrap_or_default();
         let groups = self
             .config
             .groups
@@ -998,6 +1035,8 @@ impl<P: EnginePool> Engine<P> {
             relays: self.config.relays.clone(),
             interval_secs: self.config.interval_secs,
             sender_npub,
+            display_name: self.config.display_name.clone(),
+            default_name,
         }));
     }
 
@@ -1041,9 +1080,19 @@ impl<P: EnginePool> Engine<P> {
                     t.payload.ts.unwrap_or(0),
                 ),
             };
-            let sender_short = keys::parse_public(sender_hex)
-                .map(|pk| keys::short_npub(&pk))
-                .unwrap_or_else(|_| sender_hex.clone());
+            let sender_pk = keys::parse_public(sender_hex).ok();
+            let sender_short = sender_pk
+                .as_ref()
+                .map(keys::short_npub)
+                .unwrap_or_else(|| sender_hex.clone());
+            // Effective name: what the sender broadcast, else a handle derived
+            // from their key. A receiver-set label overrides this in the UI.
+            let name = t
+                .last_name
+                .clone()
+                .or_else(|| sender_pk.as_ref().map(keys::derive_name))
+                .unwrap_or_else(|| sender_short.clone());
+            let color = sender_pk.as_ref().map(keys::display_color).unwrap_or((140, 140, 140));
             out.push(TrackSnapshot {
                 sender_hex: sender_hex.clone(),
                 sender_short,
@@ -1052,6 +1101,8 @@ impl<P: EnginePool> Engine<P> {
                     .label_for(sender_hex)
                     .unwrap_or_default()
                     .to_string(),
+                name,
+                color,
                 group_name,
                 status: t.payload.status,
                 live: t.payload.status == Status::Active,
@@ -1075,6 +1126,22 @@ pub fn now_secs() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+/// Clean a sender-declared display name for safe display: control characters
+/// become spaces, runs of whitespace collapse, ends are trimmed and the result
+/// is capped at [`MAX_NAME_CHARS`]. `None` when nothing usable remains (the
+/// caller then falls back to a key-derived handle).
+fn sanitize_name(name: Option<&str>) -> Option<String> {
+    let collapsed: String = name?
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    let cleaned = collapsed.split_whitespace().collect::<Vec<_>>().join(" ");
+    if cleaned.is_empty() {
+        return None;
+    }
+    Some(cleaned.chars().take(MAX_NAME_CHARS).collect())
 }
 
 // The Publisher trait lives in relay.rs but the engine needs more pool
@@ -1451,6 +1518,104 @@ mod tests {
         let tracks = last_tracks(drain(&mut f)).expect("mutate re-emits tracks");
         assert_eq!(tracks[0].sender_hex, sender_hex);
         assert_eq!(tracks[0].label, "Anna");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn outgoing_active_carries_configured_name_trimmed() {
+        let mut f = fixture();
+        let group = add_member_group(&mut f, "G");
+        f.engine
+            .handle(EngineCmd::Mutate(Box::new(|c| c.display_name = "  Anna  ".into())));
+        drain(&mut f);
+
+        f.engine.handle(EngineCmd::StartShare { msg: None });
+        f.engine.handle(EngineCmd::Location(sample(now_secs() * 1000)));
+        let published = f.pool.published.lock().unwrap().clone();
+        let mut seen = SeenIds::new(16);
+        let inc =
+            protocol::process_incoming(&published[0], &[group.member_keys().unwrap()], &mut seen)
+                .unwrap();
+        assert_eq!(inc.payload.name.as_deref(), Some("Anna"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn outgoing_active_omits_blank_name() {
+        let mut f = fixture();
+        let group = add_member_group(&mut f, "G");
+        drain(&mut f);
+        f.engine.handle(EngineCmd::StartShare { msg: None });
+        f.engine.handle(EngineCmd::Location(sample(now_secs() * 1000)));
+        let published = f.pool.published.lock().unwrap().clone();
+        let mut seen = SeenIds::new(16);
+        let inc =
+            protocol::process_incoming(&published[0], &[group.member_keys().unwrap()], &mut seen)
+                .unwrap();
+        // No configured name → omitted, so receivers derive the same default.
+        assert_eq!(inc.payload.name, None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn incoming_declared_name_and_color_surface_in_snapshot() {
+        let mut f = fixture();
+        let group = add_member_group(&mut f, "G");
+        drain(&mut f);
+        let sender = keys::generate();
+        let ev = protocol::build_event(
+            &sender,
+            &[group.public_key().unwrap()],
+            &GartPayload::active(1.0, 2.0, 1000, None).with_name(Some("Bea".into())),
+            None,
+        )
+        .unwrap();
+        feed(&mut f, ev);
+        let tracks = last_tracks(drain(&mut f)).unwrap();
+        assert_eq!(tracks[0].name, "Bea");
+        // Colour is derived from the sender key and stays visible.
+        assert_eq!(tracks[0].color, keys::display_color(&sender.public_key()));
+        let c = tracks[0].color;
+        assert!(c.0.max(c.1).max(c.2) >= 140);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn incoming_without_name_falls_back_to_derived_handle() {
+        let mut f = fixture();
+        let group = add_member_group(&mut f, "G");
+        drain(&mut f);
+        let sender = keys::generate();
+        feed(&mut f, active_event(&sender, &group, 1.0, 2.0, 1000, 1000));
+        let tracks = last_tracks(drain(&mut f)).unwrap();
+        assert_eq!(tracks[0].name, keys::derive_name(&sender.public_key()));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stop_retains_last_declared_name() {
+        let mut f = fixture();
+        let group = add_member_group(&mut f, "G");
+        drain(&mut f);
+        let sender = keys::generate();
+        feed(
+            &mut f,
+            event_with(
+                &sender,
+                &group,
+                GartPayload::active(1.0, 2.0, 1000, None).with_name(Some("Cleo".into())),
+                1000,
+            ),
+        );
+        feed(&mut f, event_with(&sender, &group, GartPayload::stop(), 1100));
+        let tracks = last_tracks(drain(&mut f)).unwrap();
+        assert_eq!(tracks[0].status, Status::Stop);
+        assert_eq!(tracks[0].name, "Cleo", "the name survives a STOP that carries none");
+    }
+
+    #[test]
+    fn sanitize_name_cleans_and_bounds() {
+        assert_eq!(sanitize_name(None), None);
+        assert_eq!(sanitize_name(Some("   ")), None);
+        assert_eq!(sanitize_name(Some("  Anna\nB  ")).as_deref(), Some("Anna B"));
+        assert_eq!(sanitize_name(Some("a\t\tb")).as_deref(), Some("a b"));
+        let long = "x".repeat(100);
+        assert_eq!(sanitize_name(Some(&long)).unwrap().chars().count(), MAX_NAME_CHARS);
     }
 
     #[tokio::test(start_paused = true)]

@@ -16,13 +16,15 @@ export struct GroupItem {
 
 export struct TrackItem {
     sender: string,      // sender pubkey hex (stable id)
-    title: string,       // label or short npub
+    title: string,       // label, sender's name, or derived handle
     label: string,       // raw user label ("" when unset)
+    npub: string,        // shortened npub (identity, shown under the title)
     group: string,
     status: string,      // "LIVE" | "TEST" | "ENDED"
     coords: string,
     ago: string,
     msg: string,
+    color: color,        // accent derived from the sender key
     live: bool,
     is-test: bool,
     has-coords: bool,
@@ -283,66 +285,82 @@ component TrackRow inherits Card {
     callback export-track();
     callback rename();
 
-    VerticalLayout {
-        padding: Theme.pad;
-        spacing: 6px;
-        HorizontalLayout {
-            spacing: 8px;
-            VerticalLayout {
-                alignment: center;
-                StatusDot {
-                    on: item.live || item.is-test;
-                    on-color: item.is-test ? Theme.warn : Theme.ok;
+    HorizontalLayout {
+        // Identity accent stripe: a colour derived from the sender key, the
+        // disambiguator when two senders happen to share a name.
+        Rectangle {
+            width: 6px;
+            background: item.color;
+        }
+        VerticalLayout {
+            padding: Theme.pad;
+            spacing: 6px;
+            HorizontalLayout {
+                spacing: 8px;
+                VerticalLayout {
+                    alignment: center;
+                    StatusDot {
+                        on: item.live || item.is-test;
+                        on-color: item.is-test ? Theme.warn : Theme.ok;
+                    }
                 }
-            }
-            Text {
-                text: item.title;
-                color: Theme.text;
-                font-size: 16px;
-                font-weight: 700;
-                overflow: elide;
-                horizontal-stretch: 1;
-            }
-            Rectangle {
-                width: badge.preferred-width + 16px;
-                height: 22px;
-                border-radius: 11px;
-                background: item.is-test ? Theme.warn.darker(60%)
-                    : item.live ? Theme.ok.darker(60%) : Theme.card-alt;
-                badge := Text {
-                    text: item.status;
-                    color: item.is-test ? Theme.warn : item.live ? Theme.ok : Theme.muted;
-                    font-size: 11px;
+                Text {
+                    text: item.title;
+                    color: Theme.text;
+                    font-size: 16px;
                     font-weight: 700;
-                    horizontal-alignment: center;
-                    vertical-alignment: center;
+                    overflow: elide;
+                    horizontal-stretch: 1;
+                }
+                Rectangle {
+                    width: badge.preferred-width + 16px;
+                    height: 22px;
+                    border-radius: 11px;
+                    background: item.is-test ? Theme.warn.darker(60%)
+                        : item.live ? Theme.ok.darker(60%) : Theme.card-alt;
+                    badge := Text {
+                        text: item.status;
+                        color: item.is-test ? Theme.warn : item.live ? Theme.ok : Theme.muted;
+                        font-size: 11px;
+                        font-weight: 700;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
                 }
             }
-        }
-        Text { text: "Group: " + item.group; color: Theme.muted; font-size: 12px; }
-        if item.has-coords : Text {
-            text: item.coords;
-            color: Theme.text;
-            font-size: 13px;
-        }
-        if item.msg != "" : Text {
-            text: "“" + item.msg + "”";
-            color: Theme.warn;
-            font-size: 13px;
-            wrap: word-wrap;
-        }
-        HorizontalLayout {
-            spacing: 8px;
+            // Short npub under the friendly name, so the pseudonymous identity
+            // stays verifiable even when two senders share a name.
             Text {
-                text: item.ago;
+                text: item.npub;
                 color: Theme.muted;
-                font-size: 12px;
-                vertical-alignment: center;
-                horizontal-stretch: 1;
+                font-size: 11px;
+                overflow: elide;
             }
-            SmallButton { text: "Rename"; clicked => { root.rename(); } }
-            if item.has-coords : SmallButton { text: "Open map"; clicked => { root.open-map(); } }
-            if item.has-coords : SmallButton { text: "Export"; clicked => { root.export-track(); } }
+            Text { text: "Group: " + item.group; color: Theme.muted; font-size: 12px; }
+            if item.has-coords : Text {
+                text: item.coords;
+                color: Theme.text;
+                font-size: 13px;
+            }
+            if item.msg != "" : Text {
+                text: "“" + item.msg + "”";
+                color: Theme.warn;
+                font-size: 13px;
+                wrap: word-wrap;
+            }
+            HorizontalLayout {
+                spacing: 8px;
+                Text {
+                    text: item.ago;
+                    color: Theme.muted;
+                    font-size: 12px;
+                    vertical-alignment: center;
+                    horizontal-stretch: 1;
+                }
+                SmallButton { text: "Rename"; clicked => { root.rename(); } }
+                if item.has-coords : SmallButton { text: "Open map"; clicked => { root.open-map(); } }
+                if item.has-coords : SmallButton { text: "Export"; clicked => { root.export-track(); } }
+            }
         }
     }
 }
@@ -532,14 +550,47 @@ component GroupsPage inherits ScrollView {
 component SettingsPage inherits ScrollView {
     in property <[RelayItem]> relays;
     in property <string> sender-npub;
+    in property <string> display-name;   // configured name ("" when unset)
+    in property <string> default-name;   // handle derived from the sender key
     callback add-relay(string);
     callback remove-relay(string);
     callback rotate-sender();
+    callback set-display-name(string);
 
     VerticalLayout {
         padding: Theme.pad;
         spacing: 12px;
         alignment: start;
+
+        SectionTitle { text: "YOUR NAME"; }
+        Card {
+            VerticalLayout {
+                padding: Theme.pad;
+                spacing: 8px;
+                name-input := LineEdit {
+                    placeholder-text: root.default-name == "" ? "Your name" : root.default-name;
+                    // Pre-fill once on open; not bound, so the 1 s re-render
+                    // never clobbers the field while you type.
+                    init => { self.text = root.display-name; }
+                    accepted(t) => { root.set-display-name(t); }
+                }
+                Text {
+                    text: root.default-name == ""
+                        ? "Shown to everyone you share your location with. Until you set one, a name is derived from your sender key."
+                        : "Shown to everyone you share with. Leave blank to use the auto name “" + root.default-name + "”.";
+                    color: Theme.muted;
+                    font-size: 12px;
+                    wrap: word-wrap;
+                }
+                AppButton {
+                    text: "Save name";
+                    clicked => {
+                        root.set-display-name(name-input.text);
+                        name-input.clear-focus();
+                    }
+                }
+            }
+        }
 
         SectionTitle { text: "RELAYS"; }
         Card {
@@ -643,6 +694,8 @@ export component MainWindow inherits Window {
     in property <string> status-detail: "";
     in property <int> interval-index: 1;
     in property <string> sender-npub;
+    in property <string> display-name;
+    in property <string> default-name;
     in property <bool> can-receive-any;
     in property <string> toast;
 
@@ -691,6 +744,7 @@ export component MainWindow inherits Window {
     callback add-relay(string);
     callback remove-relay(string);
     callback rotate-sender();
+    callback set-display-name(string);
     callback copy-text(string);
     callback system-share(string);
 
@@ -784,9 +838,12 @@ export component MainWindow inherits Window {
             if root.current-page == 3 : SettingsPage {
                 relays: root.relays;
                 sender-npub: root.sender-npub;
+                display-name: root.display-name;
+                default-name: root.default-name;
                 add-relay(u) => { root.add-relay(u); }
                 remove-relay(u) => { root.remove-relay(u); }
                 rotate-sender => { root.rotate-sender(); }
+                set-display-name(n) => { root.set-display-name(n); }
             }
         }
 
