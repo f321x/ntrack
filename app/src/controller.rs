@@ -47,7 +47,6 @@ enum Confirm {
 #[derive(Clone)]
 enum AfterPermission {
     StartShare { msg: String },
-    SendTest,
     ResumeShare,
 }
 
@@ -144,9 +143,6 @@ impl Controller {
                             let _ = self.cmd_tx.send(EngineCmd::StartShare {
                                 msg: Some(msg).filter(|m| !m.trim().is_empty()),
                             });
-                        }
-                        Some(AfterPermission::SendTest) => {
-                            let _ = self.cmd_tx.send(EngineCmd::SendTest);
                         }
                         Some(AfterPermission::ResumeShare) => {
                             let _ = self.cmd_tx.send(EngineCmd::ResumeShareIfArmed);
@@ -396,7 +392,6 @@ impl Controller {
 
         let share = view.share.clone().unwrap_or_default();
         ui.set_sharing(share.sharing);
-        ui.set_test_pending(share.test_pending);
         ui.set_waiting_fix(share.sharing && share.waiting_for_fix);
         let (headline, detail) = share_status_strings(&share, connected, total);
         ui.set_status_headline(headline.into());
@@ -465,10 +460,6 @@ impl Controller {
 
         hook!(on_stop_share, |ctrl| {
             let _ = ctrl.cmd_tx.send(EngineCmd::StopShare);
-        });
-
-        hook!(on_send_test, |ctrl| {
-            ctrl.send_test();
         });
 
         hook!(on_set_interval, |ctrl, idx: i32| {
@@ -673,15 +664,6 @@ impl Controller {
         } else {
             self.view.lock().unwrap().after_permission =
                 Some(AfterPermission::StartShare { msg });
-            self.platform.request_location_permission();
-        }
-    }
-
-    fn send_test(self: &Arc<Self>) {
-        if self.platform.has_location_permission() {
-            let _ = self.cmd_tx.send(EngineCmd::SendTest);
-        } else {
-            self.view.lock().unwrap().after_permission = Some(AfterPermission::SendTest);
             self.platform.request_location_permission();
         }
     }
@@ -994,7 +976,6 @@ mod tests {
     fn status_strings() {
         let s = ShareSnapshot {
             sharing: false,
-            test_pending: false,
             last_publish: None,
             publish_count: 0,
             last_acked: false,
@@ -1006,7 +987,6 @@ mod tests {
 
         let s = ShareSnapshot {
             sharing: true,
-            test_pending: false,
             last_publish: Some(now_secs()),
             publish_count: 7,
             last_acked: true,

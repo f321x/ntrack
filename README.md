@@ -26,8 +26,6 @@ channel — exactly as you would the bare `nsec`.
   linked to a personal Nostr identity.
 - **Track** — subscribes to your groups, verifies + dedups + decrypts incoming events, and shows
   each sender live with an "open in maps" shortcut.
-- **Test** — sends a `TEST` event to check the full pipeline (relays, encryption, members'
-  devices) without starting a real share.
 
 Full protocol ↔ implementation ↔ test mapping: [docs/PROTOCOL.md](docs/PROTOCOL.md).
 

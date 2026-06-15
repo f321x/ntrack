@@ -60,7 +60,7 @@ Everything revolves around a single async task — the **`Engine`** (`core/src/e
 owns the config, the share state machine, and the tracking state. It is decoupled from both UI and
 OS and communicates *only* over channels:
 
-- **In:** `EngineCmd` (StartShare, StopShare, SendTest, Location, Mutate(config), RotateGroup,
+- **In:** `EngineCmd` (StartShare, StopShare, Location, Mutate(config), RotateGroup,
   Pool events, Tick, …).
 - **Out:** `UiEvent` carrying immutable **snapshots** (`ConfigSnapshot`, `ShareSnapshot`,
   `TrackSnapshot`, Toast, `NeedLocation(bool)`, …). The engine never holds a UI reference and the
