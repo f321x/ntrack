@@ -26,8 +26,10 @@ use crate::map;
 use crate::platform::{Platform, PlatformEvent};
 use crate::{GroupItem, MainWindow, MapMarker, MapTile, RelayItem, TrackItem};
 
-/// Publish interval choices shown in the UI, in seconds.
-pub const INTERVALS: [u64; 4] = [15, 30, 60, 300];
+/// Publish interval choices shown in the UI, in seconds. Index-aligned with the
+/// combo box in `app.slint`.
+pub const INTERVALS: [u64; 10] =
+    [15, 30, 60, 300, 600, 900, 1200, 1800, 3600, 7200];
 /// Check-in (dead-man's switch) duration choices on the Share screen, in
 /// seconds. Index-aligned with the combo box in `app.slint`.
 pub const CHECKIN_OPTIONS: [u64; 7] = [900, 1800, 3600, 10_800, 21_600, 43_200, 86_400];
