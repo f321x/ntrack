@@ -201,9 +201,11 @@ overlap harmless. (Test: `subscription_filter_shape`.)
   immediately so the change reaches the group without waiting for the next tick.
 * A **check-in** (dead-man's switch) is a local timer, not a wire concept: if
   the user doesn't confirm safety before it elapses, ntrack escalates to the
-  same alert+share. It is persisted, so a deadline that lapses while the app is
-  down is re-evaluated at startup — granting a brief grace window (with a
-  notification) before firing, rather than a false alarm on a phone that merely
-  ran out of battery.
+  same alert+share. Confirming safety re-arms it for another full period — it
+  repeats until explicitly disarmed — with a reminder notification posted once
+  when 10% of the period remains. It is persisted, so a deadline that lapses
+  while the app is down is re-evaluated at startup — granting a brief grace
+  window (with a notification) before firing, rather than a false alarm on a
+  phone that merely ran out of battery.
 * ntrack originates only `ACTIVE` and `STOP` events. The first `ACTIVE` goes
   out as soon as sharing starts.

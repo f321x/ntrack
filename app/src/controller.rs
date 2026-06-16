@@ -30,7 +30,7 @@ use crate::{GroupItem, MainWindow, MapMarker, MapTile, RelayItem, TrackItem};
 pub const INTERVALS: [u64; 4] = [15, 30, 60, 300];
 /// Check-in (dead-man's switch) duration choices on the Share screen, in
 /// seconds. Index-aligned with the combo box in `app.slint`.
-pub const CHECKIN_OPTIONS: [u64; 4] = [300, 900, 1800, 3600];
+pub const CHECKIN_OPTIONS: [u64; 7] = [900, 1800, 3600, 10_800, 21_600, 43_200, 86_400];
 /// Index of the Groups page in the bottom tab bar (Share, Track, Groups,
 /// Settings). An incoming invite switches here to pre-fill the import form.
 const GROUPS_PAGE: i32 = 2;
@@ -467,7 +467,7 @@ impl Controller {
                     } else {
                         "".into()
                     },
-                    ago: ago_string(t.ts, t.created_at),
+                    ago: ago_string(t.created_at),
                     msg: t.msg.clone().into(),
                     color: slint::Color::from_rgb_u8(r, g, b),
                     live,
@@ -713,6 +713,9 @@ impl Controller {
         });
         hook!(on_checkin_safe, |ctrl| {
             let _ = ctrl.cmd_tx.send(EngineCmd::Checkin);
+        });
+        hook!(on_checkin_disarm, |ctrl| {
+            let _ = ctrl.cmd_tx.send(EngineCmd::DisarmCheckin);
         });
 
         hook!(on_set_interval, |ctrl, idx: i32| {
@@ -1084,15 +1087,17 @@ fn relays_added_suffix(added: usize) -> String {
     format!(" · {added} relay{} added", if added == 1 { "" } else { "s" })
 }
 
-/// "now", "12 s ago", "5 min ago", "3 h ago" — based on the location fix
-/// time when present, otherwise the event timestamp.
-fn ago_string(ts: u64, created_at: u64) -> slint::SharedString {
-    let t = if ts > 0 { ts } else { created_at };
-    if t == 0 {
+/// "now", "12 s ago", "5 min ago", "3 h ago" — based on the Nostr event's
+/// `created_at`, i.e. when the sender last broadcast. Deliberately not the GPS
+/// fix time (`ts`): backfilled history fetched on startup carries old events,
+/// and keying off the event time makes a 5 h-old fix read as "5 h ago" instead
+/// of resetting to "just now" when the app relaunches.
+fn ago_string(created_at: u64) -> slint::SharedString {
+    if created_at == 0 {
         return "".into();
     }
     let now = now_secs();
-    let d = now.saturating_sub(t);
+    let d = now.saturating_sub(created_at);
     let s = match d {
         0..=4 => "just now".to_string(),
         5..=59 => format!("{d} s ago"),
@@ -1227,12 +1232,13 @@ mod tests {
     #[test]
     fn ago_strings() {
         let now = now_secs();
-        assert_eq!(ago_string(now, 0).as_str(), "just now");
-        assert_eq!(ago_string(now - 30, 0).as_str(), "30 s ago");
-        assert_eq!(ago_string(now - 120, 0).as_str(), "2 min ago");
-        assert_eq!(ago_string(now - 7200, 0).as_str(), "2 h ago");
-        assert_eq!(ago_string(0, now - 90).as_str(), "1 min ago");
-        assert_eq!(ago_string(0, 0).as_str(), "");
+        assert_eq!(ago_string(now).as_str(), "just now");
+        assert_eq!(ago_string(now - 30).as_str(), "30 s ago");
+        assert_eq!(ago_string(now - 120).as_str(), "2 min ago");
+        assert_eq!(ago_string(now - 7200).as_str(), "2 h ago");
+        // A day-plus-old backfilled event reads as old, not "just now".
+        assert_eq!(ago_string(now - 90_000).as_str(), "1 d ago");
+        assert_eq!(ago_string(0).as_str(), "");
     }
 
     fn track(status: Status, created_at: u64) -> TrackSnapshot {

@@ -182,6 +182,7 @@ component SharePage inherits ScrollView {
     callback clear-alert();
     callback arm-checkin(int);
     callback checkin-safe();
+    callback checkin-disarm();
 
     VerticalLayout {
         padding: Theme.pad;
@@ -218,36 +219,6 @@ component SharePage inherits ScrollView {
             }
         }
 
-        // ---- duress alert ----
-        if root.alert : Card {
-            background: Theme.danger.darker(35%);
-            VerticalLayout {
-                padding: Theme.pad;
-                spacing: 8px;
-                Text {
-                    text: "🚨 Alert active";
-                    color: #ffffff;
-                    font-size: 17px;
-                    font-weight: 800;
-                }
-                Text {
-                    text: "Your group is being notified and your location is updating quickly. Clear it once you're safe.";
-                    color: #ffe8ea;
-                    font-size: 13px;
-                    wrap: word-wrap;
-                }
-                AppButton {
-                    text: "Clear alert — I'm safe";
-                    clicked => { root.clear-alert(); }
-                }
-            }
-        }
-        if !root.alert : AppButton {
-            text: "🆘 Raise alert";
-            danger: true;
-            clicked => { root.panic(); }
-        }
-
         // ---- check-in (dead-man's switch) ----
         SectionTitle { text: "CHECK-IN"; }
         Card {
@@ -278,20 +249,27 @@ component SharePage inherits ScrollView {
                 }
 
                 if root.checkin-armed && !root.checkin-grace : Text {
-                    text: "Checking in — " + root.checkin-countdown + " left. Confirm before it runs out, or an alert is sent to your groups.";
+                    text: "Checking in — " + root.checkin-countdown + " left. Confirm you're safe to reset it, or an alert is sent to your groups. The timer repeats until you disarm.";
                     color: Theme.text;
                     font-size: 13px;
                     wrap: word-wrap;
                 }
 
-                if root.checkin-armed : AppButton {
-                    text: "✓ I'm safe";
-                    primary: true;
-                    clicked => { root.checkin-safe(); }
+                if root.checkin-armed : HorizontalLayout {
+                    spacing: 10px;
+                    AppButton {
+                        text: "✅ I'm safe";
+                        primary: true;
+                        clicked => { root.checkin-safe(); }
+                    }
+                    AppButton {
+                        text: "Disarm";
+                        clicked => { root.checkin-disarm(); }
+                    }
                 }
 
                 if !root.checkin-armed : Text {
-                    text: "Arm a timer: if you don't confirm you're safe before it runs out, ntrack starts sharing and raises an alert to your groups.";
+                    text: "Arm a repeating timer: if you don't confirm you're safe before it runs out, ntrack starts sharing and raises an alert to your groups. Confirming resets it; it runs until you disarm.";
                     color: Theme.muted;
                     font-size: 13px;
                     wrap: word-wrap;
@@ -299,8 +277,8 @@ component SharePage inherits ScrollView {
                 if !root.checkin-armed : HorizontalLayout {
                     spacing: 10px;
                     checkin-box := ComboBox {
-                        model: ["5 min", "15 min", "30 min", "1 h"];
-                        current-index: 1;
+                        model: ["15 min", "30 min", "1 h", "3 h", "6 h", "12 h", "24 h"];
+                        current-index: 0;
                     }
                     AppButton {
                         text: "Arm";
@@ -379,6 +357,36 @@ component SharePage inherits ScrollView {
                     root.start-share(msg-input.text);
                 }
             }
+        }
+
+        // ---- duress alert ----
+        if root.alert : Card {
+            background: Theme.danger.darker(35%);
+            VerticalLayout {
+                padding: Theme.pad;
+                spacing: 8px;
+                Text {
+                    text: "🚨 Alert active";
+                    color: #ffffff;
+                    font-size: 17px;
+                    font-weight: 800;
+                }
+                Text {
+                    text: "Your group is being notified and your location is updating quickly. Clear it once you're safe.";
+                    color: #ffe8ea;
+                    font-size: 13px;
+                    wrap: word-wrap;
+                }
+                AppButton {
+                    text: "Clear alert — I'm safe";
+                    clicked => { root.clear-alert(); }
+                }
+            }
+        }
+        if !root.alert : AppButton {
+            text: "Raise alert";
+            danger: true;
+            clicked => { root.panic(); }
         }
     }
 }
@@ -1062,6 +1070,7 @@ export component MainWindow inherits Window {
     callback clear-alert();
     callback arm-checkin(int);
     callback checkin-safe();
+    callback checkin-disarm();
     callback open-map(int);
     callback open-map-view();
     callback map-close();
@@ -1173,6 +1182,7 @@ export component MainWindow inherits Window {
                 clear-alert => { root.clear-alert(); }
                 arm-checkin(i) => { root.arm-checkin(i); }
                 checkin-safe => { root.checkin-safe(); }
+                checkin-disarm => { root.checkin-disarm(); }
             }
             if root.current-page == 1 : TrackPage {
                 tracks: root.tracks;

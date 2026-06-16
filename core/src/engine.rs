@@ -43,9 +43,10 @@ pub const ALERT_INTERVAL_SECS: u64 = 15;
 /// gets this long to confirm they're safe — prompted by a notification — before
 /// the alert fires.
 pub const STARTUP_GRACE_SECS: u64 = 60;
-/// How long before a check-in deadline to nudge the user once with a reminder
-/// (only when the armed period comfortably exceeds it).
-const CHECKIN_REMINDER_LEAD_SECS: u64 = 120;
+/// Fraction of an armed check-in period at which the user is nudged once with a
+/// reminder before the deadline: at 10% remaining (period / this divisor). A
+/// short period scales the lead down with it; a long one gives ample warning.
+const CHECKIN_REMINDER_LEAD_DIVISOR: u64 = 10;
 
 // ---- track-history retention (for GPX export) --------------------------
 //
@@ -104,9 +105,12 @@ pub enum EngineCmd {
     /// Arm a dead-man's-switch check-in: escalate to [`Panic`](Self::Panic)
     /// unless the user confirms safety within `secs`.
     ArmCheckin { secs: u64 },
-    /// Confirm safety: disarm any armed check-in (live countdown or the
-    /// post-startup grace window).
+    /// Confirm safety: reset the dead-man's-switch countdown to a fresh full
+    /// period rather than disarming, so it keeps protecting the user until they
+    /// explicitly disarm it. Also confirms out of the post-startup grace window.
     Checkin,
+    /// Disarm the dead-man's-switch entirely, stopping the repeating check-in.
+    DisarmCheckin,
     /// Evaluate a persisted check-in at startup (driven by `run`/the boot path,
     /// exposed for tests): resume its countdown, or — if its deadline elapsed
     /// while the app was down — open a grace window and notify rather than fire.
@@ -494,11 +498,12 @@ impl<P: EnginePool> Engine<P> {
             EngineCmd::SetAlert(on) => self.set_alert(on),
             EngineCmd::Panic => self.trigger_panic(),
             EngineCmd::ArmCheckin { secs } => self.arm_checkin(secs),
-            EngineCmd::Checkin => {
+            EngineCmd::Checkin => self.confirm_checkin(),
+            EngineCmd::DisarmCheckin => {
                 let was_armed = self.checkin.is_some();
                 self.disarm_checkin();
                 if was_armed {
-                    self.toast("Checked in — you're safe".into());
+                    self.toast("Check-in disarmed".into());
                 }
             }
             EngineCmd::EvaluateCheckinOnStart => self.evaluate_checkin_on_start(),
@@ -868,9 +873,51 @@ impl<P: EnginePool> Engine<P> {
 
     // ---- check-in (dead-man's switch) ----------------------------------
 
-    /// Arm (or re-arm) a check-in that escalates to a panic unless confirmed
-    /// within `secs`. Persisted (plus a boot sentinel) so it survives a reboot.
+    /// Arm a check-in that escalates to a panic unless confirmed within `secs`.
+    /// Persisted (plus a boot sentinel) so it survives a reboot.
     fn arm_checkin(&mut self, secs: u64) {
+        let secs = secs.max(1);
+        self.install_checkin(secs);
+        self.toast(format!("Check-in armed — confirm within {}", fmt_duration(secs)));
+        self.emit_share();
+    }
+
+    /// Confirm safety. Instead of disarming, the dead-man's switch automatically
+    /// re-arms for another full period, so it keeps protecting the user until
+    /// they explicitly disarm it (see [`Self::disarm_checkin`]). Confirms out of
+    /// the startup grace window too, re-arming from the persisted period. No-op
+    /// when nothing is armed.
+    fn confirm_checkin(&mut self) {
+        let period = match &self.checkin {
+            Some(CheckinState::Armed { period_secs, .. }) => Some(*period_secs),
+            // Grace leaves the persisted period untouched, so re-arm from config.
+            Some(CheckinState::StartupGrace { .. }) => self.config.checkin_period_secs,
+            None => return,
+        };
+        match period.filter(|p| *p > 0) {
+            Some(period) => {
+                self.install_checkin(period);
+                self.emit_share();
+                self.toast(format!(
+                    "Checked in — next check-in within {}",
+                    fmt_duration(period)
+                ));
+            }
+            // No period to re-arm with (shouldn't happen): clear it instead.
+            None => {
+                let was_armed = self.checkin.is_some();
+                self.disarm_checkin();
+                if was_armed {
+                    self.toast("Checked in — you're safe".into());
+                }
+            }
+        }
+    }
+
+    /// (Re)install an armed check-in counting down `secs` from now, persisting
+    /// the deadline/period and the boot sentinel. No toast or snapshot — callers
+    /// add the user-facing message and emit.
+    fn install_checkin(&mut self, secs: u64) {
         let secs = secs.max(1);
         let deadline = now_secs() + secs;
         self.checkin = Some(CheckinState::Armed { deadline, period_secs: secs, reminded: false });
@@ -878,11 +925,9 @@ impl<P: EnginePool> Engine<P> {
         self.config.checkin_period_secs = Some(secs);
         self.persist();
         self.store.set_checkin_flag(true);
-        self.toast(format!("Check-in armed — confirm within {}", fmt_duration(secs)));
-        self.emit_share();
     }
 
-    /// Disarm any check-in (a confirmed "I'm safe", or after an escalation
+    /// Disarm any check-in (an explicit user disarm, or after an escalation
     /// fired) and clear its persisted state and boot sentinel.
     fn disarm_checkin(&mut self) {
         let had_state = self.checkin.is_some()
@@ -940,12 +985,11 @@ impl<P: EnginePool> Engine<P> {
         let now = now_secs();
         let action = match &mut self.checkin {
             Some(CheckinState::Armed { deadline, period_secs, reminded }) => {
+                // Nudge once when 10% of the armed period remains.
+                let lead = *period_secs / CHECKIN_REMINDER_LEAD_DIVISOR;
                 if now >= *deadline {
                     Action::Escalate
-                } else if !*reminded
-                    && *period_secs > CHECKIN_REMINDER_LEAD_SECS
-                    && now >= deadline.saturating_sub(CHECKIN_REMINDER_LEAD_SECS)
-                {
+                } else if !*reminded && lead > 0 && now >= deadline.saturating_sub(lead) {
                     *reminded = true;
                     Action::Remind
                 } else {
@@ -2506,14 +2550,39 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn checkin_safe_disarms_and_clears_sentinel() {
+    async fn checkin_safe_rearms_for_another_period() {
         let mut f = fixture();
         add_member_group(&mut f, "G");
         drain(&mut f);
         f.engine.handle(EngineCmd::ArmCheckin { secs: 600 });
+        // Wind the deadline almost down so the re-arm's reset is visible.
+        if let Some(CheckinState::Armed { deadline, .. }) = &mut f.engine.checkin {
+            *deadline = now_secs() + 5;
+        }
         f.engine.handle(EngineCmd::Checkin);
+        // Confirming safety re-arms rather than disarming: still armed, the
+        // deadline pushed back out to a fresh full period, sentinel intact.
+        match f.engine.checkin {
+            Some(CheckinState::Armed { deadline, period_secs, .. }) => {
+                assert_eq!(period_secs, 600);
+                assert!(deadline >= now_secs() + 590, "deadline reset to a fresh period");
+            }
+            _ => panic!("check-in should re-arm after confirming safe"),
+        }
+        assert_eq!(f.engine.config.checkin_period_secs, Some(600));
+        assert!(f.engine.store.checkin_flag_path().exists());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn disarm_checkin_clears_state_and_sentinel() {
+        let mut f = fixture();
+        add_member_group(&mut f, "G");
+        drain(&mut f);
+        f.engine.handle(EngineCmd::ArmCheckin { secs: 600 });
+        f.engine.handle(EngineCmd::DisarmCheckin);
         assert!(f.engine.checkin.is_none());
         assert_eq!(f.engine.config.checkin_deadline, None);
+        assert_eq!(f.engine.config.checkin_period_secs, None);
         assert!(!f.engine.store.checkin_flag_path().exists());
     }
 
@@ -2558,6 +2627,28 @@ mod tests {
         f.engine.handle(EngineCmd::Tick);
         assert!(notify_kinds(&drain(&mut f)).is_empty());
         assert!(f.pool.published.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn checkin_reminder_lead_scales_with_the_period() {
+        let mut f = fixture();
+        add_member_group(&mut f, "G");
+        drain(&mut f);
+        // A long period reminds at 10% remaining, not a fixed lead: with
+        // period 1000 the lead is 100 s, so 200 s out (20% left) is too early.
+        f.engine.checkin =
+            Some(CheckinState::Armed { deadline: now_secs() + 200, period_secs: 1000, reminded: false });
+        f.engine.handle(EngineCmd::Tick);
+        assert!(
+            notify_kinds(&drain(&mut f)).is_empty(),
+            "no reminder while more than 10% of the period remains"
+        );
+        // Inside the 10% window (90 s out) it fires.
+        if let Some(CheckinState::Armed { deadline, .. }) = &mut f.engine.checkin {
+            *deadline = now_secs() + 90;
+        }
+        f.engine.handle(EngineCmd::Tick);
+        assert_eq!(notify_kinds(&drain(&mut f)), vec![NotifyKind::CheckinReminder]);
     }
 
     #[tokio::test(start_paused = true)]
@@ -2615,14 +2706,24 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn checkin_safe_during_grace_never_escalates() {
+    async fn checkin_safe_during_grace_rearms_and_never_escalates() {
         let mut f = fixture();
         add_member_group(&mut f, "G");
+        // Grace re-arms from the persisted period, so seed it.
+        f.engine.handle(EngineCmd::Mutate(Box::new(|c| {
+            c.checkin_deadline = Some(now_secs() - 1);
+            c.checkin_period_secs = Some(600);
+        })));
         drain(&mut f);
         f.engine.checkin = Some(CheckinState::StartupGrace { until: now_secs() + 60 });
         f.engine.handle(EngineCmd::Checkin);
-        assert!(f.engine.checkin.is_none());
+        // Confirming safe re-arms into a fresh countdown (not disarmed)…
+        assert!(matches!(
+            f.engine.checkin,
+            Some(CheckinState::Armed { period_secs: 600, .. })
+        ));
         f.engine.handle(EngineCmd::Tick);
+        // …and no alert fired.
         assert!(
             f.pool.published.lock().unwrap().is_empty(),
             "confirming safe within the grace window cancels the alarm"
