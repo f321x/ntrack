@@ -298,12 +298,14 @@ impl Controller {
                 }
             }
             UiEvent::SetLocationInterval(ms) => {
-                // A duress alert boosting/relaxing the cadence: restart the
-                // running location session at the new interval.
+                // A duress alert boosting/relaxing the cadence: re-tune the
+                // running location session in place. Deliberately not a
+                // stop+start — bouncing the foreground service races Android's
+                // startForegroundService() contract (crashing the app) and
+                // drops the location-access indicator between the two.
                 let active = self.view.lock().unwrap().location_active;
                 if active {
-                    self.platform.stop_location();
-                    self.platform.start_location(ms);
+                    self.platform.set_location_interval(ms);
                 }
                 return; // no view-state change
             }
@@ -724,11 +726,13 @@ impl Controller {
                 .copied()
                 .unwrap_or(30);
             ctrl.mutate(move |c| c.interval_secs = secs);
-            // apply immediately if location updates are running
+            // Apply immediately if location updates are running — re-tune in
+            // place rather than bouncing the foreground service (a stop+start
+            // races Android's startForegroundService() contract and crashes;
+            // see the SetLocationInterval handler).
             let active = ctrl.view.lock().unwrap().location_active;
             if active {
-                ctrl.platform.stop_location();
-                ctrl.platform.start_location(secs * 1000);
+                ctrl.platform.set_location_interval(secs * 1000);
             }
         });
 

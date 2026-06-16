@@ -234,6 +234,18 @@ impl Platform for AndroidPlatform {
         });
     }
 
+    fn set_location_interval(&self, interval_ms: u64) {
+        self.with_env("setLocationInterval", |env, class| {
+            env.call_static_method(
+                class,
+                "setLocationInterval",
+                "(J)V",
+                &[JValue::Long(interval_ms as i64)],
+            )
+            .map(|_| ())
+        });
+    }
+
     fn stop_location(&self) {
         self.with_env("stopLocation", |env, class| {
             env.call_static_method(class, "stopLocation", "()V", &[])

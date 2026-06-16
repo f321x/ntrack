@@ -72,6 +72,11 @@ impl Platform for SimPlatform {
         });
     }
 
+    fn set_location_interval(&self, interval_ms: u64) {
+        // The simulated walk emits at a fixed cadence; nothing to re-tune.
+        log::info!("sim: location interval -> {interval_ms} ms");
+    }
+
     fn stop_location(&self) {
         self.running.store(false, Ordering::SeqCst);
     }
