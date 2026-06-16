@@ -66,6 +66,16 @@ public final class LocationBridge {
 
     private static LocationListener listener;
 
+    /** Whether the current session has delivered at least one fix. Until it has,
+     * we keep the GPS radio continuously powered (see {@link #ACQUIRE_INTERVAL_MS})
+     * so a cold start can complete: a long minTime lets Android rest the radio
+     * between sparse windows, which stalls the first fix and flickers the OS
+     * location-access indicator off. Reset at the start/stop of each session. */
+    private static boolean acquiredFix;
+    /** GPS sampling interval (ms) while acquiring the first fix — short enough to
+     * keep the radio powered (≈continuous tracking) rather than duty-cycling. */
+    private static final long ACQUIRE_INTERVAL_MS = 1000L;
+
     // Deep links can arrive (in MainActivity.onCreate) before the Rust side has
     // registered its native callbacks, so buffer the latest one until Rust is
     // ready and flushes it.
@@ -220,6 +230,9 @@ public final class LocationBridge {
                     Log.e(TAG, "failed to start foreground service", e);
                 }
             }
+            // Fresh session: re-acquire from scratch (keep the radio hot until
+            // the first fix), ignoring any prior session's acquired state.
+            acquiredFix = false;
             subscribe(ctx, intervalMs);
         });
     }
@@ -257,7 +270,7 @@ public final class LocationBridge {
      * existing subscription. Main-thread only — it mutates {@link #listener},
      * so every caller posts here first.
      */
-    private static void subscribe(Context ctx, long intervalMs) {
+    private static void subscribe(final Context ctx, final long intervalMs) {
         try {
             LocationManager lm =
                     (LocationManager) ctx.getSystemService(Context.LOCATION_SERVICE);
@@ -271,23 +284,39 @@ public final class LocationBridge {
                             location.getAccuracy(),
                             location.getTime() > 0 ? location.getTime()
                                     : System.currentTimeMillis());
+                    // First fix of the session: drop from the continuous
+                    // acquisition rate to the requested broadcast cadence so the
+                    // GPS can duty-cycle and save power. Re-subscribing from a
+                    // location callback must hop to the looper (it mutates
+                    // `listener`); the !acquiredFix guard makes this fire once.
+                    if (!acquiredFix) {
+                        acquiredFix = true;
+                        if (Math.max(intervalMs, 1000L) > ACQUIRE_INTERVAL_MS) {
+                            post(() -> {
+                                if (listener != null) subscribe(ctx, intervalMs);
+                            });
+                        }
+                    }
                 }
                 @Override public void onStatusChanged(String provider, int status, Bundle extras) {}
                 @Override public void onProviderEnabled(String provider) {}
                 @Override public void onProviderDisabled(String provider) {}
             };
             boolean any = false;
-            // Sample at the broadcast cadence, not faster: ntrack only
-            // ever sends the latest fix once per interval, so asking the
-            // GPS for fixes more often than that would spin the radio for
-            // positions we'd immediately discard. A 1 s floor guards a
-            // pathologically small interval.
-            long minTimeMs = Math.max(intervalMs, 1000L);
+            // Until the first fix lands, sample fast enough to keep the radio
+            // continuously powered (ACQUIRE_INTERVAL_MS): a long minTime lets
+            // Android rest the GPS between windows, stalling a cold start and
+            // flickering the OS location-access indicator off before we ever get
+            // a fix. Once acquired we relax to the broadcast cadence — ntrack only
+            // sends the latest fix once per interval, so sampling faster would
+            // spin the radio for positions we'd immediately discard (1 s floor
+            // guards a pathologically small interval).
+            long minTimeMs = acquiredFix ? Math.max(intervalMs, 1000L) : ACQUIRE_INTERVAL_MS;
             for (String provider : pickProviders(lm)) {
                 lm.requestLocationUpdates(provider, minTimeMs, 0f,
                         listener, Looper.getMainLooper());
                 any = true;
-                Log.i(TAG, "location updates from " + provider);
+                Log.i(TAG, "location updates from " + provider + " every " + minTimeMs + "ms");
                 Location last = lm.getLastKnownLocation(provider);
                 if (last != null
                         && System.currentTimeMillis() - last.getTime() < 60_000) {
@@ -320,6 +349,7 @@ public final class LocationBridge {
         if (ctx == null) return;
         post(() -> {
             stopListening(ctx);
+            acquiredFix = false;
             ctx.stopService(new Intent(ctx, LocationService.class));
         });
     }
