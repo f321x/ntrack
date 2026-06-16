@@ -220,50 +220,87 @@ public final class LocationBridge {
                     Log.e(TAG, "failed to start foreground service", e);
                 }
             }
-            try {
-                LocationManager lm =
-                        (LocationManager) ctx.getSystemService(Context.LOCATION_SERVICE);
-                stopListening(ctx);
-                listener = new LocationListener() {
-                    @Override
-                    public void onLocationChanged(Location location) {
-                        nativeOnLocation(
-                                location.getLatitude(),
-                                location.getLongitude(),
-                                location.getAccuracy(),
-                                location.getTime() > 0 ? location.getTime()
-                                        : System.currentTimeMillis());
-                    }
-                    @Override public void onStatusChanged(String provider, int status, Bundle extras) {}
-                    @Override public void onProviderEnabled(String provider) {}
-                    @Override public void onProviderDisabled(String provider) {}
-                };
-                boolean any = false;
-                // Sample at the broadcast cadence, not faster: ntrack only
-                // ever sends the latest fix once per interval, so asking the
-                // GPS for fixes more often than that would spin the radio for
-                // positions we'd immediately discard. A 1 s floor guards a
-                // pathologically small interval.
-                long minTimeMs = Math.max(intervalMs, 1000L);
-                for (String provider : pickProviders(lm)) {
-                    lm.requestLocationUpdates(provider, minTimeMs, 0f,
-                            listener, Looper.getMainLooper());
-                    any = true;
-                    Log.i(TAG, "location updates from " + provider);
-                    Location last = lm.getLastKnownLocation(provider);
-                    if (last != null
-                            && System.currentTimeMillis() - last.getTime() < 60_000) {
-                        listener.onLocationChanged(last);
-                    }
-                }
-                if (!any) {
-                    Log.w(TAG, "no usable location provider");
-                }
-            } catch (SecurityException e) {
-                Log.e(TAG, "location permission lost", e);
-                reportPermission(false);
-            }
+            subscribe(ctx, intervalMs);
         });
+    }
+
+    /**
+     * Change the GPS sampling cadence of the already-running session in place
+     * (a duress alert boosts the rate; clearing it relaxes it again), leaving
+     * the foreground service untouched.
+     *
+     * Crucially this is NOT a stopLocation()/startLocation() pair: calling
+     * stopService() immediately after startForegroundService() races Android's
+     * "call startForeground() within a few seconds" contract and crashes the
+     * process with ForegroundServiceDidNotStartInTimeException — and on the boot
+     * path it would tear down the very service that hosts the headless engine.
+     * Re-tuning in place also keeps the OS location-access indicator lit
+     * continuously instead of flickering off between a stop and the next start.
+     *
+     * No-op when no session is running (it is only ever called while sharing).
+     */
+    public static void setLocationInterval(final long intervalMs) {
+        final Context ctx = locationContext();
+        if (ctx == null) return;
+        post(() -> {
+            if (listener == null) return; // nothing running to re-tune
+            if (!hasLocationPermission()) {
+                reportPermission(false);
+                return;
+            }
+            subscribe(ctx, intervalMs);
+        });
+    }
+
+    /**
+     * (Re)subscribe the location listener at {@code intervalMs}, replacing any
+     * existing subscription. Main-thread only — it mutates {@link #listener},
+     * so every caller posts here first.
+     */
+    private static void subscribe(Context ctx, long intervalMs) {
+        try {
+            LocationManager lm =
+                    (LocationManager) ctx.getSystemService(Context.LOCATION_SERVICE);
+            stopListening(ctx);
+            listener = new LocationListener() {
+                @Override
+                public void onLocationChanged(Location location) {
+                    nativeOnLocation(
+                            location.getLatitude(),
+                            location.getLongitude(),
+                            location.getAccuracy(),
+                            location.getTime() > 0 ? location.getTime()
+                                    : System.currentTimeMillis());
+                }
+                @Override public void onStatusChanged(String provider, int status, Bundle extras) {}
+                @Override public void onProviderEnabled(String provider) {}
+                @Override public void onProviderDisabled(String provider) {}
+            };
+            boolean any = false;
+            // Sample at the broadcast cadence, not faster: ntrack only
+            // ever sends the latest fix once per interval, so asking the
+            // GPS for fixes more often than that would spin the radio for
+            // positions we'd immediately discard. A 1 s floor guards a
+            // pathologically small interval.
+            long minTimeMs = Math.max(intervalMs, 1000L);
+            for (String provider : pickProviders(lm)) {
+                lm.requestLocationUpdates(provider, minTimeMs, 0f,
+                        listener, Looper.getMainLooper());
+                any = true;
+                Log.i(TAG, "location updates from " + provider);
+                Location last = lm.getLastKnownLocation(provider);
+                if (last != null
+                        && System.currentTimeMillis() - last.getTime() < 60_000) {
+                    listener.onLocationChanged(last);
+                }
+            }
+            if (!any) {
+                Log.w(TAG, "no usable location provider");
+            }
+        } catch (SecurityException e) {
+            Log.e(TAG, "location permission lost", e);
+            reportPermission(false);
+        }
     }
 
     private static List<String> pickProviders(LocationManager lm) {

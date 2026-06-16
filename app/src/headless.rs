@@ -135,9 +135,10 @@ pub fn start(
                 }
                 UiEvent::SetLocationInterval(ms) => {
                     // Only ever emitted while a share is active, so location is
-                    // already running; restart it at the new cadence.
-                    platform_loc.stop_location();
-                    platform_loc.start_location(ms);
+                    // already running; re-tune it in place. A stop+start here
+                    // would tear down the very foreground service hosting this
+                    // engine (stop_location stops LocationService).
+                    platform_loc.set_location_interval(ms);
                 }
                 UiEvent::Notify { title, body, .. } => {
                     platform_loc.notify_alert(&title, &body);

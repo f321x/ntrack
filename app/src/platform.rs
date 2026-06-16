@@ -26,6 +26,13 @@ pub trait Platform: Send + Sync + 'static {
     /// Start platform location updates (and on Android the foreground
     /// service that keeps them alive in the background).
     fn start_location(&self, interval_ms: u64);
+    /// Change the GPS sampling cadence of an already-running session in place
+    /// (e.g. when a duress alert boosts the rate, or clearing it relaxes it),
+    /// without disturbing the foreground service. A stop+restart would race
+    /// Android's `startForegroundService()`→`startForeground()` contract —
+    /// crashing the process — and flicker the OS location-access indicator off
+    /// in between. No-op when no session is running.
+    fn set_location_interval(&self, interval_ms: u64);
     fn stop_location(&self);
     fn open_map(&self, lat: f64, lng: f64, label: &str);
     /// Raise a high-urgency notification the user should see even when the app
