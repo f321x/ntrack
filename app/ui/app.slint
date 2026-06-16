@@ -78,6 +78,7 @@ component AppButton inherits Rectangle {
     in property <string> text;
     in property <bool> primary: false;
     in property <bool> danger: false;
+    in property <bool> stop: false;
     in property <bool> warn: false;
     in property <bool> enabled: true;
     callback clicked;
@@ -86,6 +87,7 @@ component AppButton inherits Rectangle {
     border-radius: 12px;
     background: !self.enabled ? Theme.card-alt
         : self.danger ? Theme.danger.darker(20%)
+        : self.stop ? Theme.danger.darker(40%)
         : self.warn ? (touch.pressed ? Theme.warn.darker(15%) : Theme.warn)
         : self.primary ? (touch.pressed ? Theme.accent-dim : Theme.accent)
         : (touch.pressed ? Theme.card-alt.brighter(15%) : Theme.card-alt);
@@ -94,7 +96,7 @@ component AppButton inherits Rectangle {
         text: root.text;
         color: !root.enabled ? Theme.muted
             : root.warn ? Theme.bg
-            : (root.primary || root.danger) ? #ffffff
+            : (root.primary || root.danger || root.stop) ? #ffffff
             : Theme.text;
         font-size: 15px;
         font-weight: 600;
@@ -357,7 +359,8 @@ component SharePage inherits ScrollView {
         AppButton {
             text: root.sharing ? "Stop sharing" : "Start sharing";
             primary: !root.sharing;
-            danger: root.sharing;
+            // a deeper red than the "Raise alert" button below, so the two aren't identical
+            stop: root.sharing;
             clicked => {
                 if (root.sharing) {
                     root.stop-share();
