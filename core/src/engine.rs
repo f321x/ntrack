@@ -1058,10 +1058,14 @@ impl<P: EnginePool> Engine<P> {
                         // the Track tab; otherwise a session shared before the
                         // last restart never reappears. Re-fold it for *display
                         // only* — no re-notify (the alert fired when first seen)
-                        // and history insertion is idempotent — but skip when
-                        // the display already holds this point or a newer one,
-                        // so a steady-state duplicate from a second relay stays
-                        // a no-op.
+                        // and history insertion is idempotent. A newer event
+                        // advances the display; an older one can't move it back,
+                        // but may still carry the name / last-known position an
+                        // already-displayed STOP lacks (a relay replays a session
+                        // newest-first, so the STOP arrives before its ACTIVEs),
+                        // so it backfills those rather than being dropped — while
+                        // a steady-state duplicate from a second relay stays a
+                        // no-op.
                         if let Ok(incoming) = protocol::verify_and_decrypt(&event, &member_keys) {
                             let key = (incoming.sender.to_hex(), incoming.group.to_hex());
                             let advances = match self.tracks.get(&key) {
@@ -1070,6 +1074,8 @@ impl<P: EnginePool> Engine<P> {
                             };
                             if advances {
                                 self.apply_incoming(incoming, false);
+                            } else {
+                                self.backfill_retained(&key, &incoming);
                             }
                         }
                     }
@@ -1120,13 +1126,21 @@ impl<P: EnginePool> Engine<P> {
         // out-of-order ACTIVE still represents a real past point that belongs
         // in an exported track, even though it must not move the live display.
         self.record_history(&key, &inc);
-        let prev = self.tracks.get(&key);
-        // Out-of-order delivery: only apply if not older than current state.
-        if let Some(prev) = prev {
-            if inc.created_at < prev.created_at {
-                return;
-            }
+        // Out-of-order delivery must not move the display backwards. But an
+        // older ACTIVE that lands after a STOP — the shape a relay's newest-first
+        // replay produces on restart — still carries the name / last-known
+        // coordinates the STOP itself lacks, so harvest those onto the displayed
+        // STOP rather than dropping the event outright.
+        let is_older = self
+            .tracks
+            .get(&key)
+            .map(|prev| inc.created_at < prev.created_at)
+            .unwrap_or(false);
+        if is_older {
+            self.backfill_retained(&key, &inc);
+            return;
         }
+        let prev = self.tracks.get(&key);
         let last_coords = match inc.payload.status {
             Status::Stop => prev.and_then(|p| {
                 p.last_coords.or(match (p.payload.lat, p.payload.lng, p.payload.ts) {
@@ -1165,6 +1179,46 @@ impl<P: EnginePool> Engine<P> {
                 format!("⚠ Alert from {name}"),
                 "A group member raised an alert. Tap to see their live location.".into(),
             );
+        }
+    }
+
+    /// Recover a displayed STOP's name and last-known coordinates from an
+    /// out-of-order (older) ACTIVE that arrived *after* it. On restart a relay
+    /// replays a session newest-first, so the session-ending STOP — which
+    /// carries neither a name nor coordinates — is folded in before the ACTIVEs
+    /// that do; the in-order "inherit from the previous state" path then leaves
+    /// the STOP showing a key-derived handle at the null position. This fills
+    /// those gaps in place, re-emitting only when something actually changed, so
+    /// a steady-state duplicate from a second relay stays silent. A no-op unless
+    /// the current display is a STOP missing data this event can supply.
+    fn backfill_retained(&mut self, key: &(String, String), inc: &protocol::Incoming) {
+        let Some(track) = self.tracks.get_mut(key) else {
+            return;
+        };
+        // Only a STOP leans on the retained name/coords; a live ACTIVE's own
+        // payload is authoritative and must never be overwritten with older data.
+        if track.payload.status != Status::Stop {
+            return;
+        }
+        let mut changed = false;
+        // Keep the most recent fix, so arrival order doesn't matter: a
+        // later-arriving ACTIVE with a newer timestamp still corrects an earlier
+        // backfill.
+        if let Some(p) = HistPoint::from_incoming(inc) {
+            if track.last_coords.is_none_or(|(_, _, ts)| p.ts > ts) {
+                track.last_coords = Some((p.lat, p.lng, p.ts));
+                changed = true;
+            }
+        }
+        // Only an ACTIVE carries a name; fill it in if the STOP has none yet.
+        if track.last_name.is_none() {
+            if let Some(name) = sanitize_name(inc.payload.name.as_deref()) {
+                track.last_name = Some(name);
+                changed = true;
+            }
+        }
+        if changed {
+            self.emit_tracks();
         }
     }
 
@@ -2592,6 +2646,75 @@ mod tests {
             last_tracks(drain(&mut f)).is_none(),
             "a stale duplicate neither emits nor rewinds the display"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn replay_newest_first_keeps_stop_name_and_coords_after_restart() {
+        // A relay replays a session newest-first on restart, so the session-
+        // ending STOP (which carries neither a name nor a position) is delivered
+        // before the ACTIVEs that do. The rebuilt, stopped track must still show
+        // the sender's declared name and last-known fix — not a key-derived
+        // handle at (0, 0), which only corrected itself once a new share began.
+        let mut f = fixture();
+        let group = add_member_group(&mut f, "G");
+        let sender = keys::generate();
+
+        let active = event_with(
+            &sender,
+            &group,
+            Payload::active(10.0, 20.0, 1000, None).with_name(Some("Anna".into())),
+            1000,
+        );
+        let stop = event_with(&sender, &group, Payload::stop(), 1100);
+
+        // Live session: ACTIVE (carrying the name) then STOP, in order.
+        feed(&mut f, active.clone());
+        feed(&mut f, stop.clone());
+        assert_eq!(last_tracks(drain(&mut f)).unwrap()[0].name, "Anna", "name shown live");
+
+        // Restart: the in-memory display is gone, but the ids stay in the
+        // persisted replay window, so the relay re-delivers them as duplicates.
+        f.engine.tracks.clear();
+        f.engine.history.clear();
+        drain(&mut f);
+
+        // The relay replays the *same* events newest-first: STOP before ACTIVE.
+        feed(&mut f, stop);
+        feed(&mut f, active);
+        let tracks = last_tracks(drain(&mut f)).expect("replay rebuilds the track");
+        assert_eq!(tracks.len(), 1);
+        assert_eq!(tracks[0].status, Status::Stop);
+        assert_eq!(tracks[0].name, "Anna", "the declared name survives a newest-first replay");
+        assert_eq!(tracks[0].lat, 10.0, "last-known coordinates recovered too");
+        assert_eq!(tracks[0].lng, 20.0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stop_before_active_backfills_name_and_coords() {
+        // The same newest-first ordering for a session we're seeing for the
+        // first time (a freshly-joined peer's history): the older ACTIVE lands
+        // after the STOP and must hand it the name and last-known position,
+        // without dragging the displayed status off the (newest) STOP.
+        let mut f = fixture();
+        let group = add_member_group(&mut f, "G");
+        let sender = keys::generate();
+
+        feed(&mut f, event_with(&sender, &group, Payload::stop(), 1100));
+        feed(
+            &mut f,
+            event_with(
+                &sender,
+                &group,
+                Payload::active(10.0, 20.0, 1000, None).with_name(Some("Anna".into())),
+                1000,
+            ),
+        );
+        let tracks = last_tracks(drain(&mut f)).unwrap();
+        assert_eq!(tracks.len(), 1);
+        assert_eq!(tracks[0].status, Status::Stop, "display stays on the newest event (the STOP)");
+        assert_eq!(tracks[0].name, "Anna", "name harvested from the older ACTIVE");
+        assert_eq!(tracks[0].lat, 10.0, "last-known coordinates harvested too");
+        assert_eq!(tracks[0].lng, 20.0);
     }
 
     #[tokio::test(start_paused = true)]

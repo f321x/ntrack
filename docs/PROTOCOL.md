@@ -86,14 +86,19 @@ be dropped (test: `unknown_status_is_dropped`).
   it ever crossing the wire. Receivers that don't recognise the field ignore
   it per the forward-compatibility rule above.
 * On receive the name is sanitized and length-capped before display, retained
-  across a STOP, and overridden by any local label the user set. A per-key
-  colour (`keys::display_color`) shown beside each card disambiguates the
-  collisions that duplicate names can produce.
+  across a STOP (including when a relay replays a session newest-first on
+  restart, delivering the STOP before the ACTIVE that named it — the name and
+  last-known position are then back-filled onto the displayed STOP), and
+  overridden by any local label the user set. A per-key colour
+  (`keys::display_color`) shown beside each card disambiguates the collisions
+  that duplicate names can produce.
 
 Tests: `name_roundtrips_through_the_payload`, `with_name_trims_and_drops_blank`
 (protocol); `incoming_declared_name_and_color_surface_in_snapshot`,
 `incoming_without_name_falls_back_to_derived_handle`,
-`stop_retains_last_declared_name`, `outgoing_active_carries_configured_name_trimmed`,
+`stop_retains_last_declared_name`,
+`replay_newest_first_keeps_stop_name_and_coords_after_restart`,
+`outgoing_active_carries_configured_name_trimmed`,
 `outgoing_active_omits_blank_name` (engine);
 `derived_name_is_deterministic_and_well_formed`,
 `display_color_is_deterministic_and_visible` (keys).
