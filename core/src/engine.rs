@@ -1047,7 +1047,31 @@ impl<P: EnginePool> Engine<P> {
                 match protocol::process_incoming(&event, &member_keys, &mut self.seen) {
                     Ok(incoming) => {
                         self.seen_dirty = true;
-                        self.apply_incoming(incoming);
+                        self.apply_incoming(incoming, true);
+                    }
+                    Err(protocol::DropReason::Duplicate) => {
+                        // An event we have already processed — its id is in the
+                        // (persisted) replay window, possibly recorded in an
+                        // earlier run. The in-memory track display is rebuilt
+                        // from scratch each launch, so the relay's `since`
+                        // replay of an already-seen event must still repopulate
+                        // the Track tab; otherwise a session shared before the
+                        // last restart never reappears. Re-fold it for *display
+                        // only* — no re-notify (the alert fired when first seen)
+                        // and history insertion is idempotent — but skip when
+                        // the display already holds this point or a newer one,
+                        // so a steady-state duplicate from a second relay stays
+                        // a no-op.
+                        if let Ok(incoming) = protocol::verify_and_decrypt(&event, &member_keys) {
+                            let key = (incoming.sender.to_hex(), incoming.group.to_hex());
+                            let advances = match self.tracks.get(&key) {
+                                Some(t) => incoming.created_at > t.created_at,
+                                None => true,
+                            };
+                            if advances {
+                                self.apply_incoming(incoming, false);
+                            }
+                        }
                     }
                     Err(drop) => {
                         log::debug!("dropped incoming event: {drop:?}");
@@ -1085,7 +1109,12 @@ impl<P: EnginePool> Engine<P> {
         }
     }
 
-    fn apply_incoming(&mut self, inc: protocol::Incoming) {
+    /// Fold an incoming broadcast into history and the live track display.
+    /// `notify` fires the one-shot peer-alert notification on the no-alert →
+    /// alert edge; it is `false` for a display-only rebuild of an already-seen
+    /// event (e.g. the relay's replay after a restart), where re-alerting would
+    /// be a false alarm.
+    fn apply_incoming(&mut self, inc: protocol::Incoming, notify: bool) {
         let key = (inc.sender.to_hex(), inc.group.to_hex());
         // Record into history *before* the out-of-order display guard: an
         // out-of-order ACTIVE still represents a real past point that belongs
@@ -1117,8 +1146,8 @@ impl<P: EnginePool> Engine<P> {
         // one per broadcast. STOP carries no alert, so it never triggers.
         let was_alerting = prev.map(|p| p.payload.alert.is_some()).unwrap_or(false);
         let alert_edge = inc.payload.alert.is_some() && !was_alerting;
-        let alert_name =
-            alert_edge.then(|| self.incoming_display_name(&inc, last_name.as_deref()));
+        let alert_name = (notify && alert_edge)
+            .then(|| self.incoming_display_name(&inc, last_name.as_deref()));
         self.tracks.insert(
             key,
             TrackState {
@@ -1229,7 +1258,7 @@ impl<P: EnginePool> Engine<P> {
     /// One backfill event arrived for an in-flight export. Decrypt it
     /// specifically for the export's target group (so a sender broadcasting to
     /// several of our groups can't smear points across exports) via
-    /// [`protocol::process_for_export`] — NO replay dedup, so events already
+    /// [`protocol::verify_and_decrypt`] — NO replay dedup, so events already
     /// seen live are recovered rather than dropped.
     fn on_fetch_event(&mut self, corr: u64, event: &nostr::Event) {
         let Some((group_hex, sender_hex)) = self
@@ -1246,7 +1275,7 @@ impl<P: EnginePool> Engine<P> {
             .filter(|g| g.public == group_hex)
             .filter_map(|g| g.member_keys())
             .collect();
-        let Ok(inc) = protocol::process_for_export(event, &group_keys) else {
+        let Ok(inc) = protocol::verify_and_decrypt(event, &group_keys) else {
             return;
         };
         if inc.sender.to_hex() != sender_hex {
@@ -2511,6 +2540,92 @@ mod tests {
             ),
         );
         assert!(notify_kinds(&drain(&mut f)).is_empty(), "no re-alert on a heartbeat");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn replayed_seen_event_repopulates_the_track_after_restart() {
+        // The Track tab is rebuilt from the relay's `since` replay each launch.
+        // An event seen before a restart is still in the *persisted* replay
+        // window, so the relay re-delivers it as a "duplicate" — it must still
+        // repopulate the (now-empty) in-memory display rather than be dropped.
+        let mut f = fixture();
+        let group = add_member_group(&mut f, "G");
+        let sender = keys::generate();
+
+        let ev = active_event(&sender, &group, 10.0, 20.0, 1000, 1000);
+        feed(&mut f, ev.clone());
+        assert_eq!(last_tracks(drain(&mut f)).unwrap().len(), 1, "track shown live");
+
+        // Simulate a restart: the in-memory display is gone, but `seen` is
+        // persisted and still holds the id.
+        f.engine.tracks.clear();
+        f.engine.history.clear();
+        assert!(f.engine.seen.contains(&ev.id), "id still in the replay window");
+        drain(&mut f);
+
+        // The relay replays the already-seen event on reconnect.
+        feed(&mut f, ev);
+        let tracks = last_tracks(drain(&mut f)).expect("replay must rebuild the track");
+        assert_eq!(tracks.len(), 1);
+        assert_eq!(tracks[0].lat, 10.0);
+        assert_eq!(tracks[0].sender_hex, sender.public_key().to_hex());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn duplicate_does_not_regress_a_newer_displayed_point() {
+        // A stale replay must not drag the live display backwards: once a newer
+        // point is shown, re-delivery of an older already-seen event is a no-op.
+        let mut f = fixture();
+        let group = add_member_group(&mut f, "G");
+        let sender = keys::generate();
+
+        let older = active_event(&sender, &group, 1.0, 1.0, 1000, 1000);
+        let newer = active_event(&sender, &group, 2.0, 2.0, 2000, 2000);
+        feed(&mut f, older.clone());
+        feed(&mut f, newer);
+        assert_eq!(last_tracks(drain(&mut f)).unwrap()[0].lat, 2.0, "newest point shown");
+
+        // Re-deliver the older, already-seen event: the display stays on the
+        // newer point and nothing is emitted.
+        feed(&mut f, older);
+        assert!(
+            last_tracks(drain(&mut f)).is_none(),
+            "a stale duplicate neither emits nor rewinds the display"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn replayed_alert_rebuilds_track_without_renotifying() {
+        // A replayed alert (e.g. the relay's startup replay after a restart)
+        // must rebuild the track with its alert flag set, but must NOT sound
+        // the alert again — the user was warned when it first arrived.
+        let mut f = fixture();
+        let group = add_member_group(&mut f, "G");
+        let sender = keys::generate();
+
+        let ev = event_with(
+            &sender,
+            &group,
+            Payload::active(1.0, 2.0, 1100, None).with_alert(Some(1100)),
+            1100,
+        );
+        feed(&mut f, ev.clone());
+        assert_eq!(
+            notify_kinds(&drain(&mut f)),
+            vec![NotifyKind::PeerAlert],
+            "alerts once when fresh"
+        );
+
+        // Restart: display gone, `seen` retained.
+        f.engine.tracks.clear();
+        f.engine.history.clear();
+        drain(&mut f);
+
+        feed(&mut f, ev);
+        let evs = drain(&mut f);
+        assert!(notify_kinds(&evs).is_empty(), "a replayed alert must not re-notify");
+        let tracks = last_tracks(evs).expect("replay rebuilds the alerting track");
+        assert!(tracks[0].alert, "the rebuilt track is still flagged alerting");
     }
 
     #[tokio::test(start_paused = true)]

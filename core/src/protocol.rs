@@ -281,14 +281,17 @@ pub fn process_incoming(
     Ok(incoming)
 }
 
-/// Verify and decrypt an event for *export* (track backfill), WITHOUT the
-/// replay dedup that [`process_incoming`] applies.
+/// Verify (kind + NIP-01 signature) and decrypt an event WITHOUT the replay
+/// dedup that [`process_incoming`] layers on top.
 ///
-/// Backfill re-fetches events the live path has already seen; routing them
-/// through [`process_incoming`] would drop nearly all of them as
-/// [`DropReason::Duplicate`] and would also churn the bounded replay window.
-/// This bypass is load-bearing: it never reads or writes any [`SeenIds`].
-pub fn process_for_export(
+/// Two callers need an already-seen event decrypted rather than dropped:
+/// track *export* re-fetches events the live path has already seen, and the
+/// live path itself re-folds the relay's startup replay to rebuild the
+/// in-memory track display (which, unlike the persisted [`SeenIds`], does not
+/// survive a restart). Routing either through [`process_incoming`] would drop
+/// them as [`DropReason::Duplicate`] and churn the bounded replay window. This
+/// bypass is load-bearing: it never reads or writes any [`SeenIds`].
+pub fn verify_and_decrypt(
     event: &Event,
     group_keys: &[Keys],
 ) -> std::result::Result<Incoming, DropReason> {
@@ -303,8 +306,9 @@ pub fn process_for_export(
 
 /// Shared receiver body: ciphertext lookup → NIP-44 decrypt → payload
 /// validation. Assumes the kind and signature have already been checked and
-/// performs no replay dedup, so both the live ([`process_incoming`]) and
-/// export ([`process_for_export`]) paths can layer their own policy around it.
+/// performs no replay dedup, so both the dedup-aware live path
+/// ([`process_incoming`]) and the dedup-free path ([`verify_and_decrypt`]) can
+/// layer their own policy around it.
 fn decrypt_and_validate(
     event: &Event,
     group_keys: &[Keys],
@@ -653,7 +657,7 @@ mod tests {
     }
 
     #[test]
-    fn process_for_export_decrypts_without_touching_seen() {
+    fn verify_and_decrypt_decrypts_without_touching_seen() {
         let sender = generate();
         let group = generate();
         let event = build_event(
@@ -671,18 +675,18 @@ mod tests {
         let seen_len = s.len();
         assert!(s.contains(&event.id));
 
-        // The export path returns the same decrypted result even though the id
-        // is already "seen" — and it leaves `seen` completely untouched (it
+        // The dedup-free path returns the same decrypted result even though the
+        // id is already "seen" — and it leaves `seen` completely untouched (it
         // takes no SeenIds at all).
-        let exported = process_for_export(&event, std::slice::from_ref(&group)).unwrap();
-        assert_eq!(exported.payload, live.payload);
-        assert_eq!(exported.sender, sender.public_key());
-        assert_eq!(exported.group, group.public_key());
-        assert_eq!(s.len(), seen_len, "export must not grow the replay window");
+        let again = verify_and_decrypt(&event, std::slice::from_ref(&group)).unwrap();
+        assert_eq!(again.payload, live.payload);
+        assert_eq!(again.sender, sender.public_key());
+        assert_eq!(again.group, group.public_key());
+        assert_eq!(s.len(), seen_len, "the bypass must not grow the replay window");
     }
 
     #[test]
-    fn process_for_export_still_verifies_and_validates() {
+    fn verify_and_decrypt_still_verifies_and_validates() {
         let sender = generate();
         let group = generate();
         let other = generate();
@@ -695,7 +699,7 @@ mod tests {
         .unwrap();
         // not tagged for us → NotForUs
         assert_eq!(
-            process_for_export(&good, &[other]).unwrap_err(),
+            verify_and_decrypt(&good, &[other]).unwrap_err(),
             DropReason::NotForUs
         );
         // tampered → BadSignature
@@ -703,7 +707,7 @@ mod tests {
         json["created_at"] = serde_json::json!(good.created_at.as_secs() + 1);
         let tampered: Event = serde_json::from_value(json).unwrap();
         assert_eq!(
-            process_for_export(&tampered, &[group]).unwrap_err(),
+            verify_and_decrypt(&tampered, &[group]).unwrap_err(),
             DropReason::BadSignature
         );
     }

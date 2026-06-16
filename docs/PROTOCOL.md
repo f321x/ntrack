@@ -142,19 +142,33 @@ Implemented in `protocol::process_incoming`, exercised end-to-end in
 5. NIP-44 decrypt with the recipient pseudonym secret + event `pubkey`
 6. payload validation per the table above (invalid → drop)
 
-### Export path (track backfill)
+### Dedup-free decrypt path (export & startup replay)
 
-`process_for_export` runs the same verify → decrypt → validate body as
+`verify_and_decrypt` runs the same verify → decrypt → validate body as
 `process_incoming` (steps 1, 2, 4–6) but deliberately **omits the replay
-dedup** (step 3) and never reads or writes `SeenIds`. It exists because
-exporting a track re-fetches `kind:3434` events the live path has already
-seen; routing those through `process_incoming` would drop nearly all of them
-as `Duplicate` and churn the bounded replay window. The shared body is
-factored into a private `decrypt_and_validate`, so the live receiver's
-behaviour is unchanged (tests: `process_for_export_decrypts_without_touching_seen`,
-`process_for_export_still_verifies_and_validates`). The one-shot backfill
-filter is `backfill_filter` — `{"kinds":[3434], "authors":[<sender>],
-"#p":[<group>], "since":…, "limit":…}`.
+dedup** (step 3) and never reads or writes `SeenIds`. Two callers need an
+already-seen event decrypted rather than dropped:
+
+* **track export** re-fetches `kind:3434` events the live path has already
+  seen, via the one-shot `backfill_filter` — `{"kinds":[3434],
+  "authors":[<sender>], "#p":[<group>], "since":…, "limit":…}`; and
+* the **live receiver itself**, which re-folds the relay's `since` replay
+  (below) into the in-memory track display. That display — unlike the
+  persisted `SeenIds` — does not survive a restart, so without this the Track
+  tab would stay empty after relaunch even though the relay re-delivers your
+  (and your peers') recent sessions.
+
+Routing either through `process_incoming` would drop the events as `Duplicate`
+and churn the bounded replay window. The shared body is factored into a
+private `decrypt_and_validate`, so the live receiver's verify/decrypt
+behaviour is unchanged (tests: `verify_and_decrypt_decrypts_without_touching_seen`,
+`verify_and_decrypt_still_verifies_and_validates`). The replay rebuild folds
+for **display only** — it never re-fires the one-shot alert notification and is
+skipped when the display already holds an equal-or-newer point, so a
+steady-state duplicate from a second relay stays a no-op (tests:
+`replayed_seen_event_repopulates_the_track_after_restart`,
+`duplicate_does_not_regress_a_newer_displayed_point`,
+`replayed_alert_rebuilds_track_without_renotifying`).
 
 ## Subscription
 
@@ -165,8 +179,13 @@ filter is `backfill_filter` — `{"kinds":[3434], "authors":[<sender>],
 `since` bounds startup traffic while still recovering each peer's last-known
 location: it matches the 24 h NIP-40 expiration below, so any event still alive
 on a relay (a peer's most recent fix, even if they haven't published in hours)
-is fetched, and anything older has aged out anyway. The replay window makes the
-overlap harmless. (Test: `subscription_filter_shape`.)
+is fetched, and anything older has aged out anyway. Because the persisted
+replay window has usually already seen these events, the dedup suppresses their
+*side effects* (no duplicate alert notifications), but the live receiver still
+re-folds them into the in-memory track display (see the dedup-free path above)
+— which does not survive a restart — so a peer's, or your own, last session
+resurfaces on launch instead of vanishing. (Tests: `subscription_filter_shape`,
+`replayed_seen_event_repopulates_the_track_after_restart`.)
 
 ## Other requirements
 
