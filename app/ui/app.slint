@@ -78,6 +78,7 @@ component AppButton inherits Rectangle {
     in property <string> text;
     in property <bool> primary: false;
     in property <bool> danger: false;
+    in property <bool> warn: false;
     in property <bool> enabled: true;
     callback clicked;
 
@@ -85,12 +86,16 @@ component AppButton inherits Rectangle {
     border-radius: 12px;
     background: !self.enabled ? Theme.card-alt
         : self.danger ? Theme.danger.darker(20%)
+        : self.warn ? (touch.pressed ? Theme.warn.darker(15%) : Theme.warn)
         : self.primary ? (touch.pressed ? Theme.accent-dim : Theme.accent)
         : (touch.pressed ? Theme.card-alt.brighter(15%) : Theme.card-alt);
 
     Text {
         text: root.text;
-        color: root.enabled ? (root.primary || root.danger ? #ffffff : Theme.text) : Theme.muted;
+        color: !root.enabled ? Theme.muted
+            : root.warn ? Theme.bg
+            : (root.primary || root.danger) ? #ffffff
+            : Theme.text;
         font-size: 15px;
         font-weight: 600;
         horizontal-alignment: center;
@@ -219,6 +224,37 @@ component SharePage inherits ScrollView {
             }
         }
 
+        SectionTitle { text: "SHARE WITH"; }
+        Card {
+            VerticalLayout {
+                padding: 8px;
+                if root.groups.length == 0 : VerticalLayout {
+                    padding: 8px;
+                    Text {
+                        text: "No groups yet — create one in the Groups tab.";
+                        color: Theme.muted;
+                        font-size: 13px;
+                        wrap: word-wrap;
+                    }
+                }
+                for g[i] in root.groups : HorizontalLayout {
+                    padding: 8px;
+                    spacing: 10px;
+                    VerticalLayout {
+                        alignment: center;
+                        Toggle {
+                            checked: g.selected;
+                            toggled(v) => { root.toggle-group(g.id, v); }
+                        }
+                    }
+                    VerticalLayout {
+                        Text { text: g.name; color: Theme.text; font-size: 15px; }
+                        Text { text: g.npub; color: Theme.muted; font-size: 11px; }
+                    }
+                }
+            }
+        }
+
         // ---- check-in (dead-man's switch) ----
         SectionTitle { text: "CHECK-IN"; }
         Card {
@@ -277,43 +313,15 @@ component SharePage inherits ScrollView {
                 if !root.checkin-armed : HorizontalLayout {
                     spacing: 10px;
                     checkin-box := ComboBox {
+                        horizontal-stretch: 1;
                         model: ["15 min", "30 min", "1 h", "3 h", "6 h", "12 h", "24 h"];
                         current-index: 0;
                     }
                     AppButton {
                         text: "Arm";
+                        warn: true;
+                        min-width: 120px;
                         clicked => { root.arm-checkin(checkin-box.current-index); }
-                    }
-                }
-            }
-        }
-
-        SectionTitle { text: "SHARE WITH"; }
-        Card {
-            VerticalLayout {
-                padding: 8px;
-                if root.groups.length == 0 : VerticalLayout {
-                    padding: 8px;
-                    Text {
-                        text: "No groups yet — create one in the Groups tab.";
-                        color: Theme.muted;
-                        font-size: 13px;
-                        wrap: word-wrap;
-                    }
-                }
-                for g[i] in root.groups : HorizontalLayout {
-                    padding: 8px;
-                    spacing: 10px;
-                    VerticalLayout {
-                        alignment: center;
-                        Toggle {
-                            checked: g.selected;
-                            toggled(v) => { root.toggle-group(g.id, v); }
-                        }
-                    }
-                    VerticalLayout {
-                        Text { text: g.name; color: Theme.text; font-size: 15px; }
-                        Text { text: g.npub; color: Theme.muted; font-size: 11px; }
                     }
                 }
             }
