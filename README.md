@@ -20,8 +20,9 @@ recipient never retypes anything. They can **scan** it (Groups → *Scan QR code
 still works too. For a member invite the link carries the secret, so share it over a secure
 channel — exactly as you would the bare `nsec`.
 
-- **Share** — publishes your encrypted location at a set interval from a sender key that's never
-  linked to a personal Nostr identity.
+- **Share** — publishes your encrypted location from a sender key that's never linked to a personal
+  Nostr identity. Updates are velocity-based — frequent while you're moving, sparse while you're
+  still — using a built-in preset (Battery saver / Normal / High) or a custom scheme you define.
 - **Track** — subscribes to your groups, verifies + dedups + decrypts incoming events, and shows
   each sender live with an "open in maps" shortcut.
 - **Alert** — for dangerous situations: one tap raises a duress alert (starting a share if you

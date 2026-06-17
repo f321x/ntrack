@@ -13,8 +13,8 @@ use std::time::{Duration, Instant};
 
 use ntrack_core::config::{CadenceMode, ConfigStore, Group};
 use ntrack_core::engine::{
-    now_secs, ConfigSnapshot, Engine, EngineCmd, LocationSample, ShareSnapshot, TrackSnapshot,
-    UiEvent,
+    now_secs, CadenceSchemeSnapshot, ConfigSnapshot, Engine, EngineCmd, LocationSample,
+    ShareSnapshot, TrackSnapshot, UiEvent,
 };
 use ntrack_core::keys::{parse_group_key, ParsedGroupKey};
 use ntrack_core::protocol::Status;
@@ -24,26 +24,7 @@ use tokio::sync::mpsc;
 
 use crate::map;
 use crate::platform::{Platform, PlatformEvent};
-use crate::{GroupItem, MainWindow, MapMarker, MapTile, RelayItem, TrackItem};
-
-/// Cadence modes shown in the Share-screen selector, in display order.
-/// Index-aligned with the combo box in `app.slint` and with
-/// [`cadence_from_index`] / [`cadence_to_index`].
-pub const CADENCE_MODES: [CadenceMode; 3] =
-    [CadenceMode::BatterySaver, CadenceMode::Normal, CadenceMode::High];
-
-/// The selector index for a cadence mode (inverse of `CADENCE_MODES`).
-fn cadence_to_index(mode: CadenceMode) -> i32 {
-    CADENCE_MODES.iter().position(|m| *m == mode).unwrap_or(1) as i32
-}
-
-/// The cadence mode for a selector index, defaulting to `Normal` out of range.
-fn cadence_from_index(idx: i32) -> CadenceMode {
-    usize::try_from(idx)
-        .ok()
-        .and_then(|i| CADENCE_MODES.get(i).copied())
-        .unwrap_or(CadenceMode::Normal)
-}
+use crate::{CadenceSchemeItem, GroupItem, MainWindow, MapMarker, MapTile, RelayItem, TrackItem};
 
 /// Check-in (dead-man's switch) duration choices on the Share screen, in
 /// seconds. Index-aligned with the combo box in `app.slint`.
@@ -306,7 +287,8 @@ impl Controller {
                     view.location_active = on;
                     view.config
                         .as_ref()
-                        .map(|c| c.cadence_mode.params().min_secs * 1000)
+                        .and_then(|c| c.cadence_schemes.get(c.cadence_selected))
+                        .map(|s| s.min_secs * 1000)
                         .unwrap_or(30_000)
                 };
                 if on {
@@ -419,7 +401,20 @@ impl Controller {
             ui.set_sender_npub(cfg.sender_npub.clone().into());
             ui.set_display_name(cfg.display_name.clone().into());
             ui.set_default_name(cfg.default_name.clone().into());
-            ui.set_cadence_mode(cadence_to_index(cfg.cadence_mode));
+
+            // Cadence selector + the schemes screen. The dropdown lists every
+            // scheme's name (presets then customs); the schemes view shows the
+            // presets read-only for comparison and the customs with Edit/Delete.
+            let names: Vec<slint::SharedString> =
+                cfg.cadence_schemes.iter().map(|s| s.name.clone().into()).collect();
+            ui.set_cadence_names(slint::ModelRc::new(slint::VecModel::from(names)));
+            ui.set_cadence_selected(cfg.cadence_selected as i32);
+            let presets: Vec<CadenceSchemeItem> =
+                cfg.cadence_schemes.iter().filter(|s| s.builtin).map(cadence_item).collect();
+            let customs: Vec<CadenceSchemeItem> =
+                cfg.cadence_schemes.iter().filter(|s| !s.builtin).map(cadence_item).collect();
+            ui.set_cadence_presets(slint::ModelRc::new(slint::VecModel::from(presets)));
+            ui.set_cadence_customs(slint::ModelRc::new(slint::VecModel::from(customs)));
         }
 
         let relays: Vec<RelayItem> = view
@@ -734,12 +729,34 @@ impl Controller {
         });
 
         hook!(on_set_cadence, |ctrl, idx: i32| {
-            let mode = cadence_from_index(idx);
-            // The engine reclamps the live share's interval and emits a
-            // SetLocationInterval to re-tune the running GPS session in place
-            // (handled above) — no direct platform call here, which would race
-            // Android's startForegroundService() contract.
-            ctrl.mutate(move |c| c.cadence_mode = mode);
+            let idx = idx.max(0) as usize;
+            // Core maps the combined [presets, customs] index to a built-in or a
+            // custom scheme; the engine then reclamps the live share's interval
+            // and emits a SetLocationInterval to re-tune the running GPS session
+            // in place (handled above) — no direct platform call here, which
+            // would race Android's startForegroundService() contract.
+            ctrl.mutate(move |c| c.select_cadence_index(idx));
+        });
+
+        hook!(on_save_cadence_scheme, |ctrl,
+                                       name: slint::SharedString,
+                                       res: slint::SharedString,
+                                       min: slint::SharedString,
+                                       max: slint::SharedString| {
+            ctrl.save_cadence_scheme(
+                name.to_string(),
+                res.to_string(),
+                min.to_string(),
+                max.to_string(),
+            );
+        });
+
+        hook!(on_delete_cadence_scheme, |ctrl, name: slint::SharedString| {
+            let n = name.to_string();
+            ctrl.mutate(move |c| {
+                c.remove_custom_cadence(&n);
+            });
+            ctrl.toast("Scheme deleted");
         });
 
         hook!(on_message_edited, |ctrl, msg: slint::SharedString| {
@@ -933,6 +950,59 @@ impl Controller {
         f: impl FnOnce(&mut ntrack_core::config::Config) + Send + 'static,
     ) {
         let _ = self.cmd_tx.send(EngineCmd::Mutate(Box::new(f)));
+    }
+
+    /// Parse, validate and save a custom cadence scheme from the schemes-screen
+    /// form. Numeric parsing (a UI concern) happens here; the value/ordering
+    /// rules live in core ([`CadenceScheme::new`]). Saving under an existing
+    /// name edits it in place. On success the form is cleared.
+    fn save_cadence_scheme(self: &Arc<Self>, name: String, res: String, min: String, max: String) {
+        let res = match res.trim().parse::<f64>() {
+            Ok(v) => v,
+            Err(_) => return self.toast("Resolution must be a number, in metres"),
+        };
+        let min = match min.trim().parse::<u64>() {
+            Ok(v) => v,
+            Err(_) => return self.toast("Min interval must be a whole number of seconds"),
+        };
+        let max = match max.trim().parse::<u64>() {
+            Ok(v) => v,
+            Err(_) => return self.toast("Max interval must be a whole number of seconds"),
+        };
+        let scheme = match ntrack_core::config::CadenceScheme::new(&name, res, min, max) {
+            Ok(s) => s,
+            Err(e) => return self.toast(&e),
+        };
+        // The cap is enforced in core too (upsert is a no-op past it), but check
+        // here against the latest snapshot so we can explain the refusal — a new
+        // name past the cap, as opposed to editing an existing scheme.
+        let at_cap = {
+            let view = self.view.lock().unwrap();
+            view.config
+                .as_ref()
+                .map(|c| {
+                    let customs = c.cadence_schemes.iter().filter(|s| !s.builtin);
+                    let is_new = !c.cadence_schemes.iter().any(|s| !s.builtin && s.name == scheme.name);
+                    is_new && customs.count() >= ntrack_core::config::MAX_CUSTOM_CADENCES
+                })
+                .unwrap_or(false)
+        };
+        if at_cap {
+            return self.toast(&format!(
+                "You can save at most {} custom schemes",
+                ntrack_core::config::MAX_CUSTOM_CADENCES
+            ));
+        }
+        self.mutate(move |c| {
+            c.upsert_custom_cadence(scheme);
+        });
+        self.toast("Scheme saved — pick it from Updates on the Share tab");
+        let _ = self.ui.upgrade_in_event_loop(|ui| {
+            ui.set_cadence_form_name("".into());
+            ui.set_cadence_form_resolution("".into());
+            ui.set_cadence_form_min("".into());
+            ui.set_cadence_form_max("".into());
+        });
     }
 
     /// One-tap panic: raise the alert and force-start a share to the emergency
@@ -1168,6 +1238,48 @@ fn shorten(npub: &str) -> String {
         format!("{}…{}", &npub[..14], &npub[npub.len() - 6..])
     } else {
         npub.to_string()
+    }
+}
+
+/// "100 m" / "1.5 km" — a cadence scheme's spatial resolution, compact for the
+/// scheme cards.
+fn fmt_distance(m: f64) -> String {
+    if m >= 1000.0 {
+        format!("{:.1} km", m / 1000.0)
+    } else {
+        format!("{m:.0} m")
+    }
+}
+
+/// "45 s" / "10 min" / "2 h" — a cadence interval bound, whole units where it
+/// divides evenly, otherwise one decimal.
+fn fmt_interval(secs: u64) -> String {
+    if secs < 60 {
+        format!("{secs} s")
+    } else if secs < 3600 {
+        if secs.is_multiple_of(60) {
+            format!("{} min", secs / 60)
+        } else {
+            format!("{:.1} min", secs as f64 / 60.0)
+        }
+    } else if secs.is_multiple_of(3600) {
+        format!("{} h", secs / 3600)
+    } else {
+        format!("{:.1} h", secs as f64 / 3600.0)
+    }
+}
+
+/// A schemes-screen card item: formatted display strings plus the raw numbers
+/// (for the Edit prefill) and the built-in flag (gates Edit/Delete).
+fn cadence_item(s: &CadenceSchemeSnapshot) -> CadenceSchemeItem {
+    CadenceSchemeItem {
+        name: s.name.clone().into(),
+        resolution: fmt_distance(s.resolution_m).into(),
+        interval: format!("{} – {}", fmt_interval(s.min_secs), fmt_interval(s.max_secs)).into(),
+        res_text: format!("{:.0}", s.resolution_m).into(),
+        min_text: s.min_secs.to_string().into(),
+        max_text: s.max_secs.to_string().into(),
+        builtin: s.builtin,
     }
 }
 

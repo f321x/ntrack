@@ -52,6 +52,19 @@ export struct MapMarker {
     label: string,
 }
 
+// One location-update scheme on the "update schemes" screen: a built-in preset
+// (shown read-only for comparison) or a user-defined scheme (Edit/Delete). The
+// `*-text` fields are the raw numbers, used to pre-fill the form when editing.
+export struct CadenceSchemeItem {
+    name: string,
+    resolution: string,   // formatted, e.g. "100 m"
+    interval: string,     // formatted bounds, e.g. "30 s – 10 min"
+    res-text: string,     // raw resolution in metres, e.g. "100"
+    min-text: string,     // raw min interval in seconds, e.g. "30"
+    max-text: string,     // raw max interval in seconds, e.g. "600"
+    builtin: bool,
+}
+
 global Theme {
     out property <color> bg: #0f1117;
     out property <color> card: #1a1d27;
@@ -173,7 +186,8 @@ component SharePage inherits ScrollView {
     in property <bool> waiting-fix;
     in property <string> status-headline;
     in property <string> status-detail;
-    in property <int> cadence-mode;
+    in property <[string]> cadence-names;
+    in property <int> cadence-selected;
     in property <bool> location-permission;
     in property <bool> alert;
     in property <bool> checkin-armed;
@@ -184,6 +198,7 @@ component SharePage inherits ScrollView {
     callback start-share(string);
     callback stop-share();
     callback set-cadence(int);
+    callback open-cadence-view();
     callback message-edited(string);
     callback panic();
     callback clear-alert();
@@ -348,9 +363,17 @@ component SharePage inherits ScrollView {
                         vertical-alignment: center;
                     }
                     cadence-box := ComboBox {
-                        model: ["Battery saver", "Normal", "High"];
-                        current-index: root.cadence-mode;
+                        horizontal-stretch: 1;
+                        model: root.cadence-names;
+                        current-index: root.cadence-selected;
                         selected => { root.set-cadence(self.current-index); }
+                    }
+                }
+                HorizontalLayout {
+                    alignment: start;
+                    SmallButton {
+                        text: "Customize update schemes…";
+                        clicked => { root.open-cadence-view(); }
                     }
                 }
             }
@@ -1014,6 +1037,263 @@ component MapOverlay inherits Rectangle {
     }
 }
 
+// ------------------------------------------------- update-schemes view --
+
+// One scheme on the "update schemes" screen: its values, plus Edit/Delete for
+// user schemes (built-in presets are read-only, shown only for comparison).
+component SchemeCard inherits Card {
+    in property <CadenceSchemeItem> item;
+    callback edit();
+    callback delete();
+
+    VerticalLayout {
+        padding: Theme.pad;
+        spacing: 8px;
+        HorizontalLayout {
+            spacing: 8px;
+            Text {
+                text: item.name;
+                color: Theme.text;
+                font-size: 16px;
+                font-weight: 700;
+                overflow: elide;
+                horizontal-stretch: 1;
+            }
+            if item.builtin : Rectangle {
+                width: pbadge.preferred-width + 16px;
+                height: 22px;
+                border-radius: 11px;
+                background: Theme.card-alt;
+                pbadge := Text {
+                    text: "PRESET";
+                    color: Theme.muted;
+                    font-size: 11px;
+                    font-weight: 700;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+            }
+        }
+        HorizontalLayout {
+            spacing: 24px;
+            VerticalLayout {
+                Text { text: "Resolution"; color: Theme.muted; font-size: 11px; }
+                Text { text: item.resolution; color: Theme.text; font-size: 14px; }
+            }
+            VerticalLayout {
+                Text { text: "Interval"; color: Theme.muted; font-size: 11px; }
+                Text { text: item.interval; color: Theme.text; font-size: 14px; }
+            }
+        }
+        if !item.builtin : HorizontalLayout {
+            spacing: 8px;
+            alignment: start;
+            SmallButton { text: "Edit"; clicked => { root.edit(); } }
+            SmallButton { text: "Delete"; danger: true; clicked => { root.delete(); } }
+        }
+    }
+}
+
+// Full-screen overlay (opened from the Share tab) to create, edit and delete
+// custom location-update schemes. Shows the built-in presets alongside, so the
+// user can compare their own schemes against them.
+component CadenceView inherits Rectangle {
+    in property <[CadenceSchemeItem]> presets;
+    in property <[CadenceSchemeItem]> customs;
+    // Form fields, two-way bound so Rust can clear them after a save and the
+    // Edit button can pre-fill them.
+    in-out property <string> form-name;
+    in-out property <string> form-resolution;
+    in-out property <string> form-min;
+    in-out property <string> form-max;
+    in property <length> inset-top;
+    in property <length> inset-bottom;
+    callback close();
+    callback save(string, string, string, string);
+    callback delete(string);
+
+    background: Theme.bg;
+
+    // Catch the Android Back gesture/button so it dismisses this view instead of
+    // exiting the app (same approach as the map overlay). Grabs focus on open;
+    // inputs inside still take focus when tapped.
+    init => { back-catcher.focus(); }
+    back-catcher := FocusScope {
+        width: 0px;
+        height: 0px;
+        key-pressed(event) => {
+            if (event.text == Key.Back || event.text == Key.Escape) {
+                root.close();
+                return EventResult.accept;
+            }
+            return EventResult.reject;
+        }
+    }
+
+    VerticalLayout {
+        padding-top: root.inset-top;
+        padding-bottom: root.inset-bottom;
+
+        // header
+        HorizontalLayout {
+            padding-left: Theme.pad;
+            padding-right: Theme.pad;
+            padding-top: 8px;
+            padding-bottom: 8px;
+            spacing: 8px;
+            Text {
+                text: "Update schemes";
+                color: Theme.text;
+                font-size: 20px;
+                font-weight: 800;
+                horizontal-stretch: 1;
+                vertical-alignment: center;
+            }
+            Rectangle {
+                width: 36px;
+                height: 36px;
+                border-radius: 18px;
+                background: closetouch.pressed ? Theme.card-alt.brighter(20%) : Theme.card-alt;
+                Path {
+                    width: 16px;
+                    height: 16px;
+                    x: (parent.width - self.width) / 2;
+                    y: (parent.height - self.height) / 2;
+                    viewbox-width: 24;
+                    viewbox-height: 24;
+                    commands: "M 5 5 L 19 19 M 19 5 L 5 19";
+                    stroke: Theme.text;
+                    stroke-width: 2px;
+                    stroke-line-cap: round;
+                }
+                closetouch := TouchArea { clicked => { root.close(); } }
+            }
+        }
+
+        ScrollView {
+            vertical-stretch: 1;
+            VerticalLayout {
+                padding: Theme.pad;
+                spacing: 12px;
+                alignment: start;
+
+                Text {
+                    text: "ntrack adjusts how often it samples and sends your location to your speed: more often while moving, rarely while still. A scheme sets the target distance between updates (resolution) and the shortest/longest time between them.";
+                    color: Theme.muted;
+                    font-size: 13px;
+                    wrap: word-wrap;
+                }
+
+                SectionTitle { text: "PRESETS"; }
+                for s in root.presets : SchemeCard { item: s; }
+
+                SectionTitle { text: "YOUR SCHEMES"; }
+                if root.customs.length == 0 : Text {
+                    text: "No custom schemes yet. Create one below — it appears in the Updates menu on the Share tab.";
+                    color: Theme.muted;
+                    font-size: 13px;
+                    wrap: word-wrap;
+                }
+                for s in root.customs : SchemeCard {
+                    item: s;
+                    edit => {
+                        root.form-name = s.name;
+                        root.form-resolution = s.res-text;
+                        root.form-min = s.min-text;
+                        root.form-max = s.max-text;
+                    }
+                    delete => { root.delete(s.name); }
+                }
+
+                SectionTitle { text: "CREATE / EDIT SCHEME"; }
+                Card {
+                    VerticalLayout {
+                        padding: Theme.pad;
+                        spacing: 10px;
+                        LineEdit {
+                            placeholder-text: "Name (e.g. Cycling)";
+                            text <=> root.form-name;
+                        }
+                        HorizontalLayout {
+                            spacing: 10px;
+                            Text {
+                                text: "Resolution";
+                                color: Theme.text;
+                                font-size: 14px;
+                                vertical-alignment: center;
+                                width: 96px;
+                            }
+                            LineEdit {
+                                horizontal-stretch: 1;
+                                placeholder-text: "metres, e.g. 120";
+                                input-type: decimal;
+                                text <=> root.form-resolution;
+                            }
+                        }
+                        HorizontalLayout {
+                            spacing: 10px;
+                            Text {
+                                text: "Min interval";
+                                color: Theme.text;
+                                font-size: 14px;
+                                vertical-alignment: center;
+                                width: 96px;
+                            }
+                            LineEdit {
+                                horizontal-stretch: 1;
+                                placeholder-text: "seconds, e.g. 20";
+                                input-type: number;
+                                text <=> root.form-min;
+                            }
+                        }
+                        HorizontalLayout {
+                            spacing: 10px;
+                            Text {
+                                text: "Max interval";
+                                color: Theme.text;
+                                font-size: 14px;
+                                vertical-alignment: center;
+                                width: 96px;
+                            }
+                            LineEdit {
+                                horizontal-stretch: 1;
+                                placeholder-text: "seconds, e.g. 300";
+                                input-type: number;
+                                text <=> root.form-max;
+                            }
+                        }
+                        Text {
+                            text: "Resolution is roughly how far you travel between updates while moving. Min/max cap how close together or far apart updates can be.";
+                            color: Theme.muted;
+                            font-size: 12px;
+                            wrap: word-wrap;
+                        }
+                        HorizontalLayout {
+                            spacing: 8px;
+                            AppButton {
+                                text: "Save scheme";
+                                primary: true;
+                                clicked => {
+                                    root.save(root.form-name, root.form-resolution, root.form-min, root.form-max);
+                                }
+                            }
+                            AppButton {
+                                text: "Clear";
+                                clicked => {
+                                    root.form-name = "";
+                                    root.form-resolution = "";
+                                    root.form-min = "";
+                                    root.form-max = "";
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------- main window --
 
 export component MainWindow inherits Window {
@@ -1030,7 +1310,8 @@ export component MainWindow inherits Window {
     in property <bool> waiting-fix;
     in property <string> status-headline: "Not sharing";
     in property <string> status-detail: "";
-    in property <int> cadence-mode: 1;
+    in property <[string]> cadence-names;
+    in property <int> cadence-selected: 1;
     in property <bool> alert;
     in property <bool> checkin-armed;
     in property <bool> checkin-grace;
@@ -1072,10 +1353,21 @@ export component MainWindow inherits Window {
     in property <[MapMarker]> map-markers;
     in property <bool> map-has-peers;
 
+    // update-schemes overlay (opened from the Share tab)
+    in-out property <bool> cadence-view-visible;
+    in property <[CadenceSchemeItem]> cadence-presets;
+    in property <[CadenceSchemeItem]> cadence-customs;
+    in-out property <string> cadence-form-name;
+    in-out property <string> cadence-form-resolution;
+    in-out property <string> cadence-form-min;
+    in-out property <string> cadence-form-max;
+
     callback toggle-group(string, bool);
     callback start-share(string);
     callback stop-share();
     callback set-cadence(int);
+    callback save-cadence-scheme(string, string, string, string);
+    callback delete-cadence-scheme(string);
     callback message-edited(string);
     callback panic();
     callback clear-alert();
@@ -1179,7 +1471,8 @@ export component MainWindow inherits Window {
                 waiting-fix: root.waiting-fix;
                 status-headline: root.status-headline;
                 status-detail: root.status-detail;
-                cadence-mode: root.cadence-mode;
+                cadence-names: root.cadence-names;
+                cadence-selected: root.cadence-selected;
                 alert: root.alert;
                 checkin-armed: root.checkin-armed;
                 checkin-grace: root.checkin-grace;
@@ -1188,6 +1481,14 @@ export component MainWindow inherits Window {
                 start-share(msg) => { root.start-share(msg); }
                 stop-share => { root.stop-share(); }
                 set-cadence(i) => { root.set-cadence(i); }
+                open-cadence-view => {
+                    // Open with a clean form (Edit pre-fills it from a card).
+                    root.cadence-form-name = "";
+                    root.cadence-form-resolution = "";
+                    root.cadence-form-min = "";
+                    root.cadence-form-max = "";
+                    root.cadence-view-visible = true;
+                }
                 message-edited(m) => { root.message-edited(m); }
                 panic => { root.panic(); }
                 clear-alert => { root.clear-alert(); }
@@ -1277,6 +1578,22 @@ export component MainWindow inherits Window {
         fit => { root.map-fit(); }
         pinch-zoom(s) => { root.map-pinch-zoom(s); }
         viewport(w, h) => { root.map-viewport(w, h); }
+    }
+
+    if root.cadence-view-visible : CadenceView {
+        width: 100%;
+        height: 100%;
+        presets: root.cadence-presets;
+        customs: root.cadence-customs;
+        form-name <=> root.cadence-form-name;
+        form-resolution <=> root.cadence-form-resolution;
+        form-min <=> root.cadence-form-min;
+        form-max <=> root.cadence-form-max;
+        inset-top: root.safe-area-insets.top;
+        inset-bottom: root.safe-area-insets.bottom;
+        close => { root.cadence-view-visible = false; }
+        save(n, r, mn, mx) => { root.save-cadence-scheme(n, r, mn, mx); }
+        delete(n) => { root.delete-cadence-scheme(n); }
     }
 
     if root.key-dialog-visible : ModalScrim {

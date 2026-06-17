@@ -101,9 +101,21 @@ pub struct Config {
     pub groups: Vec<Group>,
     /// Adaptive location-cadence mode governing how often a fix is sampled and
     /// published while sharing. Replaces the old fixed `interval_secs`; configs
-    /// predating it deserialize to [`CadenceMode::Normal`].
+    /// predating it deserialize to [`CadenceMode::Normal`]. When
+    /// `selected_custom` names a present scheme, that overrides this; otherwise
+    /// this built-in preset is active (and the fallback if a custom is removed).
     #[serde(default)]
     pub cadence_mode: CadenceMode,
+    /// User-defined cadence schemes, offered in the Share selector alongside the
+    /// built-in presets and managed from the dedicated schemes screen.
+    #[serde(default)]
+    pub custom_cadences: Vec<CadenceScheme>,
+    /// Name of the selected custom scheme. When `Some` and it still exists in
+    /// `custom_cadences`, it overrides `cadence_mode` as the active cadence;
+    /// otherwise the built-in `cadence_mode` governs, so a removed or renamed
+    /// scheme falls back cleanly to a preset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_custom: Option<String>,
     /// Attach a NIP-40 expiration tag to outgoing events.
     #[serde(default = "default_true")]
     pub use_expiration: bool,
@@ -193,6 +205,21 @@ pub struct CadenceParams {
 }
 
 impl CadenceMode {
+    /// The built-in presets in selector / display order. The custom-scheme
+    /// selector lists these first, then the user's schemes.
+    pub const ALL: [CadenceMode; 3] =
+        [CadenceMode::BatterySaver, CadenceMode::Normal, CadenceMode::High];
+
+    /// The label shown for this preset in the UI (and reserved from custom
+    /// scheme names so a user scheme can't shadow a preset).
+    pub const fn display_name(self) -> &'static str {
+        match self {
+            CadenceMode::BatterySaver => "Battery saver",
+            CadenceMode::Normal => "Normal",
+            CadenceMode::High => "High",
+        }
+    }
+
     /// The tuning for this mode. `const` so call sites (e.g. the share-timeout
     /// bound) can use it in const context.
     pub const fn params(self) -> CadenceParams {
@@ -216,6 +243,96 @@ impl CadenceMode {
     }
 }
 
+/// Bounds enforced on a custom [`CadenceScheme`], both when the user creates one
+/// and (defensively, by clamping) when a possibly hand-edited config is loaded —
+/// so no scheme can drive the GPS into hammering or never sampling.
+pub const MIN_CADENCE_RESOLUTION_M: f64 = 5.0;
+pub const MAX_CADENCE_RESOLUTION_M: f64 = 50_000.0;
+pub const MIN_CADENCE_SECS: u64 = 5;
+pub const MAX_CADENCE_SECS: u64 = 86_400; // 24 h
+/// Cap on saved custom schemes, keeping the Share-screen dropdown manageable.
+pub const MAX_CUSTOM_CADENCES: usize = 16;
+/// Cap on a custom scheme name's length (characters).
+pub const MAX_CADENCE_NAME_LEN: usize = 24;
+
+/// A user-defined cadence scheme: a named [`CadenceParams`] saved alongside the
+/// three built-in [`CadenceMode`] presets and offered in the Share-screen
+/// selector. Created and managed from the dedicated "update schemes" screen; the
+/// active selection is recorded in [`Config::selected_custom`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CadenceScheme {
+    pub name: String,
+    pub resolution_m: f64,
+    pub min_secs: u64,
+    pub max_secs: u64,
+}
+
+impl CadenceScheme {
+    /// Build a scheme from user input, validating each field and the
+    /// `min ≤ max` ordering and rejecting a name that collides with a preset.
+    /// Returns a short, user-facing message on failure (surfaced as a toast).
+    /// The name is trimmed; the numeric fields are parsed by the caller.
+    pub fn new(
+        name: &str,
+        resolution_m: f64,
+        min_secs: u64,
+        max_secs: u64,
+    ) -> std::result::Result<Self, String> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err("Give the scheme a name".into());
+        }
+        if name.chars().count() > MAX_CADENCE_NAME_LEN {
+            return Err(format!("Name is too long (max {MAX_CADENCE_NAME_LEN} characters)"));
+        }
+        if CadenceMode::ALL.iter().any(|m| m.display_name().eq_ignore_ascii_case(name)) {
+            return Err("That name is reserved for a preset".into());
+        }
+        if !(resolution_m.is_finite()
+            && (MIN_CADENCE_RESOLUTION_M..=MAX_CADENCE_RESOLUTION_M).contains(&resolution_m))
+        {
+            return Err(format!(
+                "Resolution must be between {MIN_CADENCE_RESOLUTION_M:.0} and {MAX_CADENCE_RESOLUTION_M:.0} m"
+            ));
+        }
+        if !(MIN_CADENCE_SECS..=MAX_CADENCE_SECS).contains(&min_secs) {
+            return Err(format!(
+                "Min interval must be between {MIN_CADENCE_SECS} and {MAX_CADENCE_SECS} s"
+            ));
+        }
+        if !(MIN_CADENCE_SECS..=MAX_CADENCE_SECS).contains(&max_secs) {
+            return Err(format!(
+                "Max interval must be between {MIN_CADENCE_SECS} and {MAX_CADENCE_SECS} s"
+            ));
+        }
+        if max_secs < min_secs {
+            return Err("Max interval must be at least the min interval".into());
+        }
+        Ok(Self { name: name.to_string(), resolution_m, min_secs, max_secs })
+    }
+
+    pub fn params(&self) -> CadenceParams {
+        CadenceParams {
+            resolution_m: self.resolution_m,
+            min_secs: self.min_secs,
+            max_secs: self.max_secs,
+        }
+    }
+
+    /// Clamp a (possibly hand-edited) scheme back into the valid ranges, keeping
+    /// `min ≤ max`. Used on load so a tampered config can't escape the bounds
+    /// [`CadenceScheme::new`] enforces.
+    fn clamp(&mut self) {
+        if !self.resolution_m.is_finite() {
+            self.resolution_m = CadenceMode::Normal.params().resolution_m;
+        }
+        self.resolution_m =
+            self.resolution_m.clamp(MIN_CADENCE_RESOLUTION_M, MAX_CADENCE_RESOLUTION_M);
+        self.min_secs = self.min_secs.clamp(MIN_CADENCE_SECS, MAX_CADENCE_SECS);
+        self.max_secs = self.max_secs.clamp(self.min_secs, MAX_CADENCE_SECS);
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -225,6 +342,8 @@ impl Default for Config {
             auto_relays: Vec::new(),
             groups: Vec::new(),
             cadence_mode: CadenceMode::default(),
+            custom_cadences: Vec::new(),
+            selected_custom: None,
             use_expiration: true,
             sender_labels: Vec::new(),
             processed_ids: Vec::new(),
@@ -254,6 +373,86 @@ impl Config {
     pub fn rotate_sender(&mut self) -> Result<Keys> {
         self.sender_secret = None;
         self.sender_keys()
+    }
+
+    /// The selected custom scheme, if a still-present one is selected.
+    fn active_custom(&self) -> Option<&CadenceScheme> {
+        let name = self.selected_custom.as_deref()?;
+        self.custom_cadences.iter().find(|c| c.name == name)
+    }
+
+    /// The cadence parameters currently in effect: the selected custom scheme if
+    /// one is selected and still present, else the selected built-in preset.
+    pub fn active_cadence_params(&self) -> CadenceParams {
+        self.active_custom().map(|c| c.params()).unwrap_or_else(|| self.cadence_mode.params())
+    }
+
+    /// Index of the active scheme in the combined selector list — built-ins
+    /// first (in [`CadenceMode::ALL`] order), then custom schemes in saved order.
+    /// Positions the Share-screen dropdown.
+    pub fn active_cadence_index(&self) -> usize {
+        if let Some(name) = self.selected_custom.as_deref() {
+            if let Some(pos) = self.custom_cadences.iter().position(|c| c.name == name) {
+                return CadenceMode::ALL.len() + pos;
+            }
+        }
+        CadenceMode::ALL.iter().position(|m| *m == self.cadence_mode).unwrap_or(1)
+    }
+
+    /// Select the active scheme by its index in the combined selector list (see
+    /// [`Config::active_cadence_index`]). Out-of-range indices are ignored.
+    pub fn select_cadence_index(&mut self, idx: usize) {
+        let n_builtin = CadenceMode::ALL.len();
+        if idx < n_builtin {
+            self.cadence_mode = CadenceMode::ALL[idx];
+            self.selected_custom = None;
+        } else if let Some(c) = self.custom_cadences.get(idx - n_builtin) {
+            self.selected_custom = Some(c.name.clone());
+        }
+    }
+
+    /// Add a custom scheme, or replace the existing one with the same name (the
+    /// schemes screen's Save — saving under an existing name edits it in place).
+    /// Capped at [`MAX_CUSTOM_CADENCES`]; returns `false` (a no-op) if adding a
+    /// genuinely new scheme would exceed the cap.
+    pub fn upsert_custom_cadence(&mut self, scheme: CadenceScheme) -> bool {
+        if let Some(slot) = self.custom_cadences.iter_mut().find(|c| c.name == scheme.name) {
+            *slot = scheme;
+            return true;
+        }
+        if self.custom_cadences.len() >= MAX_CUSTOM_CADENCES {
+            return false;
+        }
+        self.custom_cadences.push(scheme);
+        true
+    }
+
+    /// Remove a custom scheme by name. If it was the selected one, selection
+    /// falls back to the built-in preset. Returns `true` if one was removed.
+    pub fn remove_custom_cadence(&mut self, name: &str) -> bool {
+        let before = self.custom_cadences.len();
+        self.custom_cadences.retain(|c| c.name != name);
+        let removed = self.custom_cadences.len() != before;
+        if removed && self.selected_custom.as_deref() == Some(name) {
+            self.selected_custom = None;
+        }
+        removed
+    }
+
+    /// Sanitize cadence state after load: drop duplicate-named schemes, clamp
+    /// any hand-edited values back into range, and clear a `selected_custom`
+    /// that no longer resolves to a present scheme.
+    fn normalize_cadence(&mut self) {
+        let mut seen = std::collections::HashSet::new();
+        self.custom_cadences.retain(|c| seen.insert(c.name.clone()));
+        for c in &mut self.custom_cadences {
+            c.clamp();
+        }
+        if let Some(name) = &self.selected_custom {
+            if !self.custom_cadences.iter().any(|c| &c.name == name) {
+                self.selected_custom = None;
+            }
+        }
     }
 
     /// The relays to advertise in an invite: the oldest (first-added) up to
@@ -467,6 +666,7 @@ impl ConfigStore {
             Ok(bytes) => {
                 let mut cfg: Config = serde_json::from_slice(&bytes).map_err(Error::from)?;
                 cfg.normalize_relays();
+                cfg.normalize_cadence();
                 Ok(cfg)
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Config::default()),
@@ -821,6 +1021,124 @@ mod tests {
         let cfg = store.load().unwrap();
         assert!(cfg.auto_relays.is_empty());
         assert!(cfg.groups[0].relays.is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn cadence_scheme_validation() {
+        // Happy path.
+        let s = CadenceScheme::new("  Cycling ", 120.0, 20, 300).unwrap();
+        assert_eq!(s.name, "Cycling", "name is trimmed");
+        assert_eq!(s.params(), CadenceParams { resolution_m: 120.0, min_secs: 20, max_secs: 300 });
+
+        // Rejections.
+        assert!(CadenceScheme::new("", 100.0, 30, 60).is_err(), "empty name");
+        assert!(CadenceScheme::new("normal", 100.0, 30, 60).is_err(), "preset name (any case)");
+        assert!(CadenceScheme::new("X", 0.0, 30, 60).is_err(), "resolution below floor");
+        assert!(CadenceScheme::new("X", 100.0, 0, 60).is_err(), "min below floor");
+        assert!(CadenceScheme::new("X", 100.0, 300, 60).is_err(), "max < min");
+        assert!(CadenceScheme::new("X", 100.0, 30, MAX_CADENCE_SECS + 1).is_err(), "max over ceiling");
+        assert!(CadenceScheme::new("X", f64::NAN, 30, 60).is_err(), "non-finite resolution");
+    }
+
+    #[test]
+    fn active_cadence_resolves_custom_then_falls_back() {
+        let mut c = Config::default(); // cadence_mode = Normal, no customs
+        assert_eq!(c.active_cadence_params(), CadenceMode::Normal.params());
+        assert_eq!(c.active_cadence_index(), 1, "Normal is the second built-in");
+
+        // Save and select a custom scheme: it becomes active and sits after the
+        // three presets in the combined list.
+        let scheme = CadenceScheme::new("Hike", 200.0, 45, 900).unwrap();
+        assert!(c.upsert_custom_cadence(scheme.clone()));
+        c.select_cadence_index(3);
+        assert_eq!(c.active_cadence_params(), scheme.params());
+        assert_eq!(c.active_cadence_index(), 3);
+        assert_eq!(c.selected_custom.as_deref(), Some("Hike"));
+
+        // Removing the selected scheme falls selection back to the preset.
+        assert!(c.remove_custom_cadence("Hike"));
+        assert_eq!(c.selected_custom, None);
+        assert_eq!(c.active_cadence_params(), CadenceMode::Normal.params());
+        assert_eq!(c.active_cadence_index(), 1);
+    }
+
+    #[test]
+    fn upsert_replaces_by_name_and_respects_cap() {
+        let mut c = Config::default();
+        c.upsert_custom_cadence(CadenceScheme::new("A", 100.0, 30, 60).unwrap());
+        // Saving under the same name edits in place rather than duplicating.
+        c.upsert_custom_cadence(CadenceScheme::new("A", 250.0, 60, 120).unwrap());
+        assert_eq!(c.custom_cadences.len(), 1);
+        assert_eq!(c.custom_cadences[0].resolution_m, 250.0);
+
+        // Fill to the cap, then a genuinely new scheme is rejected; an edit of an
+        // existing one still goes through.
+        while c.custom_cadences.len() < MAX_CUSTOM_CADENCES {
+            let n = format!("S{}", c.custom_cadences.len());
+            assert!(c.upsert_custom_cadence(CadenceScheme::new(&n, 100.0, 30, 60).unwrap()));
+        }
+        assert!(!c.upsert_custom_cadence(CadenceScheme::new("overflow", 100.0, 30, 60).unwrap()));
+        assert!(c.upsert_custom_cadence(CadenceScheme::new("A", 300.0, 90, 180).unwrap()));
+    }
+
+    #[test]
+    fn select_cadence_index_maps_builtins_and_customs() {
+        let mut c = Config::default();
+        c.upsert_custom_cadence(CadenceScheme::new("A", 100.0, 30, 60).unwrap());
+        c.upsert_custom_cadence(CadenceScheme::new("B", 200.0, 60, 120).unwrap());
+        c.select_cadence_index(0);
+        assert_eq!(c.cadence_mode, CadenceMode::BatterySaver);
+        assert_eq!(c.selected_custom, None);
+        c.select_cadence_index(4); // 3 presets + second custom
+        assert_eq!(c.selected_custom.as_deref(), Some("B"));
+        c.select_cadence_index(99); // out of range: ignored
+        assert_eq!(c.selected_custom.as_deref(), Some("B"));
+    }
+
+    #[test]
+    fn normalize_cadence_clamps_dedups_and_clears_dangling_selection() {
+        let dir = tmpdir();
+        let store = ConfigStore::new(&dir);
+        // A hand-edited config: out-of-range values, a duplicate name, and a
+        // selection pointing at a scheme that isn't present.
+        std::fs::write(
+            store.path(),
+            br#"{"relays":["wss://a"],"groups":[],
+                "custom_cadences":[
+                  {"name":"Fast","resolution_m":1.0,"min_secs":0,"max_secs":99999999},
+                  {"name":"Fast","resolution_m":300.0,"min_secs":60,"max_secs":120}
+                ],
+                "selected_custom":"Ghost"}"#,
+        )
+        .unwrap();
+        let cfg = store.load().unwrap();
+        assert_eq!(cfg.custom_cadences.len(), 1, "duplicate name dropped");
+        let f = &cfg.custom_cadences[0];
+        assert_eq!(f.resolution_m, MIN_CADENCE_RESOLUTION_M, "resolution clamped up");
+        assert_eq!(f.min_secs, MIN_CADENCE_SECS, "min clamped up");
+        assert_eq!(f.max_secs, MAX_CADENCE_SECS, "max clamped to ceiling");
+        assert_eq!(cfg.selected_custom, None, "dangling selection cleared");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn custom_cadence_fields_default_for_old_config_and_roundtrip() {
+        let dir = tmpdir();
+        let store = ConfigStore::new(&dir);
+        // A config predating custom schemes still loads with sane defaults.
+        std::fs::write(store.path(), br#"{"relays":[],"groups":[],"cadence_mode":"high"}"#).unwrap();
+        let mut cfg = store.load().unwrap();
+        assert_eq!(cfg.cadence_mode, CadenceMode::High);
+        assert!(cfg.custom_cadences.is_empty());
+        assert_eq!(cfg.selected_custom, None);
+        // A saved + selected scheme round-trips.
+        cfg.upsert_custom_cadence(CadenceScheme::new("Drive", 400.0, 30, 300).unwrap());
+        cfg.select_cadence_index(3);
+        store.save(&cfg).unwrap();
+        let loaded = store.load().unwrap();
+        assert_eq!(loaded, cfg);
+        assert_eq!(loaded.active_cadence_params().resolution_m, 400.0);
         std::fs::remove_dir_all(&dir).ok();
     }
 

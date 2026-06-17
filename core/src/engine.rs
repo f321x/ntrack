@@ -185,11 +185,29 @@ pub struct GroupSnapshot {
     pub selected: bool,
 }
 
+/// One cadence scheme as shown in the UI — a built-in preset or a user scheme.
+/// Carries display-ready numbers; the controller formats them and, for custom
+/// schemes, offers Edit/Delete on the schemes screen.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CadenceSchemeSnapshot {
+    pub name: String,
+    pub resolution_m: f64,
+    pub min_secs: u64,
+    pub max_secs: u64,
+    /// A built-in preset (read-only, shown for comparison) vs a user scheme.
+    pub builtin: bool,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct ConfigSnapshot {
     pub groups: Vec<GroupSnapshot>,
     pub relays: Vec<String>,
-    pub cadence_mode: CadenceMode,
+    /// All cadence schemes in selector order: the three built-in presets, then
+    /// the user's custom schemes. The Share dropdown lists their names; the
+    /// schemes screen shows their values.
+    pub cadence_schemes: Vec<CadenceSchemeSnapshot>,
+    /// Index of the active scheme within `cadence_schemes`.
+    pub cadence_selected: usize,
     pub sender_npub: String,
     /// The user's configured display name (empty when unset).
     pub display_name: String,
@@ -704,10 +722,10 @@ impl<P: EnginePool> Engine<P> {
             msg,
             alert_since,
             last_publish_at: None,
-            // Start at the mode's fast floor so the first two fixes establish a
-            // speed quickly; the third onward relaxes toward the ceiling if the
-            // device turns out to be stationary.
-            adaptive_secs: self.config.cadence_mode.params().min_secs,
+            // Start at the active scheme's fast floor so the first two fixes
+            // establish a speed quickly; the third onward relaxes toward the
+            // ceiling if the device turns out to be stationary.
+            adaptive_secs: self.config.active_cadence_params().min_secs,
             last_sample: None,
             last_sample_published: false,
             last_event_id: None,
@@ -764,22 +782,23 @@ impl<P: EnginePool> Engine<P> {
     /// The location cadence (seconds) that currently governs both publishing and
     /// GPS sampling: the fast [`ALERT_INTERVAL_SECS`] while alerting, otherwise
     /// the running share's adaptive cadence (see [`adaptive_interval_secs`]).
-    /// Without a share it falls back to the current mode's floor.
+    /// Without a share it falls back to the active scheme's floor.
     fn effective_interval_secs(&self) -> u64 {
         match &self.share {
             Some(s) if s.alert_since.is_some() => ALERT_INTERVAL_SECS,
             Some(s) => s.adaptive_secs,
-            None => self.config.cadence_mode.params().min_secs,
+            None => self.config.active_cadence_params().min_secs,
         }
     }
 
     /// Keep a running share's adaptive cadence within the (possibly just
-    /// reselected) mode's `[min, max]` window and retune the live GPS session if
-    /// it moved. No-op while alerting (the alert owns the cadence) or not
-    /// sharing. Called after any config mutation, so a mode change takes effect
-    /// without waiting for the next fix.
+    /// reselected) scheme's `[min, max]` window and retune the live GPS session
+    /// if it moved. No-op while alerting (the alert owns the cadence) or not
+    /// sharing. Called after any config mutation, so selecting a different
+    /// scheme — or editing the active one — takes effect without waiting for the
+    /// next fix.
     fn retune_cadence_after_config(&mut self) {
-        let p = self.config.cadence_mode.params();
+        let p = self.config.active_cadence_params();
         let changed = match &mut self.share {
             Some(s) if s.alert_since.is_none() => {
                 let clamped = s.adaptive_secs.clamp(p.min_secs, p.max_secs);
@@ -828,7 +847,7 @@ impl<P: EnginePool> Engine<P> {
         // then retune the live GPS session if it changed. Skipped while alerting
         // (the alert forces the fast emergency cadence) and on the first fix
         // (no previous fix to measure speed against).
-        let params = self.config.cadence_mode.params();
+        let params = self.config.active_cadence_params();
         let retuned = match &mut self.share {
             Some(s) if s.alert_since.is_none() => s.last_sample.and_then(|prev| {
                 let secs = adaptive_interval_secs(prev, sample, params);
@@ -1546,10 +1565,37 @@ impl<P: EnginePool> Engine<P> {
                 selected: g.selected,
             })
             .collect();
+        // The combined selector list: built-in presets (in `CadenceMode::ALL`
+        // order) followed by the user's custom schemes. The order here defines
+        // the indices `Config::active_cadence_index` / `select_cadence_index`
+        // speak, so both must stay in lockstep.
+        let mut cadence_schemes: Vec<CadenceSchemeSnapshot> = CadenceMode::ALL
+            .iter()
+            .map(|m| {
+                let p = m.params();
+                CadenceSchemeSnapshot {
+                    name: m.display_name().to_string(),
+                    resolution_m: p.resolution_m,
+                    min_secs: p.min_secs,
+                    max_secs: p.max_secs,
+                    builtin: true,
+                }
+            })
+            .collect();
+        cadence_schemes.extend(self.config.custom_cadences.iter().map(|c| {
+            CadenceSchemeSnapshot {
+                name: c.name.clone(),
+                resolution_m: c.resolution_m,
+                min_secs: c.min_secs,
+                max_secs: c.max_secs,
+                builtin: false,
+            }
+        }));
         let _ = self.ui_tx.send(UiEvent::Config(ConfigSnapshot {
             groups,
             relays: self.config.relays.clone(),
-            cadence_mode: self.config.cadence_mode,
+            cadence_selected: self.config.active_cadence_index(),
+            cadence_schemes,
             sender_npub,
             display_name: self.config.display_name.clone(),
             default_name,
@@ -2003,6 +2049,42 @@ mod tests {
             Some(CadenceMode::High.params().max_secs * 1000),
             "switching to High retunes the live session down immediately"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn selecting_a_custom_scheme_governs_the_running_share() {
+        // A saved + selected custom scheme drives the live cadence exactly like a
+        // built-in preset: selecting one mid-share reclamps the running session
+        // to its bounds and pushes the new interval to the GPS in place.
+        let mut f = fixture();
+        add_member_group(&mut f, "G");
+        drain(&mut f);
+
+        // Start sharing under the Normal preset (floor 30 s); the first fix
+        // leaves the adaptive cadence at that floor.
+        f.engine.handle(EngineCmd::StartShare { msg: None });
+        f.engine.handle(EngineCmd::Location(sample(now_secs() * 1000)));
+        drain(&mut f);
+
+        // Define and select a custom scheme with a higher floor (45 s). The
+        // retune clamps the live cadence up to it without a restart.
+        f.engine.handle(EngineCmd::Mutate(Box::new(|c| {
+            let s = crate::config::CadenceScheme::new("Slow", 300.0, 45, 1200).unwrap();
+            assert!(c.upsert_custom_cadence(s));
+            c.select_cadence_index(3); // first custom, after the three presets
+        })));
+        let evs = drain(&mut f);
+        assert_eq!(
+            last_set_interval(&evs),
+            Some(45 * 1000),
+            "the selected custom scheme's floor now governs the live cadence"
+        );
+        // And the emitted config reflects the new selection.
+        let cfg = last_config(&evs).expect("a config snapshot");
+        assert_eq!(cfg.cadence_selected, 3);
+        assert_eq!(cfg.cadence_schemes.len(), 4);
+        assert_eq!(cfg.cadence_schemes[3].name, "Slow");
+        assert!(!cfg.cadence_schemes[3].builtin);
     }
 
     #[tokio::test(start_paused = true)]
@@ -2535,6 +2617,13 @@ mod tests {
     fn last_set_interval(evs: &[UiEvent]) -> Option<u64> {
         evs.iter().rev().find_map(|e| match e {
             UiEvent::SetLocationInterval(ms) => Some(*ms),
+            _ => None,
+        })
+    }
+
+    fn last_config(evs: &[UiEvent]) -> Option<ConfigSnapshot> {
+        evs.iter().rev().find_map(|e| match e {
+            UiEvent::Config(c) => Some(c.clone()),
             _ => None,
         })
     }
