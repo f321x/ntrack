@@ -79,7 +79,7 @@ pub fn start(
     let interval_ms = store
         .load()
         .ok()
-        .map(|c| c.interval_secs.saturating_mul(1000))
+        .map(|c| c.cadence_mode.params().min_secs.saturating_mul(1000))
         .filter(|ms| *ms > 0)
         .unwrap_or(FALLBACK_INTERVAL_MS);
 

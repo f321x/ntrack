@@ -173,7 +173,7 @@ component SharePage inherits ScrollView {
     in property <bool> waiting-fix;
     in property <string> status-headline;
     in property <string> status-detail;
-    in property <int> interval-index;
+    in property <int> cadence-mode;
     in property <bool> location-permission;
     in property <bool> alert;
     in property <bool> checkin-armed;
@@ -183,7 +183,7 @@ component SharePage inherits ScrollView {
     callback toggle-group(string, bool);
     callback start-share(string);
     callback stop-share();
-    callback set-interval(int);
+    callback set-cadence(int);
     callback message-edited(string);
     callback panic();
     callback clear-alert();
@@ -342,15 +342,15 @@ component SharePage inherits ScrollView {
                 HorizontalLayout {
                     spacing: 10px;
                     Text {
-                        text: "Update every";
+                        text: "Updates";
                         color: Theme.text;
                         font-size: 14px;
                         vertical-alignment: center;
                     }
-                    interval-box := ComboBox {
-                        model: ["15 s", "30 s", "1 min", "5 min", "10 min", "15 min", "20 min", "30 min", "1 h", "2 h"];
-                        current-index: root.interval-index;
-                        selected => { root.set-interval(self.current-index); }
+                    cadence-box := ComboBox {
+                        model: ["Battery saver", "Normal", "High"];
+                        current-index: root.cadence-mode;
+                        selected => { root.set-cadence(self.current-index); }
                     }
                 }
             }
@@ -1030,7 +1030,7 @@ export component MainWindow inherits Window {
     in property <bool> waiting-fix;
     in property <string> status-headline: "Not sharing";
     in property <string> status-detail: "";
-    in property <int> interval-index: 1;
+    in property <int> cadence-mode: 1;
     in property <bool> alert;
     in property <bool> checkin-armed;
     in property <bool> checkin-grace;
@@ -1075,7 +1075,7 @@ export component MainWindow inherits Window {
     callback toggle-group(string, bool);
     callback start-share(string);
     callback stop-share();
-    callback set-interval(int);
+    callback set-cadence(int);
     callback message-edited(string);
     callback panic();
     callback clear-alert();
@@ -1179,7 +1179,7 @@ export component MainWindow inherits Window {
                 waiting-fix: root.waiting-fix;
                 status-headline: root.status-headline;
                 status-detail: root.status-detail;
-                interval-index: root.interval-index;
+                cadence-mode: root.cadence-mode;
                 alert: root.alert;
                 checkin-armed: root.checkin-armed;
                 checkin-grace: root.checkin-grace;
@@ -1187,7 +1187,7 @@ export component MainWindow inherits Window {
                 toggle-group(id, v) => { root.toggle-group(id, v); }
                 start-share(msg) => { root.start-share(msg); }
                 stop-share => { root.stop-share(); }
-                set-interval(i) => { root.set-interval(i); }
+                set-cadence(i) => { root.set-cadence(i); }
                 message-edited(m) => { root.message-edited(m); }
                 panic => { root.panic(); }
                 clear-alert => { root.clear-alert(); }

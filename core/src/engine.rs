@@ -12,7 +12,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use nostr::{EventId, Filter, Keys, PublicKey};
 use tokio::sync::mpsc;
 
-use crate::config::{Config, ConfigStore};
+use crate::config::{CadenceMode, CadenceParams, Config, ConfigStore};
 use crate::dedup::SeenIds;
 use crate::keys;
 use crate::protocol::{self, Payload, Status};
@@ -80,6 +80,44 @@ impl LocationSample {
     fn ts_secs(&self) -> u64 {
         self.ts_millis / 1000
     }
+}
+
+/// Great-circle distance between two WGS-84 points, in metres (haversine on a
+/// spherical Earth — accurate to well under a percent at the scales that matter
+/// here, and far cheaper than an ellipsoidal formula).
+fn haversine_m(lat1: f64, lng1: f64, lat2: f64, lng2: f64) -> f64 {
+    const R: f64 = 6_371_000.0; // mean Earth radius, metres
+    let (p1, p2) = (lat1.to_radians(), lat2.to_radians());
+    let dp = (lat2 - lat1).to_radians();
+    let dl = (lng2 - lng1).to_radians();
+    let a = (dp / 2.0).sin().powi(2) + p1.cos() * p2.cos() * (dl / 2.0).sin().powi(2);
+    2.0 * R * a.sqrt().asin()
+}
+
+/// The next location interval (seconds) for `mode`, derived from the two most
+/// recent fixes. The displacement is discounted by the fixes' combined GPS
+/// uncertainty (`sqrt(acc1² + acc2²)`) so positional jitter never reads as
+/// motion: two fixes closer than their combined error are treated as the same
+/// place (stationary → ride the `max_secs` ceiling). Otherwise the speed of the
+/// *excess* displacement sets the interval that would cover one `resolution_m`
+/// step, clamped to `[min_secs, max_secs]`.
+fn adaptive_interval_secs(prev: LocationSample, cur: LocationSample, p: CadenceParams) -> u64 {
+    let dt = cur.ts_millis.saturating_sub(prev.ts_millis) as f64 / 1000.0;
+    if dt <= 0.0 {
+        // Out-of-order or duplicate-timestamp fix: can't measure speed, stay
+        // responsive rather than guess.
+        return p.min_secs;
+    }
+    let dist = haversine_m(prev.lat, prev.lng, cur.lat, cur.lng);
+    let uncertainty =
+        ((prev.accuracy_m as f64).powi(2) + (cur.accuracy_m as f64).powi(2)).sqrt();
+    let moved = (dist - uncertainty).max(0.0);
+    if moved <= 0.0 {
+        return p.max_secs; // within the noise floor: stationary
+    }
+    let speed = moved / dt; // m/s
+    let secs = (p.resolution_m / speed).round() as u64;
+    secs.clamp(p.min_secs, p.max_secs)
 }
 
 /// Commands from the UI / platform layer into the engine.
@@ -151,7 +189,7 @@ pub struct GroupSnapshot {
 pub struct ConfigSnapshot {
     pub groups: Vec<GroupSnapshot>,
     pub relays: Vec<String>,
-    pub interval_secs: u64,
+    pub cadence_mode: CadenceMode,
     pub sender_npub: String,
     /// The user's configured display name (empty when unset).
     pub display_name: String,
@@ -267,6 +305,11 @@ struct ShareState {
     /// re-broadcast even without a fresh fix).
     alert_since: Option<u64>,
     last_publish_at: Option<tokio::time::Instant>,
+    /// Current adaptive cadence (seconds), recomputed from each pair of
+    /// consecutive fixes (see [`adaptive_interval_secs`]) and governing both the
+    /// publish gate and the GPS sampling cadence pushed to the platform. Ignored
+    /// while alerting, when [`ALERT_INTERVAL_SECS`] takes over.
+    adaptive_secs: u64,
     last_sample: Option<LocationSample>,
     /// Whether `last_sample` has already been broadcast. Guards the tick
     /// against re-sending a position we've already published (which would
@@ -473,6 +516,8 @@ impl<P: EnginePool> Engine<P> {
                 // so a rename/relabel must refresh them immediately rather than
                 // waiting for the next incoming event to re-emit tracks.
                 self.emit_tracks();
+                // A cadence-mode change reclamps the live share's interval.
+                self.retune_cadence_after_config();
             }
             EngineCmd::StartShare { msg } => self.start_share(msg),
             EngineCmd::ResumeShareIfArmed => {
@@ -659,6 +704,10 @@ impl<P: EnginePool> Engine<P> {
             msg,
             alert_since,
             last_publish_at: None,
+            // Start at the mode's fast floor so the first two fixes establish a
+            // speed quickly; the third onward relaxes toward the ceiling if the
+            // device turns out to be stationary.
+            adaptive_secs: self.config.cadence_mode.params().min_secs,
             last_sample: None,
             last_sample_published: false,
             last_event_id: None,
@@ -714,17 +763,35 @@ impl<P: EnginePool> Engine<P> {
 
     /// The location cadence (seconds) that currently governs both publishing and
     /// GPS sampling: the fast [`ALERT_INTERVAL_SECS`] while alerting, otherwise
-    /// the configured interval (floored at 5 s).
+    /// the running share's adaptive cadence (see [`adaptive_interval_secs`]).
+    /// Without a share it falls back to the current mode's floor.
     fn effective_interval_secs(&self) -> u64 {
-        let alerting = self
-            .share
-            .as_ref()
-            .map(|s| s.alert_since.is_some())
-            .unwrap_or(false);
-        if alerting {
-            ALERT_INTERVAL_SECS
-        } else {
-            self.config.interval_secs.max(5)
+        match &self.share {
+            Some(s) if s.alert_since.is_some() => ALERT_INTERVAL_SECS,
+            Some(s) => s.adaptive_secs,
+            None => self.config.cadence_mode.params().min_secs,
+        }
+    }
+
+    /// Keep a running share's adaptive cadence within the (possibly just
+    /// reselected) mode's `[min, max]` window and retune the live GPS session if
+    /// it moved. No-op while alerting (the alert owns the cadence) or not
+    /// sharing. Called after any config mutation, so a mode change takes effect
+    /// without waiting for the next fix.
+    fn retune_cadence_after_config(&mut self) {
+        let p = self.config.cadence_mode.params();
+        let changed = match &mut self.share {
+            Some(s) if s.alert_since.is_none() => {
+                let clamped = s.adaptive_secs.clamp(p.min_secs, p.max_secs);
+                (clamped != s.adaptive_secs).then(|| {
+                    s.adaptive_secs = clamped;
+                    clamped
+                })
+            }
+            _ => None,
+        };
+        if let Some(secs) = changed {
+            let _ = self.ui_tx.send(UiEvent::SetLocationInterval(secs * 1000));
         }
     }
 
@@ -757,6 +824,25 @@ impl<P: EnginePool> Engine<P> {
     }
 
     fn on_location(&mut self, sample: LocationSample) {
+        // Recompute the adaptive cadence from this fix and the previous one,
+        // then retune the live GPS session if it changed. Skipped while alerting
+        // (the alert forces the fast emergency cadence) and on the first fix
+        // (no previous fix to measure speed against).
+        let params = self.config.cadence_mode.params();
+        let retuned = match &mut self.share {
+            Some(s) if s.alert_since.is_none() => s.last_sample.and_then(|prev| {
+                let secs = adaptive_interval_secs(prev, sample, params);
+                (secs != s.adaptive_secs).then(|| {
+                    s.adaptive_secs = secs;
+                    secs
+                })
+            }),
+            _ => None,
+        };
+        if let Some(secs) = retuned {
+            let _ = self.ui_tx.send(UiEvent::SetLocationInterval(secs * 1000));
+        }
+
         let interval = Duration::from_secs(self.effective_interval_secs());
         let due = match &self.share {
             Some(s) => match s.last_publish_at {
@@ -1463,7 +1549,7 @@ impl<P: EnginePool> Engine<P> {
         let _ = self.ui_tx.send(UiEvent::Config(ConfigSnapshot {
             groups,
             relays: self.config.relays.clone(),
-            interval_secs: self.config.interval_secs,
+            cadence_mode: self.config.cadence_mode,
             sender_npub,
             display_name: self.config.display_name.clone(),
             default_name,
@@ -1743,6 +1829,18 @@ mod tests {
         LocationSample { lat: 48.1, lng: 11.5, accuracy_m: 5.0, ts_millis }
     }
 
+    /// A fix `meters` due east of `base`, `dt_ms` later — for exercising the
+    /// velocity-dependent cadence. Uses the local metres-per-degree-longitude
+    /// (≈ 111.32 km · cos lat) so the haversine distance matches `meters`.
+    fn east(base: &LocationSample, meters: f64, dt_ms: u64) -> LocationSample {
+        let dlng = meters / (111_320.0 * base.lat.to_radians().cos());
+        LocationSample {
+            lng: base.lng + dlng,
+            ts_millis: base.ts_millis + dt_ms,
+            ..*base
+        }
+    }
+
     /// Decrypt one published event back to its payload for `group`, using a
     /// fresh replay window (each test only decrypts a handful of distinct
     /// events, so dedup is irrelevant here).
@@ -1784,13 +1882,19 @@ mod tests {
         assert_eq!(inc.payload.lat, Some(48.1));
         assert_eq!(inc.payload.msg.as_deref(), Some("on my way"));
 
-        // Second fix within the interval does NOT publish.
+        // Second fix at the same spot does NOT publish: two co-located fixes
+        // read as stationary, so the adaptive cadence relaxes to the Normal
+        // mode's ceiling and this off-cycle fix is held back.
         f.engine.handle(EngineCmd::Location(sample(now_secs() * 1000 + 1000)));
         assert_eq!(f.pool.published.lock().unwrap().len(), 1);
 
-        // After the interval elapses, the tick publishes the latest fix that
-        // arrived off-cycle (the second one), without re-sending the first.
-        tokio::time::advance(Duration::from_secs(31)).await;
+        // Once that stationary ceiling elapses, the tick publishes the latest
+        // fix that arrived off-cycle (the second one), without re-sending the
+        // first.
+        tokio::time::advance(Duration::from_secs(
+            CadenceMode::Normal.params().max_secs + 1,
+        ))
+        .await;
         f.engine.handle(EngineCmd::Tick);
         assert_eq!(f.pool.published.lock().unwrap().len(), 2);
 
@@ -1842,41 +1946,62 @@ mod tests {
         assert_eq!(f.pool.published.lock().unwrap().len(), 2);
     }
 
+    #[test]
+    fn adaptive_interval_rides_ceiling_when_still_and_floor_when_fast() {
+        let p = CadenceMode::Normal.params(); // resolution 100 m, [30, 600] s
+        let a = LocationSample { lat: 48.1, lng: 11.5, accuracy_m: 5.0, ts_millis: 0 };
+
+        // Identical position 10 s apart: stationary → the ceiling.
+        let still = LocationSample { ts_millis: 10_000, ..a };
+        assert_eq!(adaptive_interval_secs(a, still, p), p.max_secs);
+
+        // The headline jitter case: a 10 m jump in 1 s between two fixes each
+        // with 10 m accuracy is within their combined uncertainty (~14 m), so
+        // it reads as stationary — NOT 10 m/s. Without the accuracy gate this
+        // would slam the interval to the floor; with it, we ride the ceiling.
+        let noisy = LocationSample { accuracy_m: 10.0, ..a };
+        let jitter = east(&noisy, 10.0, 1_000);
+        assert_eq!(adaptive_interval_secs(noisy, jitter, p), p.max_secs);
+
+        // Clearly moving fast (~100 m/s): floored at the minimum.
+        let fast = east(&a, 1_000.0, 10_000);
+        assert_eq!(adaptive_interval_secs(a, fast, p), p.min_secs);
+
+        // A real ~1 m/s walk lands between the bounds, near resolution / speed
+        // (100 m / ~1 m/s ≈ 100 s).
+        let walk = east(&a, 105.0, 100_000);
+        let secs = adaptive_interval_secs(a, walk, p);
+        assert!((90..=160).contains(&secs), "moderate pace landed at {secs}s");
+    }
+
     #[tokio::test(start_paused = true)]
-    async fn interval_change_while_sharing_adjusts_cadence_without_restart() {
-        // The publish cadence is read from config on every fix/tick, never
-        // cached in the share state, so changing "Update every" mid-share
-        // governs the running session immediately — no stop/start required.
+    async fn cadence_mode_change_retunes_running_share_without_restart() {
+        // Switching mode mid-share reclamps the live cadence and pushes the new
+        // interval down to the running GPS session in place — no stop/start.
         let mut f = fixture();
         add_member_group(&mut f, "G");
         drain(&mut f);
 
-        // Default 30 s interval. Start sharing; the first fix publishes at once.
+        // Default Normal mode. Two co-located fixes relax the cadence to the
+        // Normal ceiling and that gets pushed to the location session.
         f.engine.handle(EngineCmd::StartShare { msg: None });
         f.engine.handle(EngineCmd::Location(sample(now_secs() * 1000)));
-        assert_eq!(f.pool.published.lock().unwrap().len(), 1);
-
-        // Lengthen to 5 min mid-share. A fix at +31 s — which WOULD publish
-        // under the 30 s default — is now held back, proving the longer
-        // interval already governs the ongoing share.
-        f.engine.handle(EngineCmd::Mutate(Box::new(|c| c.interval_secs = 300)));
-        tokio::time::advance(Duration::from_secs(31)).await;
-        f.engine.handle(EngineCmd::Location(sample(now_secs() * 1000)));
+        f.engine.handle(EngineCmd::Location(sample(now_secs() * 1000 + 1000)));
+        let evs = drain(&mut f);
         assert_eq!(
-            f.pool.published.lock().unwrap().len(),
-            1,
-            "a lengthened interval immediately governs the running share"
+            last_set_interval(&evs),
+            Some(CadenceMode::Normal.params().max_secs * 1000),
+            "two still fixes relax to the Normal ceiling"
         );
 
-        // Shorten to 15 s. The previous publish was ~31 s ago, so the next fix
-        // is due again and broadcasts — once more without a restart.
-        f.engine.handle(EngineCmd::Mutate(Box::new(|c| c.interval_secs = 15)));
-        tokio::time::advance(Duration::from_secs(1)).await;
-        f.engine.handle(EngineCmd::Location(sample(now_secs() * 1000)));
+        // Switching to High clamps the cadence to High's lower ceiling at once.
+        f.engine
+            .handle(EngineCmd::Mutate(Box::new(|c| c.cadence_mode = CadenceMode::High)));
+        let evs = drain(&mut f);
         assert_eq!(
-            f.pool.published.lock().unwrap().len(),
-            2,
-            "a shortened interval takes effect on the running share"
+            last_set_interval(&evs),
+            Some(CadenceMode::High.params().max_secs * 1000),
+            "switching to High retunes the live session down immediately"
         );
     }
 
@@ -2476,7 +2601,13 @@ mod tests {
             "clearing republishes without the marker"
         );
         let evs = drain(&mut f);
-        assert_eq!(last_set_interval(&evs), Some(30 * 1000), "cadence back to the default");
+        // Only one fix arrived, so the adaptive cadence is still at its initial
+        // floor (the mode minimum) when the alert relaxes it.
+        assert_eq!(
+            last_set_interval(&evs),
+            Some(CadenceMode::Normal.params().min_secs * 1000),
+            "cadence relaxes back off the alert boost"
+        );
         assert!(!last_share(&evs).unwrap().alert);
         assert!(!f.engine.config.alert_active);
     }

@@ -99,9 +99,11 @@ pub struct Config {
     pub auto_relays: Vec<String>,
     #[serde(default)]
     pub groups: Vec<Group>,
-    /// Seconds between location publishes while sharing.
-    #[serde(default = "default_interval")]
-    pub interval_secs: u64,
+    /// Adaptive location-cadence mode governing how often a fix is sampled and
+    /// published while sharing. Replaces the old fixed `interval_secs`; configs
+    /// predating it deserialize to [`CadenceMode::Normal`].
+    #[serde(default)]
+    pub cadence_mode: CadenceMode,
     /// Attach a NIP-40 expiration tag to outgoing events.
     #[serde(default = "default_true")]
     pub use_expiration: bool,
@@ -157,8 +159,61 @@ pub fn default_relays() -> Vec<String> {
     ]
 }
 
-fn default_interval() -> u64 {
-    30
+/// Adaptive location-cadence mode. Rather than a fixed interval, each mode
+/// targets a *spatial resolution*: the next GPS sample is scheduled so that, at
+/// the current speed, the device moves roughly that far before the next fix —
+/// frequent updates while moving, sparse ones while stationary (saving the
+/// radio and battery, since a parked GPS produces nothing worth sending). The
+/// speed is gated by GPS accuracy so positional jitter never reads as motion,
+/// and the resulting interval is clamped to the mode's `[min, max]` window. The
+/// three modes differ chiefly in that window's ceiling, which bounds how long a
+/// newly-moving device can stay undetected while it was parked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CadenceMode {
+    /// Coarse resolution, long stationary ceiling — maximum battery saving.
+    BatterySaver,
+    /// Balanced default.
+    #[default]
+    Normal,
+    /// Fine resolution, short intervals — most responsive, highest battery use.
+    High,
+}
+
+/// Resolved tuning for a [`CadenceMode`]: the spatial resolution it targets and
+/// the floor/ceiling clamped onto the adaptive interval it produces.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CadenceParams {
+    /// Target distance (metres) the device should travel between fixes.
+    pub resolution_m: f64,
+    /// Shortest interval (seconds): the fast cap and the jitter floor.
+    pub min_secs: u64,
+    /// Longest interval (seconds): used while stationary.
+    pub max_secs: u64,
+}
+
+impl CadenceMode {
+    /// The tuning for this mode. `const` so call sites (e.g. the share-timeout
+    /// bound) can use it in const context.
+    pub const fn params(self) -> CadenceParams {
+        match self {
+            CadenceMode::BatterySaver => CadenceParams {
+                resolution_m: 250.0,
+                min_secs: 60,
+                max_secs: 3600,
+            },
+            CadenceMode::Normal => CadenceParams {
+                resolution_m: 100.0,
+                min_secs: 30,
+                max_secs: 600,
+            },
+            CadenceMode::High => CadenceParams {
+                resolution_m: 40.0,
+                min_secs: 10,
+                max_secs: 120,
+            },
+        }
+    }
 }
 
 impl Default for Config {
@@ -169,7 +224,7 @@ impl Default for Config {
             relays: default_relays(),
             auto_relays: Vec::new(),
             groups: Vec::new(),
-            interval_secs: default_interval(),
+            cadence_mode: CadenceMode::default(),
             use_expiration: true,
             sender_labels: Vec::new(),
             processed_ids: Vec::new(),

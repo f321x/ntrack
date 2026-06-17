@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use ntrack_core::config::{ConfigStore, Group};
+use ntrack_core::config::{CadenceMode, ConfigStore, Group};
 use ntrack_core::engine::{
     now_secs, ConfigSnapshot, Engine, EngineCmd, LocationSample, ShareSnapshot, TrackSnapshot,
     UiEvent,
@@ -26,10 +26,25 @@ use crate::map;
 use crate::platform::{Platform, PlatformEvent};
 use crate::{GroupItem, MainWindow, MapMarker, MapTile, RelayItem, TrackItem};
 
-/// Publish interval choices shown in the UI, in seconds. Index-aligned with the
-/// combo box in `app.slint`.
-pub const INTERVALS: [u64; 10] =
-    [15, 30, 60, 300, 600, 900, 1200, 1800, 3600, 7200];
+/// Cadence modes shown in the Share-screen selector, in display order.
+/// Index-aligned with the combo box in `app.slint` and with
+/// [`cadence_from_index`] / [`cadence_to_index`].
+pub const CADENCE_MODES: [CadenceMode; 3] =
+    [CadenceMode::BatterySaver, CadenceMode::Normal, CadenceMode::High];
+
+/// The selector index for a cadence mode (inverse of `CADENCE_MODES`).
+fn cadence_to_index(mode: CadenceMode) -> i32 {
+    CADENCE_MODES.iter().position(|m| *m == mode).unwrap_or(1) as i32
+}
+
+/// The cadence mode for a selector index, defaulting to `Normal` out of range.
+fn cadence_from_index(idx: i32) -> CadenceMode {
+    usize::try_from(idx)
+        .ok()
+        .and_then(|i| CADENCE_MODES.get(i).copied())
+        .unwrap_or(CadenceMode::Normal)
+}
+
 /// Check-in (dead-man's switch) duration choices on the Share screen, in
 /// seconds. Index-aligned with the combo box in `app.slint`.
 pub const CHECKIN_OPTIONS: [u64; 7] = [900, 1800, 3600, 10_800, 21_600, 43_200, 86_400];
@@ -37,11 +52,12 @@ pub const CHECKIN_OPTIONS: [u64; 7] = [900, 1800, 3600, 10_800, 21_600, 43_200, 
 /// Settings). An incoming invite switches here to pre-fill the import form.
 const GROUPS_PAGE: i32 = 2;
 /// How long a live share may go without an update before we stop showing it
-/// as live: the longest publish interval a sender can pick plus a grace
-/// buffer for relay/GPS jitter. A killed or offline app never gets to send
-/// its best-effort STOP, so the "live" state must time out rather than be
-/// trusted forever. Recomputed every second by the render timer.
-const SHARE_TIMEOUT_SECS: u64 = INTERVALS[INTERVALS.len() - 1] + 60;
+/// as live: the longest stationary interval any mode can produce (Battery
+/// saver's ceiling) plus a grace buffer for relay/GPS jitter. A killed or
+/// offline app never gets to send its best-effort STOP, so the "live" state
+/// must time out rather than be trusted forever. Recomputed every second by the
+/// render timer.
+const SHARE_TIMEOUT_SECS: u64 = CadenceMode::BatterySaver.params().max_secs + 60;
 const TOAST_DURATION: Duration = Duration::from_secs(3);
 
 #[derive(Clone)]
@@ -290,7 +306,7 @@ impl Controller {
                     view.location_active = on;
                     view.config
                         .as_ref()
-                        .map(|c| c.interval_secs * 1000)
+                        .map(|c| c.cadence_mode.params().min_secs * 1000)
                         .unwrap_or(30_000)
                 };
                 if on {
@@ -403,12 +419,7 @@ impl Controller {
             ui.set_sender_npub(cfg.sender_npub.clone().into());
             ui.set_display_name(cfg.display_name.clone().into());
             ui.set_default_name(cfg.default_name.clone().into());
-            ui.set_interval_index(
-                INTERVALS
-                    .iter()
-                    .position(|s| *s == cfg.interval_secs)
-                    .unwrap_or(1) as i32,
-            );
+            ui.set_cadence_mode(cadence_to_index(cfg.cadence_mode));
         }
 
         let relays: Vec<RelayItem> = view
@@ -722,20 +733,13 @@ impl Controller {
             let _ = ctrl.cmd_tx.send(EngineCmd::DisarmCheckin);
         });
 
-        hook!(on_set_interval, |ctrl, idx: i32| {
-            let secs = INTERVALS
-                .get(idx.max(0) as usize)
-                .copied()
-                .unwrap_or(30);
-            ctrl.mutate(move |c| c.interval_secs = secs);
-            // Apply immediately if location updates are running — re-tune in
-            // place rather than bouncing the foreground service (a stop+start
-            // races Android's startForegroundService() contract and crashes;
-            // see the SetLocationInterval handler).
-            let active = ctrl.view.lock().unwrap().location_active;
-            if active {
-                ctrl.platform.set_location_interval(secs * 1000);
-            }
+        hook!(on_set_cadence, |ctrl, idx: i32| {
+            let mode = cadence_from_index(idx);
+            // The engine reclamps the live share's interval and emits a
+            // SetLocationInterval to re-tune the running GPS session in place
+            // (handled above) — no direct platform call here, which would race
+            // Android's startForegroundService() contract.
+            ctrl.mutate(move |c| c.cadence_mode = mode);
         });
 
         hook!(on_message_edited, |ctrl, msg: slint::SharedString| {
