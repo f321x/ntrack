@@ -78,7 +78,13 @@ struct ViewState {
 const TILE_MARGIN: f64 = 128.0;
 
 pub struct Controller {
-    rt: tokio::runtime::Runtime,
+    /// A *handle* to the engine's tokio runtime, never the runtime itself: the
+    /// `Controller` is shared (`Arc`) and several of its own runtime tasks hold
+    /// a clone, so if it owned the `Runtime` the last clone could drop it from a
+    /// worker thread — which panics ("Cannot drop a runtime ... from within an
+    /// asynchronous context"). The runtime is owned (and torn down) by
+    /// [`run_app`](crate::run_app) instead; a `Handle` is safe to drop anywhere.
+    rt: tokio::runtime::Handle,
     cmd_tx: mpsc::UnboundedSender<EngineCmd>,
     platform: Arc<dyn Platform>,
     ui: Weak<MainWindow>,
@@ -89,16 +95,11 @@ pub struct Controller {
 
 impl Controller {
     pub fn new(
+        rt: tokio::runtime::Handle,
         data_dir: PathBuf,
         platform: Arc<dyn Platform>,
         ui: Weak<MainWindow>,
     ) -> Arc<Self> {
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()
-            .expect("tokio runtime");
-
         let (pool_tx, mut pool_rx) = mpsc::unbounded_channel();
         let (ui_tx, ui_rx) = mpsc::unbounded_channel();
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();

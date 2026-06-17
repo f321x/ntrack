@@ -30,8 +30,21 @@ pub fn run_app(
     platform: Arc<dyn Platform>,
     platform_rx: mpsc::UnboundedReceiver<PlatformEvent>,
 ) {
+    // Own the engine's tokio runtime here rather than inside the (shared,
+    // Arc'd) Controller. Several of the Controller's own runtime tasks hold a
+    // clone of it, so if it owned the runtime the last clone could drop it from
+    // a worker thread — which panics ("Cannot drop a runtime ... from within an
+    // asynchronous context") and crashes the app when the Activity is recreated
+    // (a config/locale change re-runs `android_main`). Owning it here means the
+    // runtime is only ever torn down from this (non-worker) thread.
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
+
     let ui = MainWindow::new().expect("failed to create main window");
-    let controller = Controller::new(data_dir, platform, ui.as_weak());
+    let controller = Controller::new(rt.handle().clone(), data_dir, platform, ui.as_weak());
     controller.attach(&ui);
     controller.spawn_platform_forwarder(platform_rx);
     // Continue a share that was still active when the process last died. On
@@ -59,6 +72,11 @@ pub fn run_app(
 
     ui.run().expect("event loop failed");
     controller.shutdown();
+    // Tear the runtime down from this (non-worker) thread so its tasks'
+    // Arc<Controller> clones can never trigger a drop-from-async panic. The
+    // engine already got its flush window in `shutdown()`, so a non-blocking
+    // background shutdown is enough and keeps Activity teardown snappy.
+    rt.shutdown_background();
 }
 
 #[cfg(all(target_os = "android", not(feature = "android")))]

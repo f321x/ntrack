@@ -1097,7 +1097,7 @@ component SchemeCard inherits Card {
 // Full-screen overlay (opened from the Share tab) to create, edit and delete
 // custom location-update schemes. Shows the built-in presets alongside, so the
 // user can compare their own schemes against them.
-component CadenceView inherits Rectangle {
+component CadenceView inherits FocusScope {
     in property <[CadenceSchemeItem]> presets;
     in property <[CadenceSchemeItem]> customs;
     // Form fields, two-way bound so Rust can clear them after a save and the
@@ -1112,22 +1112,28 @@ component CadenceView inherits Rectangle {
     callback save(string, string, string, string);
     callback delete(string);
 
-    background: Theme.bg;
-
     // Catch the Android Back gesture/button so it dismisses this view instead of
-    // exiting the app (same approach as the map overlay). Grabs focus on open;
-    // inputs inside still take focus when tapped.
-    init => { back-catcher.focus(); }
-    back-catcher := FocusScope {
-        width: 0px;
-        height: 0px;
-        key-pressed(event) => {
-            if (event.text == Key.Back || event.text == Key.Escape) {
-                root.close();
-                return EventResult.accept;
-            }
-            return EventResult.reject;
+    // exiting the app. The view's root is itself the FocusScope, so it sits
+    // *above* every text input in the tree: a focused LineEdit ignores
+    // Back/Escape, so the key bubbles up here and is caught even mid-edit. (The
+    // map overlay gets away with a sibling 0x0 scope only because it has no
+    // inputs to steal focus.) Grab focus on open so Back works before any field
+    // is tapped.
+    init => { root.focus(); }
+    key-pressed(event) => {
+        if (event.text == Key.Back || event.text == Key.Escape) {
+            root.close();
+            return EventResult.accept;
         }
+        return EventResult.reject;
+    }
+
+    // A FocusScope has no background of its own; this fills behind the content,
+    // and its TouchArea both blocks taps from falling through to the tab behind
+    // and drops the text caret when you tap an empty area (unfocus-on-tap).
+    Rectangle {
+        background: Theme.bg;
+        TouchArea { clicked => { root.focus(); } }
     }
 
     VerticalLayout {
@@ -1275,6 +1281,10 @@ component CadenceView inherits Rectangle {
                                 primary: true;
                                 clicked => {
                                     root.save(root.form-name, root.form-resolution, root.form-min, root.form-max);
+                                    // Drop the caret/keyboard off the field so it
+                                    // doesn't keep blinking after the tap (and
+                                    // re-arm Back handling on the root scope).
+                                    root.focus();
                                 }
                             }
                             AppButton {
@@ -1284,6 +1294,7 @@ component CadenceView inherits Rectangle {
                                     root.form-resolution = "";
                                     root.form-min = "";
                                     root.form-max = "";
+                                    root.focus();
                                 }
                             }
                         }
