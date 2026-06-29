@@ -850,6 +850,18 @@ impl<P: EnginePool> Engine<P> {
         let params = self.config.active_cadence_params();
         let retuned = match &mut self.share {
             Some(s) if s.alert_since.is_none() => s.last_sample.and_then(|prev| {
+                // Only a strictly newer fix can measure speed. A fix that is not
+                // newer than the last one carries no motion information — most
+                // commonly the platform re-delivering its cached last-known
+                // location when we re-tune the GPS session (Android hands one
+                // back on every requestLocationUpdates). Feeding such a zero-Δt
+                // sample to `adaptive_interval_secs` would trip its `dt <= 0`
+                // branch and slam the cadence to the floor, so every relax toward
+                // the stationary ceiling would be snapped straight back to the
+                // maximum rate. Leave the cadence untouched instead.
+                if sample.ts_millis <= prev.ts_millis {
+                    return None;
+                }
                 let secs = adaptive_interval_secs(prev, sample, params);
                 (secs != s.adaptive_secs).then(|| {
                     s.adaptive_secs = secs;
@@ -2049,6 +2061,47 @@ mod tests {
             Some(CadenceMode::High.params().max_secs * 1000),
             "switching to High retunes the live session down immediately"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn redelivered_duplicate_fix_does_not_ratchet_cadence_to_floor() {
+        // Regression: on real devices updates pinned to the maximum rate even
+        // when stationary. Android's LocationBridge re-delivers its cached
+        // last-known location on every re-tune, so each SetLocationInterval the
+        // engine emits bounced straight back as a fix bearing the SAME
+        // timestamp. That zero-Δt sample must not reset the adaptive cadence to
+        // the floor — otherwise every relax toward the ceiling is undone at once.
+        let mut f = fixture();
+        add_member_group(&mut f, "G");
+        drain(&mut f);
+
+        let p = CadenceMode::Normal.params(); // [30, 600] s
+        f.engine.handle(EngineCmd::StartShare { msg: None });
+
+        // Two co-located fixes 10 s apart relax the cadence to the ceiling and
+        // push it to the GPS session; the first fix publishes immediately.
+        let t0 = now_secs() * 1000;
+        f.engine.handle(EngineCmd::Location(sample(t0)));
+        f.engine.handle(EngineCmd::Location(sample(t0 + 10_000)));
+        let evs = drain(&mut f);
+        assert_eq!(
+            last_set_interval(&evs),
+            Some(p.max_secs * 1000),
+            "two still fixes relax to the ceiling"
+        );
+        assert_eq!(f.pool.published.lock().unwrap().len(), 1);
+
+        // The platform now re-delivers its last known location verbatim (same
+        // timestamp) because we just re-tuned the session. It must change
+        // neither the cadence nor trigger a spurious publish.
+        f.engine.handle(EngineCmd::Location(sample(t0 + 10_000)));
+        let evs = drain(&mut f);
+        assert_eq!(
+            last_set_interval(&evs),
+            None,
+            "a duplicate-timestamp re-delivery must not retune the cadence"
+        );
+        assert_eq!(f.pool.published.lock().unwrap().len(), 1);
     }
 
     #[tokio::test(start_paused = true)]

@@ -317,10 +317,21 @@ public final class LocationBridge {
                         listener, Looper.getMainLooper());
                 any = true;
                 Log.i(TAG, "location updates from " + provider + " every " + minTimeMs + "ms");
-                Location last = lm.getLastKnownLocation(provider);
-                if (last != null
-                        && System.currentTimeMillis() - last.getTime() < 60_000) {
-                    listener.onLocationChanged(last);
+                // Seed an immediate fix from the OS cache ONLY while still
+                // acquiring (before the first real fix of the session). A re-tune
+                // (setLocationInterval, e.g. when the engine relaxes the cadence)
+                // re-runs subscribe() with a fix already in hand; re-delivering
+                // getLastKnownLocation there hands the engine a fix bearing the
+                // SAME timestamp it just processed, which its adaptive cadence
+                // reads as "can't measure speed" and snaps back to the minimum
+                // interval — pinning updates to the maximum rate even when
+                // stationary. The seed only exists to bootstrap a cold start.
+                if (!acquiredFix) {
+                    Location last = lm.getLastKnownLocation(provider);
+                    if (last != null
+                            && System.currentTimeMillis() - last.getTime() < 60_000) {
+                        listener.onLocationChanged(last);
+                    }
                 }
             }
             if (!any) {
