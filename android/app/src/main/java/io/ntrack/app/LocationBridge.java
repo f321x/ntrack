@@ -269,8 +269,19 @@ public final class LocationBridge {
      * (Re)subscribe the location listener at {@code intervalMs}, replacing any
      * existing subscription. Main-thread only — it mutates {@link #listener},
      * so every caller posts here first.
+     *
+     * The LocationManager is always resolved through the Application context,
+     * never the activity/service that happened to trigger the call: engine
+     * handoffs (UI -> headless on task removal and back on relaunch) subscribe
+     * and remove from whichever context is alive at the time, and before
+     * API 30 LocationManager instances are cached per-Context — removeUpdates
+     * on a different context's instance silently no-ops, leaking a duplicate
+     * listener that keeps the GPS radio on. One process-wide instance makes
+     * replacement always work (and keeps the re-subscribe closure below from
+     * pinning a destroyed Activity).
      */
-    private static void subscribe(final Context ctx, final long intervalMs) {
+    private static void subscribe(final Context callerCtx, final long intervalMs) {
+        final Context ctx = callerCtx.getApplicationContext();
         try {
             LocationManager lm =
                     (LocationManager) ctx.getSystemService(Context.LOCATION_SERVICE);
@@ -367,8 +378,10 @@ public final class LocationBridge {
 
     private static void stopListening(Context ctx) {
         if (listener != null) {
-            LocationManager lm =
-                    (LocationManager) ctx.getSystemService(Context.LOCATION_SERVICE);
+            // Same Application-context resolution as subscribe(): the listener
+            // may have been registered from a context that is gone by now.
+            LocationManager lm = (LocationManager) ctx.getApplicationContext()
+                    .getSystemService(Context.LOCATION_SERVICE);
             try {
                 lm.removeUpdates(listener);
             } catch (Exception e) {

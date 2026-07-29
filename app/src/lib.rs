@@ -123,13 +123,15 @@ fn android_main(app: slint::android::AndroidApp) {
     run_app(data_dir.clone(), platform.clone(), rx);
 
     // The Activity is gone (swiped from recents, Back, or a config-change
-    // teardown) and the UI engine with it. If a share or check-in is still
-    // armed, hand it straight to a headless engine hosted by the still-running
-    // foreground service — otherwise casting the app away would silently stop
-    // publishing until the next launch or reboot. The platform (JavaVM + bridge
-    // class refs) outlives the Activity, so it is reused as-is; only the event
-    // sink needs rebinding to the successor's channel.
+    // teardown) and the UI engine with it. If a share is still armed, hand it
+    // straight to a headless engine hosted by the still-running foreground
+    // service — otherwise casting the app away would silently stop publishing
+    // until the next launch or reboot. The platform (JavaVM + bridge class
+    // refs) outlives the Activity, so it is reused as-is; the event sink is
+    // rebound to the successor's channel only if the handoff engine actually
+    // starts.
     let (tx, rx) = mpsc::unbounded_channel();
-    glue::rebind_platform_events(tx);
-    headless::handoff_from_ui(data_dir, platform, rx);
+    headless::handoff_from_ui(data_dir, platform, rx, move || {
+        glue::rebind_platform_events(tx)
+    });
 }

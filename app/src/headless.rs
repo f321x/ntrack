@@ -7,10 +7,10 @@
 //!   [`crate::glue`]) to spin up the same UI-free `ntrack_core` engine the
 //!   controller normally drives.
 //! * **Task removal**: when the user swipes the app away from recents (or
-//!   otherwise exits the Activity) while a share or check-in is armed,
-//!   `android_main` calls [`handoff_from_ui`] on its way out, so publishing
-//!   continues inside the still-running foreground service instead of silently
-//!   stopping until the next launch.
+//!   otherwise exits the Activity) while a share is armed, `android_main`
+//!   calls [`handoff_from_ui`] on its way out, so publishing continues inside
+//!   the still-running foreground service instead of silently stopping until
+//!   the next launch.
 //! * **Process death**: if the OS kills the process anyway, the sticky
 //!   `LocationService` restart resumes headlessly the same way the boot path
 //!   does.
@@ -61,20 +61,34 @@ struct HeadlessHost {
 /// Start a UI-less engine that resumes any armed share. Idempotent, and a no-op
 /// once the UI owns the engine. Takes ownership of the platform and its event
 /// receiver — location fixes flow in through `platform_rx`.
+///
+/// `bind_events` points the platform's Java→Rust event stream at this engine's
+/// channel. It runs inside the ownership critical section, and only when the
+/// engine actually starts: binding it up front would sever a live UI engine's
+/// location stream whenever a service start loses the race to [`claim_for_ui`]
+/// (a boot start — or a sticky service restart — racing the user opening the
+/// app).
 pub fn start(
     data_dir: PathBuf,
     platform: Arc<dyn Platform>,
     mut platform_rx: mpsc::UnboundedReceiver<PlatformEvent>,
+    bind_events: impl FnOnce(),
 ) {
+    // Ownership is decided under the HOST lock — the same lock claim_for_ui
+    // flips UI_ACTIVE under — so a start racing a claim either runs first
+    // (and its engine is then taken over and stopped) or observes UI_ACTIVE
+    // and refuses. Checking the flag outside the lock would let both slip
+    // through and leave two engines publishing.
+    let mut slot = HOST.lock().unwrap();
     if UI_ACTIVE.load(Ordering::SeqCst) {
         log::info!("headless: UI already owns the engine; ignoring service start");
         return;
     }
-    let mut slot = HOST.lock().unwrap();
     if slot.is_some() {
         log::info!("headless: engine already running; ignoring service start");
         return;
     }
+    bind_events();
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
@@ -174,41 +188,61 @@ pub fn start(
 pub fn stop() {
     let host = HOST.lock().unwrap().take();
     if let Some(host) = host {
-        log::info!("headless: stopping engine");
-        let _ = host.cmd_tx.send(EngineCmd::Shutdown);
-        host.platform.stop_location();
-        host.rt.shutdown_timeout(SHUTDOWN_GRACE);
+        shutdown_host(host);
     }
+}
+
+fn shutdown_host(host: HeadlessHost) {
+    log::info!("headless: stopping engine");
+    let _ = host.cmd_tx.send(EngineCmd::Shutdown);
+    host.platform.stop_location();
+    host.rt.shutdown_timeout(SHUTDOWN_GRACE);
 }
 
 /// Mark this process's UI as the sole engine owner and tear down any headless
 /// boot engine. Called from `android_main` before the UI engine is built.
 pub fn claim_for_ui() {
-    UI_ACTIVE.store(true, Ordering::SeqCst);
-    stop();
+    // Flip ownership and take the host under the same lock start() decides
+    // under: a racing service start either committed first (and is taken and
+    // stopped here) or observes UI_ACTIVE and refuses — never both.
+    let host = {
+        let mut slot = HOST.lock().unwrap();
+        UI_ACTIVE.store(true, Ordering::SeqCst);
+        slot.take()
+    };
+    if let Some(host) = host {
+        shutdown_host(host);
+    }
 }
 
 /// Mirror image of [`claim_for_ui`]: the UI engine has shut down because the
 /// Activity is going away (swiped from recents, Back, or a config-change
-/// teardown). Release UI ownership and — when the persisted sentinels say a
-/// share or check-in is still armed — start a headless engine that takes over
-/// publishing inside the still-running foreground service. The UI engine left
-/// the resume flag armed and the platform location session running (its
-/// shutdown STOP deliberately skips `NeedLocation(false)`), so the successor
-/// resumes seamlessly. When nothing is armed this only clears the ownership
-/// flag: starting an engine (and its relay pool) in a process the OS is about
-/// to cache would be pure battery cost.
+/// teardown). Release UI ownership and — when the persisted resume sentinel
+/// says a share is still armed — start a headless engine that takes over
+/// publishing inside the still-running foreground service (a live share
+/// guarantees one). The UI engine left the resume flag armed and the platform
+/// location session running (its shutdown STOP deliberately skips
+/// `NeedLocation(false)`), so the successor resumes seamlessly.
+///
+/// Deliberately not gated on the check-in sentinel: without a share there is
+/// no foreground service, so a check-in-only engine would sit in a cached
+/// process the OS may kill at any moment, unable to raise notifications
+/// (`notifyAlert` has no Context) — an unreliable escalation is worse than the
+/// existing lifecycle, which re-evaluates the deadline (grace window included)
+/// at the next launch or boot. When nothing is armed this only clears the
+/// ownership flag: an idle engine and its relay pool in a cached process would
+/// be pure battery cost.
 pub fn handoff_from_ui(
     data_dir: PathBuf,
     platform: Arc<dyn Platform>,
     platform_rx: mpsc::UnboundedReceiver<PlatformEvent>,
+    bind_events: impl FnOnce(),
 ) {
     UI_ACTIVE.store(false, Ordering::SeqCst);
-    let store = ConfigStore::new(&data_dir);
-    if !store.resume_flag_path().exists() && !store.checkin_flag_path().exists() {
-        log::info!("headless: UI exited with nothing armed; no engine handoff");
+    if !ConfigStore::new(&data_dir).resume_flag_path().exists() {
+        log::info!("headless: UI exited with no share armed; no engine handoff");
         return;
     }
-    log::info!("headless: UI exited with a share/check-in armed; taking over");
-    start(data_dir, platform, platform_rx);
+    log::info!("headless: UI exited while sharing; taking over");
+    start(data_dir, platform, platform_rx, bind_events);
 }

@@ -84,6 +84,18 @@ public class LocationService extends Service {
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
+        // A null intent is a START_STICKY restart: the OS killed the process
+        // while sharing (activity and engine died with it) and has now brought
+        // the service back. With nothing armed there is nothing to host — stop
+        // before ever going foreground so no notification flashes. (A restart
+        // is not a startForegroundService() start, so skipping startForeground
+        // here does not violate the 5-second contract.)
+        boolean restarted = intent == null;
+        if (restarted && !shareOrCheckinArmed(this)) {
+            stopSelf(startId);
+            return START_NOT_STICKY;
+        }
+
         NotificationManager nm = getSystemService(NotificationManager.class);
         NotificationChannel channel = new NotificationChannel(
                 CHANNEL_ID, "Live location sharing", NotificationManager.IMPORTANCE_LOW);
@@ -102,20 +114,21 @@ public class LocationService extends Service {
                 .setContentIntent(tap)
                 .build();
 
-        if (Build.VERSION.SDK_INT >= 29) {
-            startForeground(NOTIFICATION_ID, notification,
-                    ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION);
-        } else {
-            startForeground(NOTIFICATION_ID, notification);
-        }
-
-        // A null intent is a START_STICKY restart: the OS killed the process
-        // while sharing (activity and engine died with it) and has now brought
-        // the service back. With nothing armed there is nothing to host — drop
-        // the notification and stop instead of lingering as an idle shell.
-        boolean restarted = intent == null;
-        if (restarted && !shareOrCheckinArmed(this)) {
-            stopForeground(STOP_FOREGROUND_REMOVE);
+        try {
+            if (Build.VERSION.SDK_INT >= 29) {
+                startForeground(NOTIFICATION_ID, notification,
+                        ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION);
+            } else {
+                startForeground(NOTIFICATION_ID, notification);
+            }
+        } catch (Exception e) {
+            // Android 14+ throws SecurityException from startForeground with a
+            // location type when the location permission was revoked while we
+            // were down, and 12-14 can deny a background foreground-start
+            // outright. Crashing here would make the sticky restart crash-loop;
+            // stay down instead — the share resumes on the next app launch,
+            // where the permission flow can run.
+            Log.e(TAG, "startForeground failed; not resuming", e);
             stopSelf(startId);
             return START_NOT_STICKY;
         }
@@ -124,8 +137,9 @@ public class LocationService extends Service {
         // host the engine here. The headless engine resumes the share and
         // drives location through LocationBridge (which resolves this service
         // via current()). Guard so a redelivery can't start a second engine;
-        // the native side additionally no-ops once a live UI owns the engine
-        // (a restart racing the user reopening the app).
+        // the native side additionally refuses (and leaves the live engine's
+        // event routing untouched) once a UI owns the engine — a restart
+        // racing the user reopening the app.
         boolean fromBoot = intent != null && intent.getBooleanExtra(EXTRA_FROM_BOOT, false);
         if ((fromBoot || restarted) && !headlessStarted) {
             headlessStarted = true;

@@ -92,11 +92,11 @@ prefer extending those over end-to-end testing.
 Whenever a share must keep running with no UI, the *same* `ntrack_core` engine runs UI-less inside
 `app/src/headless.rs`, wired straight to the platform and dropping every `UiEvent` except
 `NeedLocation`: after a reboot (`BootReceiver` starts `LocationService`, which loads this library
-via `glue.rs`), after the user swipes the app away from recents (`android_main` calls
-`headless::handoff_from_ui()` on its way out, taking over inside the still-running foreground
-service — the engine's shutdown STOP deliberately leaves the location session running for exactly
-this handoff), and after the OS kills the process (the `START_STICKY` service restart resumes like
-the boot path). **Exactly one engine may own the persisted config and publish at a time**, so when
+via `glue.rs`), after the user swipes the app away from recents while sharing (`android_main`
+calls `headless::handoff_from_ui()` on its way out, taking over inside the still-running
+foreground service — the engine's shutdown STOP deliberately leaves the location session running
+for exactly this handoff), and after the OS kills the process (the `START_STICKY` service restart
+resumes like the boot path). **Exactly one engine may own the persisted config and publish at a time**, so when
 the user opens the app `android_main` calls `headless::claim_for_ui()` to tear the headless host
 down first; the share is handed over through the persisted *resume flag* (the engine leaves it
 armed across a clean shutdown, and `run_app` → `Controller::resume_if_armed` continues it). A

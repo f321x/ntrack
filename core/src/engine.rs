@@ -558,6 +558,15 @@ impl<P: EnginePool> Engine<P> {
                     } else {
                         self.begin_share(recipients, msg, alert_since);
                     }
+                    // The handoff paths (boot, task removal) inherit a
+                    // possibly still-running location session from their
+                    // predecessor engine. If the resume declined (no selected
+                    // groups, sender-key error), nothing will publish —
+                    // release location so the GPS and the foreground service
+                    // don't run on with no consumer.
+                    if self.share.is_none() {
+                        let _ = self.ui_tx.send(UiEvent::NeedLocation(false));
+                    }
                 }
             }
             EngineCmd::SetMessage(msg) => {
@@ -579,8 +588,9 @@ impl<P: EnginePool> Engine<P> {
             EngineCmd::EvaluateCheckinOnStart => self.evaluate_checkin_on_start(),
             EngineCmd::StopShare => {
                 // An explicit user stop disarms boot-resume (and the alert); a
-                // process-death STOP (run()'s shutdown tail) goes through
-                // stop_share() directly and deliberately leaves the flag armed.
+                // shutdown STOP (run()'s tail) goes through publish_stop()
+                // instead, deliberately leaving the flag armed and the
+                // location session running for a successor engine.
                 self.disarm_resume();
                 self.stop_share();
             }
@@ -2571,6 +2581,26 @@ mod tests {
             "the shutdown tail must still publish the best-effort STOP"
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn declined_resume_releases_inherited_location_session() {
+        // A handoff successor (boot / task removal) inherits a running
+        // location session. If the armed resume cannot actually start — every
+        // group deselected mid-share, say — the engine must release location,
+        // or the GPS and the foreground service would run on with no consumer.
+        let mut f = fixture();
+        f.engine
+            .handle(EngineCmd::Mutate(Box::new(|c| c.resume_share = true)));
+        drain(&mut f);
+
+        f.engine.handle(EngineCmd::ResumeShareIfArmed);
+        let evs = drain(&mut f);
+        assert!(f.engine.share.is_none(), "no groups: resume must decline");
+        assert!(
+            evs.iter().any(|e| matches!(e, UiEvent::NeedLocation(false))),
+            "a declined resume must release the inherited location session"
+        );
     }
 
     #[tokio::test(start_paused = true)]

@@ -167,11 +167,11 @@ impl AndroidPlatform {
     /// service callback runs on a Java thread, so `FindClass` resolves app
     /// classes (unlike the tokio worker threads used afterwards). Used only by
     /// the headless engine; no deep-link flush, as there is no UI to receive
-    /// invites.
-    pub fn new_for_service(
-        env: &mut JNIEnv,
-        tx: mpsc::UnboundedSender<PlatformEvent>,
-    ) -> Result<Self, String> {
+    /// invites. Unlike [`Self::new`] this does NOT install an event sink —
+    /// the caller binds one via [`rebind_platform_events`] only once the
+    /// headless engine actually wins engine ownership, so a service start
+    /// losing the race to a live UI cannot sever that UI's event stream.
+    pub fn new_for_service(env: &mut JNIEnv) -> Result<Self, String> {
         let vm = env.get_java_vm().map_err(|e| format!("get_java_vm: {e}"))?;
         let bridge_class = env
             .find_class(BRIDGE_CLASS_PATH)
@@ -180,7 +180,6 @@ impl AndroidPlatform {
         let bridge = env
             .new_global_ref(&bridge_class)
             .map_err(|e| format!("global ref class: {e}"))?;
-        set_platform_tx(tx);
         Ok(Self { vm, bridge })
     }
 
@@ -375,19 +374,24 @@ fn deliver_invite(env: &mut JNIEnv, s: &JString) {
     }
 }
 
-/// Start a UI-less engine inside the boot `LocationService`. Builds the
-/// platform from the live JNI env (the activity context is absent at boot) and
-/// hands it to [`crate::headless::start`], which resumes any armed share.
+/// Start a UI-less engine inside the `LocationService` (boot, or a sticky
+/// restart after a process kill). Builds the platform from the live JNI env
+/// (the activity context is absent) and hands it to [`crate::headless::start`],
+/// which resumes any armed share. The event sink is bound inside `start`'s
+/// ownership critical section so a start that loses to a live UI engine leaves
+/// that engine's location stream untouched.
 fn start_headless_engine(env: &mut JNIEnv, data_dir: String) {
     let (tx, rx) = mpsc::unbounded_channel();
-    let platform = match AndroidPlatform::new_for_service(env, tx) {
+    let platform = match AndroidPlatform::new_for_service(env) {
         Ok(p) => p,
         Err(e) => {
             log::error!("headless platform init failed: {e}");
             return;
         }
     };
-    crate::headless::start(PathBuf::from(data_dir), Arc::new(platform), rx);
+    crate::headless::start(PathBuf::from(data_dir), Arc::new(platform), rx, move || {
+        set_platform_tx(tx)
+    });
 }
 
 /// `static native void nativeOnLocation(double, double, float, long)` —
