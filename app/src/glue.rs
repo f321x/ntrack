@@ -49,6 +49,16 @@ fn platform_tx() -> Option<mpsc::UnboundedSender<PlatformEvent>> {
     PLATFORM_TX.read().unwrap().clone()
 }
 
+/// Point the Java→Rust event stream at a new receiver without rebuilding the
+/// platform (the JNI natives stay registered). Used by the UI→headless handoff
+/// in `android_main`: the UI engine's forwarder died with its runtime, so the
+/// successor engine installs its own channel here. (`pub` like the rest of the
+/// glue API so the host build, which never runs `android_main`, doesn't flag
+/// it dead.)
+pub fn rebind_platform_events(tx: mpsc::UnboundedSender<PlatformEvent>) {
+    set_platform_tx(tx);
+}
+
 /// The native methods Java's `LocationBridge` calls back into. Registered on
 /// the bridge class by whichever engine (UI or headless) constructs the
 /// platform; re-registering simply overwrites, which is fine.

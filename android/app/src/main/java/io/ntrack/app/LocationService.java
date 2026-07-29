@@ -5,26 +5,35 @@ import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.app.PendingIntent;
 import android.app.Service;
+import android.content.Context;
 import android.content.Intent;
 import android.content.pm.ServiceInfo;
 import android.os.Build;
 import android.os.IBinder;
 import android.util.Log;
 
+import java.io.File;
+
 /**
  * Foreground service shown while a live share is running. It keeps the process
  * and location access alive with the screen off, and ensures the user always
  * sees that sharing is active.
  *
- * Two roles:
+ * Three roles:
  *  - While the app is open it is a keep-alive shell: location fixes are
  *    delivered to {@link LocationBridge}'s listener in this same process and the
- *    engine runs inside the activity.
+ *    engine runs inside the activity. When the activity is torn down (the app is
+ *    swiped away from recents) the Rust side hands the engine over to a UI-less
+ *    one hosted by this still-running service, so publishing continues.
  *  - On boot (started by {@link BootReceiver} with {@link #EXTRA_FROM_BOOT})
  *    there is no activity, so it loads the native library and starts a UI-less
  *    engine ({@code nativeServiceStart}) that resumes the share. It also exposes
  *    itself (via {@link #current}) as the Context {@link LocationBridge} uses
  *    for location when no activity exists.
+ *  - After the OS kills the process while sharing, the {@code START_STICKY}
+ *    restart (null intent) resumes the share headlessly exactly like the boot
+ *    path — gated on the same persisted sentinels, so a restart with nothing to
+ *    do stops itself instead of lingering as an idle notification.
  */
 public class LocationService extends Service {
     private static final String TAG = "ntrack";
@@ -53,6 +62,18 @@ public class LocationService extends Service {
      * {@link LocationBridge} to drive location with no activity present. */
     static LocationService current() {
         return sInstance;
+    }
+
+    /**
+     * Whether the core's persisted sentinels say there is work for a headless
+     * engine: a share to resume ({@code resume.flag}) or an armed check-in to
+     * evaluate ({@code checkin.flag}). The same gate {@link BootReceiver} uses;
+     * the config file itself is never parsed from Java — it holds group secrets.
+     */
+    static boolean shareOrCheckinArmed(Context context) {
+        File files = context.getFilesDir();
+        return new File(files, "resume.flag").exists()
+                || new File(files, "checkin.flag").exists();
     }
 
     @Override
@@ -88,12 +109,25 @@ public class LocationService extends Service {
             startForeground(NOTIFICATION_ID, notification);
         }
 
-        // Boot path: no activity exists, so host the engine here. The headless
-        // engine resumes the share and drives location through LocationBridge
-        // (which resolves this service via current()). Guard so a redelivery
-        // can't start a second engine.
+        // A null intent is a START_STICKY restart: the OS killed the process
+        // while sharing (activity and engine died with it) and has now brought
+        // the service back. With nothing armed there is nothing to host — drop
+        // the notification and stop instead of lingering as an idle shell.
+        boolean restarted = intent == null;
+        if (restarted && !shareOrCheckinArmed(this)) {
+            stopForeground(STOP_FOREGROUND_REMOVE);
+            stopSelf(startId);
+            return START_NOT_STICKY;
+        }
+
+        // No-activity paths — boot, or a sticky restart after a process kill —
+        // host the engine here. The headless engine resumes the share and
+        // drives location through LocationBridge (which resolves this service
+        // via current()). Guard so a redelivery can't start a second engine;
+        // the native side additionally no-ops once a live UI owns the engine
+        // (a restart racing the user reopening the app).
         boolean fromBoot = intent != null && intent.getBooleanExtra(EXTRA_FROM_BOOT, false);
-        if (fromBoot && !headlessStarted) {
+        if ((fromBoot || restarted) && !headlessStarted) {
             headlessStarted = true;
             try {
                 nativeServiceStart(getFilesDir().getAbsolutePath());
@@ -101,7 +135,9 @@ public class LocationService extends Service {
                 Log.e(TAG, "headless resume failed to start", t);
             }
         }
-        return START_NOT_STICKY;
+        // Sticky, so a share survives its process being killed: the restart
+        // re-enters this method with a null intent and resumes headlessly.
+        return START_STICKY;
     }
 
     @Override

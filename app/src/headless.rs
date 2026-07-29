@@ -1,19 +1,28 @@
-//! UI-less engine host for the Android boot path.
+//! UI-less engine host for the Android paths where a share must keep running
+//! with no Activity — and therefore no Slint UI and no
+//! [`Controller`](crate::controller::Controller):
 //!
-//! After a reboot there is no Activity — and therefore no Slint UI and no
-//! [`Controller`](crate::controller::Controller) — yet we still want a share
-//! that was active before the restart to resume with no user interaction. The
-//! `BootReceiver` starts the `LocationService` foreground service, which loads
-//! this library and calls in (via [`crate::glue`]) to spin up the same UI-free
-//! `ntrack_core` engine the controller normally drives. We wire it straight to
-//! the platform and drop the `UiEvent`s that have no headless consumer — only
-//! [`UiEvent::NeedLocation`] matters here.
+//! * **Boot**: after a reboot the `BootReceiver` starts the `LocationService`
+//!   foreground service, which loads this library and calls in (via
+//!   [`crate::glue`]) to spin up the same UI-free `ntrack_core` engine the
+//!   controller normally drives.
+//! * **Task removal**: when the user swipes the app away from recents (or
+//!   otherwise exits the Activity) while a share or check-in is armed,
+//!   `android_main` calls [`handoff_from_ui`] on its way out, so publishing
+//!   continues inside the still-running foreground service instead of silently
+//!   stopping until the next launch.
+//! * **Process death**: if the OS kills the process anyway, the sticky
+//!   `LocationService` restart resumes headlessly the same way the boot path
+//!   does.
+//!
+//! We wire the engine straight to the platform and drop the `UiEvent`s that
+//! have no headless consumer — only [`UiEvent::NeedLocation`] matters here.
 //!
 //! Exactly one engine may own the persisted config and publish at a time. When
 //! the user later opens the app, `android_main` calls [`claim_for_ui`] to tear
 //! this host down before constructing the UI engine; the share is handed over
 //! through the persisted resume flag, which the engine leaves armed across a
-//! shutdown.
+//! shutdown. [`handoff_from_ui`] is the mirror image for the way back.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -177,4 +186,29 @@ pub fn stop() {
 pub fn claim_for_ui() {
     UI_ACTIVE.store(true, Ordering::SeqCst);
     stop();
+}
+
+/// Mirror image of [`claim_for_ui`]: the UI engine has shut down because the
+/// Activity is going away (swiped from recents, Back, or a config-change
+/// teardown). Release UI ownership and — when the persisted sentinels say a
+/// share or check-in is still armed — start a headless engine that takes over
+/// publishing inside the still-running foreground service. The UI engine left
+/// the resume flag armed and the platform location session running (its
+/// shutdown STOP deliberately skips `NeedLocation(false)`), so the successor
+/// resumes seamlessly. When nothing is armed this only clears the ownership
+/// flag: starting an engine (and its relay pool) in a process the OS is about
+/// to cache would be pure battery cost.
+pub fn handoff_from_ui(
+    data_dir: PathBuf,
+    platform: Arc<dyn Platform>,
+    platform_rx: mpsc::UnboundedReceiver<PlatformEvent>,
+) {
+    UI_ACTIVE.store(false, Ordering::SeqCst);
+    let store = ConfigStore::new(&data_dir);
+    if !store.resume_flag_path().exists() && !store.checkin_flag_path().exists() {
+        log::info!("headless: UI exited with nothing armed; no engine handoff");
+        return;
+    }
+    log::info!("headless: UI exited with a share/check-in armed; taking over");
+    start(data_dir, platform, platform_rx);
 }

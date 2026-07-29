@@ -518,8 +518,15 @@ impl<P: EnginePool> Engine<P> {
         }
         self.flush_seen();
         // Best effort STOP so receivers don't show a stale "live" state.
+        // Deliberately without NeedLocation(false): a Shutdown while sharing is
+        // a handoff (UI -> headless on Android task removal, headless -> UI at
+        // claim), and the successor engine must find the platform location
+        // session — and the foreground service hosting it — still running so it
+        // can take over publishing. Whoever genuinely wants location released
+        // stops the share first (StopShare) or stops it explicitly after the
+        // engine exits (headless::stop).
         if self.share.is_some() {
-            self.stop_share();
+            self.publish_stop();
         }
     }
 
@@ -826,7 +833,12 @@ impl<P: EnginePool> Engine<P> {
         }
     }
 
-    fn stop_share(&mut self) {
+    /// Publish a best-effort STOP for the live share (if any) and drop the
+    /// in-memory share state, leaving the platform location session untouched.
+    /// [`Self::stop_share`] wraps this for the normal "release everything"
+    /// paths; `run`'s shutdown tail calls it directly so an engine handoff can
+    /// inherit the still-running location session.
+    fn publish_stop(&mut self) {
         if let Some(state) = self.share.take() {
             match protocol::build_event(
                 &state.sender,
@@ -838,6 +850,10 @@ impl<P: EnginePool> Engine<P> {
                 Err(e) => log::error!("failed to build STOP event: {e}"),
             }
         }
+    }
+
+    fn stop_share(&mut self) {
+        self.publish_stop();
         let _ = self.ui_tx.send(UiEvent::NeedLocation(false));
         self.emit_share();
     }
@@ -2505,6 +2521,57 @@ mod tests {
     }
 
     static SHUTDOWN_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_stop_keeps_location_session_running() {
+        // A Shutdown while sharing is a handoff (UI <-> headless on Android):
+        // the successor engine takes over the still-running location session
+        // and its foreground service. The shutdown tail must publish the
+        // best-effort STOP but must NOT release location — NeedLocation(false)
+        // here would tear down the service before the successor could claim it.
+        let dir = std::env::temp_dir().join(format!(
+            "ntrack-engine-handoff-{}-{}",
+            std::process::id(),
+            SHUTDOWN_N.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = ConfigStore::new(&dir);
+        {
+            let mut cfg = store.load().unwrap();
+            cfg.groups.push(Group::new_member("G".into()).unwrap());
+            store.save(&cfg).unwrap();
+        }
+        let pool = Arc::new(MockPool::default());
+        let (ui_tx, mut ui_rx) = mpsc::unbounded_channel();
+        let engine = Engine::new(store, pool.clone(), ui_tx);
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let handle = tokio::spawn(engine.run(cmd_rx));
+        cmd_tx
+            .send(EngineCmd::StartShare { msg: None })
+            .unwrap();
+        cmd_tx.send(EngineCmd::Shutdown).unwrap();
+        handle.await.unwrap();
+
+        let mut evs = Vec::new();
+        while let Ok(ev) = ui_rx.try_recv() {
+            evs.push(ev);
+        }
+        assert!(
+            evs.iter().any(|e| matches!(e, UiEvent::NeedLocation(true))),
+            "the share start must have requested location"
+        );
+        assert!(
+            !evs.iter().any(|e| matches!(e, UiEvent::NeedLocation(false))),
+            "the shutdown STOP must leave the location session running for the handoff"
+        );
+        // No fix ever arrived, so the only published event is the STOP.
+        assert_eq!(
+            pool.published.lock().unwrap().len(),
+            1,
+            "the shutdown tail must still publish the best-effort STOP"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     #[tokio::test(start_paused = true)]
     async fn resume_if_armed_starts_when_armed() {

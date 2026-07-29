@@ -113,12 +113,23 @@ fn android_main(app: slint::android::AndroidApp) {
         .unwrap_or_else(|| PathBuf::from("/data/local/tmp/ntrack"));
 
     let (tx, rx) = mpsc::unbounded_channel();
-    let platform = match glue::AndroidPlatform::new(tx) {
-        Ok(p) => p,
+    let platform: Arc<dyn Platform> = match glue::AndroidPlatform::new(tx) {
+        Ok(p) => Arc::new(p),
         Err(e) => {
             log::error!("failed to initialize android platform: {e}");
             return;
         }
     };
-    run_app(data_dir, Arc::new(platform), rx);
+    run_app(data_dir.clone(), platform.clone(), rx);
+
+    // The Activity is gone (swiped from recents, Back, or a config-change
+    // teardown) and the UI engine with it. If a share or check-in is still
+    // armed, hand it straight to a headless engine hosted by the still-running
+    // foreground service — otherwise casting the app away would silently stop
+    // publishing until the next launch or reboot. The platform (JavaVM + bridge
+    // class refs) outlives the Activity, so it is reused as-is; only the event
+    // sink needs rebinding to the successor's channel.
+    let (tx, rx) = mpsc::unbounded_channel();
+    glue::rebind_platform_events(tx);
+    headless::handoff_from_ui(data_dir, platform, rx);
 }

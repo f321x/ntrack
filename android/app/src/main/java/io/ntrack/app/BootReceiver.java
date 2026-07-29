@@ -5,8 +5,6 @@ import android.content.Context;
 import android.content.Intent;
 import android.util.Log;
 
-import java.io.File;
-
 /**
  * After a reboot (or a low-battery shutdown), if a share was still active when
  * the device went down, resume it automatically — no user interaction.
@@ -41,10 +39,7 @@ public final class BootReceiver extends BroadcastReceiver {
         }
         // Start only if we were sharing, or a check-in is armed, when we went
         // down — otherwise there's nothing for the boot engine to do.
-        File files = context.getFilesDir();
-        boolean armed = new File(files, "resume.flag").exists()
-                || new File(files, "checkin.flag").exists();
-        if (!armed) return;
+        if (!LocationService.shareOrCheckinArmed(context)) return;
 
         Intent svc = new Intent(context, LocationService.class)
                 .putExtra(LocationService.EXTRA_FROM_BOOT, true);

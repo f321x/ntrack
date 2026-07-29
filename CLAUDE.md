@@ -87,16 +87,20 @@ dedup, STOP-on-permission-loss, key rotation, subscription updates, the alert/pa
 escalation, resume-after-reboot) is covered by in-engine `#[cfg(test)]` tests against that mock —
 prefer extending those over end-to-end testing.
 
-### The headless boot engine
+### The headless engine (boot, task removal, process death)
 
-After a reboot a share that was active when the device went down resumes with no UI: `BootReceiver`
-starts `LocationService`, which loads this library and (via `glue.rs`) spins up the *same*
-`ntrack_core` engine inside `app/src/headless.rs`, wired straight to the platform and dropping every
-`UiEvent` except `NeedLocation`. **Exactly one engine may own the persisted config and publish at a
-time**, so when the user opens the app `android_main` calls `headless::claim_for_ui()` to tear the
-boot host down first; the share is handed over through the persisted *resume flag* (the engine
-leaves it armed across a clean shutdown, and `run_app` → `Controller::resume_if_armed` continues
-it). A pending check-in is re-evaluated at startup the same way.
+Whenever a share must keep running with no UI, the *same* `ntrack_core` engine runs UI-less inside
+`app/src/headless.rs`, wired straight to the platform and dropping every `UiEvent` except
+`NeedLocation`: after a reboot (`BootReceiver` starts `LocationService`, which loads this library
+via `glue.rs`), after the user swipes the app away from recents (`android_main` calls
+`headless::handoff_from_ui()` on its way out, taking over inside the still-running foreground
+service — the engine's shutdown STOP deliberately leaves the location session running for exactly
+this handoff), and after the OS kills the process (the `START_STICKY` service restart resumes like
+the boot path). **Exactly one engine may own the persisted config and publish at a time**, so when
+the user opens the app `android_main` calls `headless::claim_for_ui()` to tear the headless host
+down first; the share is handed over through the persisted *resume flag* (the engine leaves it
+armed across a clean shutdown, and `run_app` → `Controller::resume_if_armed` continues it). A
+pending check-in is re-evaluated at startup the same way.
 
 ### Threading & the UI bridge
 
