@@ -551,7 +551,17 @@ impl<P: EnginePool> Engine<P> {
                     // Restore the alert too, so a reboot mid-emergency resumes
                     // alerting rather than a plain share.
                     let alert_since = self.config.alert_active.then(now_secs);
-                    let recipients = self.selected_recipients();
+                    // An emergency resumes to the same audience rule that
+                    // started it: panic/escalation broadcasts to every group
+                    // when none is ticked (see emergency_recipients), so its
+                    // resume must not decline — and then disarm — just
+                    // because nothing is selected. That would silently kill a
+                    // live alert the moment the app is swiped away.
+                    let recipients = if alert_since.is_some() {
+                        self.emergency_recipients()
+                    } else {
+                        self.selected_recipients()
+                    };
                     if recipients.is_empty() {
                         self.toast("Select at least one group to share with".into());
                         self.emit_share();
@@ -585,6 +595,18 @@ impl<P: EnginePool> Engine<P> {
                 // running the countdown.
                 if self.share.is_none() && self.checkin.is_none() {
                     let _ = self.ui_tx.send(UiEvent::NeedLocation(false));
+                }
+                // Re-sync the sentinel to the config in the divergent case
+                // (resume.flag on disk, resume_share false in the config — an
+                // unreadable config falls back to defaults), or BootReceiver
+                // would flap the foreground service on every reboot forever.
+                // Deliberately touches only the sentinel, never the config
+                // file: a config that failed to load must not be overwritten
+                // with defaults. If the read failure was transient, the share
+                // still resumes on the next app open, which re-persists and
+                // re-arms the sentinel.
+                if !self.config.resume_share {
+                    self.store.set_resume_flag(false);
                 }
             }
             EngineCmd::SetMessage(msg) => {
@@ -2627,6 +2649,39 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn alert_resume_falls_back_to_emergency_recipients() {
+        // A panic/escalation share broadcasts to every group when none is
+        // ticked (emergency_recipients). Its resume must apply the same rule:
+        // declining — and now disarming — because nothing is selected would
+        // silently kill a live emergency broadcast on swipe-away or reboot.
+        let mut f = fixture();
+        add_member_group(&mut f, "G");
+        f.engine.handle(EngineCmd::Mutate(Box::new(|c| {
+            for g in &mut c.groups {
+                g.selected = false;
+            }
+            c.resume_share = true;
+            c.alert_active = true;
+        })));
+        drain(&mut f);
+
+        f.engine.handle(EngineCmd::ResumeShareIfArmed);
+        let evs = drain(&mut f);
+        assert!(
+            f.engine
+                .share
+                .as_ref()
+                .is_some_and(|s| s.alert_since.is_some()),
+            "an armed alert resume must restart the emergency broadcast"
+        );
+        assert!(
+            evs.iter().any(|e| matches!(e, UiEvent::NeedLocation(true))),
+            "the resumed alert share must request location"
+        );
+        assert!(f.engine.config.resume_share, "the alert must stay armed");
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn resume_request_keeps_service_host_for_armed_checkin() {
         // A boot with only checkin.flag armed hosts the countdown inside the
         // foreground service. The armed-resume release must not fire then:
@@ -2652,12 +2707,17 @@ mod tests {
         // session and foreground service would run on forever.
         let mut f = fixture();
         drain(&mut f);
+        // Simulate the divergence: sentinel armed, config unarmed.
+        f.engine.store.set_resume_flag(true);
         f.engine.handle(EngineCmd::ResumeShareIfArmed);
         let evs = drain(&mut f);
         assert!(
             evs.iter().any(|e| matches!(e, UiEvent::NeedLocation(false))),
             "an armed-resume request that starts nothing must release location"
         );
+        // ... and re-sync the sentinel, or BootReceiver would flap the
+        // foreground service against the dead config on every reboot.
+        assert!(!f.engine.store.resume_flag_path().exists());
     }
 
     #[tokio::test(start_paused = true)]

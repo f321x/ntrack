@@ -120,17 +120,12 @@ fn android_main(app: slint::android::AndroidApp) {
             return;
         }
     };
-    // Catch panics so the handoff below still runs: a UI crash while sharing
-    // must not leave the foreground service claiming "sharing" with nothing
-    // publishing. The unwind tears down the window, controller and runtime
-    // (killing the UI engine without its shutdown STOP), which is exactly the
-    // state the handoff recovers from — the resume flag is still armed.
-    let ui_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        run_app(data_dir.clone(), platform.clone(), rx);
-    }));
-    if ui_result.is_err() {
-        log::error!("UI crashed; attempting the share handoff anyway");
-    }
+    // A UI panic never reaches the handoff below: shipped APKs build the
+    // native lib with the release profile, whose `panic = "abort"` kills the
+    // process before any unwinding (catch_unwind would be dead code here).
+    // That path is covered anyway — the abort takes the foreground service
+    // down with it, and its START_STICKY restart resumes the share headlessly.
+    run_app(data_dir.clone(), platform.clone(), rx);
 
     // The Activity is gone (swiped from recents, Back, or a config-change
     // teardown) and the UI engine with it. If a share is still armed, hand it
