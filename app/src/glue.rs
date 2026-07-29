@@ -183,6 +183,20 @@ impl AndroidPlatform {
         Ok(Self { vm, bridge })
     }
 
+    /// Tell the Java bridge this UI session's event sink is going away, so a
+    /// deep link tapped into the still-warm process buffers for the next UI
+    /// session instead of being flushed into a channel with no invite
+    /// consumer (the dead UI channel, or a headless handoff engine's — see
+    /// `LocationBridge.onUiSessionEnded`). Called from `android_main` after
+    /// the UI exits; the counterpart "ready again" signal is the
+    /// `flushPendingDeepLink` in [`Self::new`].
+    pub fn mark_ui_session_ended(&self) {
+        self.with_env("onUiSessionEnded", |env, class| {
+            env.call_static_method(class, "onUiSessionEnded", "()V", &[])
+                .map(|_| ())
+        });
+    }
+
     /// Attach (if needed) and run `f` with the env and the bridge class.
     /// JNI errors are logged and swallowed: platform calls are
     /// fire-and-forget from the app's perspective.

@@ -113,7 +113,10 @@ fn android_main(app: slint::android::AndroidApp) {
         .unwrap_or_else(|| PathBuf::from("/data/local/tmp/ntrack"));
 
     let (tx, rx) = mpsc::unbounded_channel();
-    let platform: Arc<dyn Platform> = match glue::AndroidPlatform::new(tx) {
+    // Kept as the concrete type (coerced to Arc<dyn Platform> at each use):
+    // the session-ended signal below is Android-specific and not part of the
+    // Platform trait.
+    let platform = match glue::AndroidPlatform::new(tx) {
         Ok(p) => Arc::new(p),
         Err(e) => {
             log::error!("failed to initialize android platform: {e}");
@@ -126,6 +129,12 @@ fn android_main(app: slint::android::AndroidApp) {
     // That path is covered anyway — the abort takes the foreground service
     // down with it, and its START_STICKY restart resumes the share headlessly.
     run_app(data_dir.clone(), platform.clone(), rx);
+
+    // This UI session's event sink is dead; make the bridge buffer any deep
+    // link tapped into the still-warm process until the next UI session
+    // flushes it, instead of dropping it into a channel nobody reads
+    // invites from.
+    platform.mark_ui_session_ended();
 
     // The Activity is gone (swiped from recents, Back, or a config-change
     // teardown) and the UI engine with it. If a share is still armed, hand it

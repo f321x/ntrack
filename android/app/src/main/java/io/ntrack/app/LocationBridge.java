@@ -78,7 +78,12 @@ public final class LocationBridge {
 
     // Deep links can arrive (in MainActivity.onCreate) before the Rust side has
     // registered its native callbacks, so buffer the latest one until Rust is
-    // ready and flushes it.
+    // ready and flushes it. nativeReady's lifetime is a UI SESSION, not the
+    // process: it is set by the UI engine's flush at startup and cleared again
+    // by onUiSessionEnded() when that engine's event sink dies with the
+    // Activity. In a warm process a stale true would flush a freshly tapped
+    // link into the previous session's channel — dead, or a headless handoff
+    // engine's, which has no invite consumer — silently dropping the invite.
     private static String pendingDeepLink;
     private static boolean nativeReady;
 
@@ -646,8 +651,9 @@ public final class LocationBridge {
     }
 
     /**
-     * Deliver any buffered deep link. Called by Rust once the native callbacks
-     * are registered (marking the bridge ready), and re-entrantly from
+     * Deliver any buffered deep link. Called by Rust once the UI engine has
+     * registered the native callbacks and installed its event sink (marking
+     * the bridge ready for this UI session), and re-entrantly from
      * {@link #onDeepLinkIntent} for links that arrive afterwards.
      */
     public static synchronized void flushPendingDeepLink() {
@@ -661,5 +667,16 @@ public final class LocationBridge {
             Log.e(TAG, "native not ready for deep link", e);
             pendingDeepLink = uri; // try again on a later flush
         }
+    }
+
+    /**
+     * Called by Rust when the UI engine — and with it the only event sink
+     * that consumes invites — is going away (the Activity is being torn
+     * down). From here on a tapped link is buffered for the next UI session's
+     * {@link #flushPendingDeepLink} instead of being flushed into a channel
+     * nobody reads invites from.
+     */
+    public static synchronized void onUiSessionEnded() {
+        nativeReady = false;
     }
 }
