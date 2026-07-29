@@ -156,14 +156,20 @@ public class LocationService extends Service {
 
     @Override
     public void onDestroy() {
-        if (headlessStarted) {
-            try {
-                nativeServiceStop();
-            } catch (Throwable t) {
-                Log.e(TAG, "headless stop failed", t);
-            }
-            headlessStarted = false;
+        // Tear down whichever headless engine this process hosts, regardless
+        // of which path created it: nativeServiceStart here (boot / sticky
+        // restart, tracked by headlessStarted) or the Rust-side swipe-away
+        // handoff, which this service never observes. Unconditional on
+        // purpose — headless::stop() is a safe no-op when no engine runs or
+        // the UI owns it, and gating on headlessStarted would strand a
+        // handoff engine (tokio runtime + relay pool) in the cached process
+        // whenever the service stops under it.
+        try {
+            nativeServiceStop();
+        } catch (Throwable t) {
+            Log.e(TAG, "headless stop failed", t);
         }
+        headlessStarted = false;
         if (sInstance == this) {
             sInstance = null;
         }

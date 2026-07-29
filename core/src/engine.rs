@@ -558,15 +558,33 @@ impl<P: EnginePool> Engine<P> {
                     } else {
                         self.begin_share(recipients, msg, alert_since);
                     }
-                    // The handoff paths (boot, task removal) inherit a
-                    // possibly still-running location session from their
-                    // predecessor engine. If the resume declined (no selected
-                    // groups, sender-key error), nothing will publish —
-                    // release location so the GPS and the foreground service
-                    // don't run on with no consumer.
                     if self.share.is_none() {
-                        let _ = self.ui_tx.send(UiEvent::NeedLocation(false));
+                        // The resume declined outright (no selected groups,
+                        // sender-key error): the share is dead, so disarm.
+                        // Leaving the flag armed would flap the boot service
+                        // against the same broken config on every reboot —
+                        // and worse, re-selecting a group weeks later would
+                        // silently revive a broadcast the user believes long
+                        // gone. (A permission loss instead flows through
+                        // LocationUnavailable and never reaches here.)
+                        self.disarm_resume();
                     }
+                }
+                // The handoff paths (boot, task removal) inherit a possibly
+                // still-running location session from their predecessor
+                // engine. If no share is running after an armed-resume
+                // request, nothing will publish — release location so the GPS
+                // and the foreground service don't run on with no consumer.
+                // Outside the resume_share check on purpose: the sentinel
+                // file that triggered the handoff can outlive the flag inside
+                // the config (an unreadable config falls back to defaults),
+                // and that divergence must still release the session. But
+                // never while a check-in is armed: NeedLocation(false) stops
+                // the foreground service (platform-side), and on a
+                // checkin.flag-only boot that service is the very host
+                // running the countdown.
+                if self.share.is_none() && self.checkin.is_none() {
+                    let _ = self.ui_tx.send(UiEvent::NeedLocation(false));
                 }
             }
             EngineCmd::SetMessage(msg) => {
@@ -2600,6 +2618,45 @@ mod tests {
         assert!(
             evs.iter().any(|e| matches!(e, UiEvent::NeedLocation(false))),
             "a declined resume must release the inherited location session"
+        );
+        // ... and disarm, so every future boot doesn't flap the service
+        // against the same dead config (or silently revive the broadcast
+        // once a group is re-selected much later).
+        assert!(!f.engine.config.resume_share);
+        assert!(!f.engine.store.resume_flag_path().exists());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn resume_request_keeps_service_host_for_armed_checkin() {
+        // A boot with only checkin.flag armed hosts the countdown inside the
+        // foreground service. The armed-resume release must not fire then:
+        // NeedLocation(false) stops the service platform-side, which would
+        // tear down the very host evaluating the check-in.
+        let mut f = fixture();
+        f.engine.handle(EngineCmd::ArmCheckin { secs: 600 });
+        drain(&mut f);
+        f.engine.handle(EngineCmd::ResumeShareIfArmed);
+        let evs = drain(&mut f);
+        assert!(
+            !evs.iter().any(|e| matches!(e, UiEvent::NeedLocation(false))),
+            "an armed check-in must keep its foreground-service host"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn resume_request_without_armed_config_still_releases_location() {
+        // The handoff/boot paths gate on the resume.flag sentinel, but the
+        // engine reads resume_share from the config — and an unreadable
+        // config falls back to defaults (resume_share = false). The location
+        // release must not depend on the two agreeing, or the inherited GPS
+        // session and foreground service would run on forever.
+        let mut f = fixture();
+        drain(&mut f);
+        f.engine.handle(EngineCmd::ResumeShareIfArmed);
+        let evs = drain(&mut f);
+        assert!(
+            evs.iter().any(|e| matches!(e, UiEvent::NeedLocation(false))),
+            "an armed-resume request that starts nothing must release location"
         );
     }
 
